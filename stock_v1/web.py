@@ -840,6 +840,10 @@ def set_telegram_webhook(url: str) -> dict:
     return _telegram_api("setWebhook", {"url": url})
 
 
+def delete_telegram_webhook() -> dict:
+    return _telegram_api("deleteWebhook", {"drop_pending_updates": False})
+
+
 def api_realtime(db_path: Path, raw_codes: str) -> dict:
     codes = [code.strip() for code in raw_codes.split(",") if code.strip()]
     with _connect(db_path) as conn:

@@ -98,7 +98,14 @@ python -m stock_v1 telegram-webhook --url https://你的-render網址/api/telegr
 本機版使用 Polling：
 
 ```powershell
+python -m stock_v1 telegram-delete-webhook
 python -m stock_v1 telegram-poll
+```
+
+同一個 Telegram Bot 同一時間只能使用一種收訊方式。若要切回 Render 正式版：
+
+```bash
+python -m stock_v1 telegram-webhook --url https://你的-render網址/api/telegram/webhook
 ```
 
 可在 Telegram 輸入：

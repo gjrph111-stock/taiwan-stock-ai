@@ -29,7 +29,7 @@ from .reports import (
     print_watchlist,
 )
 from .update import update_prices, update_universe
-from .web import poll_telegram_updates, run as run_web, send_enabled_user_telegrams, set_telegram_webhook
+from .web import delete_telegram_webhook, poll_telegram_updates, run as run_web, send_enabled_user_telegrams, set_telegram_webhook
 
 
 def main() -> None:
@@ -119,6 +119,8 @@ def main() -> None:
 
     webhook_parser = subparsers.add_parser("telegram-webhook", help="Set Telegram webhook URL")
     webhook_parser.add_argument("--url", required=True, help="Webhook URL, e.g. https://example.onrender.com/api/telegram/webhook")
+
+    subparsers.add_parser("telegram-delete-webhook", help="Delete Telegram webhook before local polling")
 
     poll_parser = subparsers.add_parser("telegram-poll", help="Run local Telegram bot polling")
     poll_parser.add_argument("--once", action="store_true", help="Poll one batch then exit")
@@ -289,6 +291,12 @@ def main() -> None:
     if args.command == "telegram-webhook":
         conn.close()
         result = set_telegram_webhook(args.url)
+        print(result)
+        return
+
+    if args.command == "telegram-delete-webhook":
+        conn.close()
+        result = delete_telegram_webhook()
         print(result)
         return
 
