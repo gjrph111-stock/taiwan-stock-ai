@@ -29,7 +29,7 @@ from .reports import (
     print_watchlist,
 )
 from .update import update_prices, update_universe
-from .web import run as run_web
+from .web import run as run_web, send_enabled_user_telegrams
 
 
 def main() -> None:
@@ -113,6 +113,9 @@ def main() -> None:
     telegram_parser = subparsers.add_parser("notify-telegram", help="Send daily report to Telegram")
     telegram_parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Notification config path")
     telegram_parser.add_argument("--limit", type=int, default=5, help="Rows per ranking")
+
+    user_telegram_parser = subparsers.add_parser("notify-users", help="Send personal Telegram reports to enabled users")
+    user_telegram_parser.add_argument("--limit", type=int, default=5, help="Rows per user watchlist")
 
     line_parser = subparsers.add_parser("notify-line", help="Send daily report to LINE")
     line_parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Notification config path")
@@ -267,6 +270,12 @@ def main() -> None:
         conn.close()
         message = build_daily_message(Path(args.db), args.limit)
         result = send_telegram(message, load_config(Path(args.config)))
+        print(result)
+        return
+
+    if args.command == "notify-users":
+        conn.close()
+        result = send_enabled_user_telegrams(Path(args.db), args.limit)
         print(result)
         return
 

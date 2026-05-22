@@ -45,9 +45,28 @@ CREATE TABLE IF NOT EXISTS watchlist (
     FOREIGN KEY (code) REFERENCES stocks(code)
 );
 
+CREATE TABLE IF NOT EXISTS app_users (
+    user_key TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    telegram_chat_id TEXT,
+    telegram_enabled INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS user_watchlist (
+    user_key TEXT NOT NULL,
+    code TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (user_key, code),
+    FOREIGN KEY (user_key) REFERENCES app_users(user_key),
+    FOREIGN KEY (code) REFERENCES stocks(code)
+);
+
 CREATE INDEX IF NOT EXISTS idx_prices_date ON prices(date);
 CREATE INDEX IF NOT EXISTS idx_stocks_market ON stocks(market);
 CREATE INDEX IF NOT EXISTS idx_watchlist_created_at ON watchlist(created_at);
+CREATE INDEX IF NOT EXISTS idx_user_watchlist_user ON user_watchlist(user_key, created_at);
 """
 
 

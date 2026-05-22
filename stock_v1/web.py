@@ -1,11 +1,14 @@
 import json
 import os
+import secrets
 import sqlite3
 from datetime import date, datetime, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
+from urllib.request import Request, urlopen
 
 from .ai_monitor import analyze_stock, build_ai_monitor
 from .backtest import high_win_strategy_backtest, realistic_strategy_backtest
@@ -84,6 +87,20 @@ def _make_handler(db_path: Path):
                     self._send_json(api_watchlist_add(db_path, _param(params, "code", "")))
                 elif parsed.path == "/api/watchlist/remove":
                     self._send_json(api_watchlist_remove(db_path, _param(params, "code", "")))
+                elif parsed.path == "/api/user/create":
+                    self._send_json(api_user_create(db_path, _param(params, "name", "")))
+                elif parsed.path == "/api/user/profile":
+                    self._send_json(api_user_profile(db_path, _param(params, "user_key", "")))
+                elif parsed.path == "/api/user/watchlist":
+                    self._send_json(api_user_watchlist(db_path, _param(params, "user_key", "")))
+                elif parsed.path == "/api/user/watchlist/add":
+                    self._send_json(api_user_watchlist_add(db_path, _param(params, "user_key", ""), _param(params, "code", "")))
+                elif parsed.path == "/api/user/watchlist/remove":
+                    self._send_json(api_user_watchlist_remove(db_path, _param(params, "user_key", ""), _param(params, "code", "")))
+                elif parsed.path == "/api/user/telegram/save":
+                    self._send_json(api_user_telegram_save(db_path, _param(params, "user_key", ""), _param(params, "chat_id", "")))
+                elif parsed.path == "/api/user/telegram/test":
+                    self._send_json(api_user_telegram_test(db_path, _param(params, "user_key", "")))
                 elif parsed.path == "/api/realtime":
                     codes = _param(params, "codes", "2330,2317,2454,2308,2412,2882")
                     self._send_json(api_realtime(db_path, codes))
@@ -618,6 +635,132 @@ def api_watchlist_remove(db_path: Path, code: str) -> dict:
     return api_watchlist(db_path)
 
 
+def api_user_create(db_path: Path, name: str) -> dict:
+    display_name = name.strip()[:40] or "朋友"
+    user_key = secrets.token_urlsafe(18)
+    with _connect(db_path) as conn:
+        _ensure_user_tables(conn)
+        conn.execute(
+            """
+            INSERT INTO app_users (user_key, display_name, created_at, updated_at)
+            VALUES (?, ?, datetime('now'), datetime('now'))
+            """,
+            (user_key, display_name),
+        )
+        conn.executemany(
+            "INSERT OR IGNORE INTO user_watchlist (user_key, code, created_at) VALUES (?, ?, datetime('now'))",
+            [(user_key, code) for code in ["2330", "2367", "2454"]],
+        )
+        conn.commit()
+    return api_user_profile(db_path, user_key)
+
+
+def api_user_profile(db_path: Path, user_key: str) -> dict:
+    user = _user_row(db_path, user_key)
+    if not user:
+        return {"error": "找不到使用者，請重新建立個人推播設定。"}
+    return {
+        "user": {
+            "user_key": user["user_key"],
+            "display_name": user["display_name"],
+            "telegram_chat_id": user["telegram_chat_id"] or "",
+            "telegram_enabled": bool(user["telegram_enabled"]),
+            "created_at": user["created_at"],
+        }
+    }
+
+
+def api_user_watchlist(db_path: Path, user_key: str) -> dict:
+    if not _user_row(db_path, user_key):
+        return {"error": "找不到使用者，請先建立個人推播設定。"}
+    codes = _user_watchlist_codes(db_path, user_key)
+    return api_watchlist(db_path, ",".join(codes))
+
+
+def api_user_watchlist_add(db_path: Path, user_key: str, code: str) -> dict:
+    code = code.strip()
+    if not code:
+        return {"error": "請輸入股票代號。"}
+    with _connect(db_path) as conn:
+        _ensure_user_tables(conn)
+        user = conn.execute("SELECT user_key FROM app_users WHERE user_key = ?", (user_key,)).fetchone()
+        if not user:
+            return {"error": "找不到使用者，請先建立個人推播設定。"}
+        stock = conn.execute("SELECT code FROM stocks WHERE code = ?", (code,)).fetchone()
+        if not stock:
+            return {"error": f"找不到股票代號 {code}。"}
+        conn.execute(
+            "INSERT OR IGNORE INTO user_watchlist (user_key, code, created_at) VALUES (?, ?, datetime('now'))",
+            (user_key, code),
+        )
+        conn.commit()
+    return api_user_watchlist(db_path, user_key)
+
+
+def api_user_watchlist_remove(db_path: Path, user_key: str, code: str) -> dict:
+    with _connect(db_path) as conn:
+        _ensure_user_tables(conn)
+        conn.execute("DELETE FROM user_watchlist WHERE user_key = ? AND code = ?", (user_key, code.strip()))
+        conn.commit()
+    return api_user_watchlist(db_path, user_key)
+
+
+def api_user_telegram_save(db_path: Path, user_key: str, chat_id: str) -> dict:
+    chat_id = chat_id.strip()
+    if not chat_id:
+        return {"error": "請輸入 Telegram chat_id。"}
+    with _connect(db_path) as conn:
+        _ensure_user_tables(conn)
+        row = conn.execute("SELECT user_key FROM app_users WHERE user_key = ?", (user_key,)).fetchone()
+        if not row:
+            return {"error": "找不到使用者，請先建立個人推播設定。"}
+        conn.execute(
+            """
+            UPDATE app_users
+            SET telegram_chat_id = ?, telegram_enabled = 1, updated_at = datetime('now')
+            WHERE user_key = ?
+            """,
+            (chat_id, user_key),
+        )
+        conn.commit()
+    return api_user_profile(db_path, user_key)
+
+
+def api_user_telegram_test(db_path: Path, user_key: str) -> dict:
+    user = _user_row(db_path, user_key)
+    if not user:
+        return {"error": "找不到使用者，請先建立個人推播設定。"}
+    chat_id = user["telegram_chat_id"]
+    if not chat_id:
+        return {"error": "尚未設定 Telegram chat_id。"}
+    message = _build_user_daily_message(db_path, user_key, user["display_name"], limit=5)
+    _send_telegram_to_chat(chat_id, message)
+    return {"ok": True, "message": "已送出 Telegram 測試推播。"}
+
+
+def send_enabled_user_telegrams(db_path: Path, limit: int = 5) -> dict:
+    with _connect(db_path) as conn:
+        _ensure_user_tables(conn)
+        users = conn.execute(
+            """
+            SELECT user_key, display_name, telegram_chat_id
+            FROM app_users
+            WHERE telegram_enabled = 1 AND telegram_chat_id IS NOT NULL AND telegram_chat_id != ''
+            ORDER BY created_at
+            """
+        ).fetchall()
+    sent = 0
+    failures = []
+    for user in users:
+        try:
+            message = _build_user_daily_message(db_path, user["user_key"], user["display_name"], limit=limit)
+            _send_telegram_to_chat(user["telegram_chat_id"], message)
+            sent += 1
+        except Exception as exc:
+            failures.append({"user_key": user["user_key"], "name": user["display_name"], "error": str(exc)})
+    return {"users": len(users), "sent": sent, "failures": failures}
+
+
 def api_realtime(db_path: Path, raw_codes: str) -> dict:
     codes = [code.strip() for code in raw_codes.split(",") if code.strip()]
     with _connect(db_path) as conn:
@@ -817,6 +960,128 @@ def _ensure_watchlist(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_watchlist_created_at ON watchlist(created_at)")
+
+
+def _ensure_user_tables(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_users (
+            user_key TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            telegram_chat_id TEXT,
+            telegram_enabled INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_watchlist (
+            user_key TEXT NOT NULL,
+            code TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (user_key, code),
+            FOREIGN KEY (user_key) REFERENCES app_users(user_key),
+            FOREIGN KEY (code) REFERENCES stocks(code)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_user_watchlist_user ON user_watchlist(user_key, created_at)")
+
+
+def _user_row(db_path: Path, user_key: str) -> sqlite3.Row | None:
+    key = user_key.strip()
+    if not key:
+        return None
+    with _connect(db_path) as conn:
+        _ensure_user_tables(conn)
+        return conn.execute("SELECT * FROM app_users WHERE user_key = ?", (key,)).fetchone()
+
+
+def _user_watchlist_codes(db_path: Path, user_key: str) -> list[str]:
+    with _connect(db_path) as conn:
+        _ensure_user_tables(conn)
+        rows = conn.execute(
+            "SELECT code FROM user_watchlist WHERE user_key = ? ORDER BY created_at, code",
+            (user_key,),
+        ).fetchall()
+    return [row["code"] for row in rows]
+
+
+def _build_user_daily_message(db_path: Path, user_key: str, display_name: str, limit: int = 5) -> str:
+    status = api_status(db_path)
+    codes = _user_watchlist_codes(db_path, user_key)
+    rows = api_watchlist(db_path, ",".join(codes)).get("watchlist", [])[:limit]
+    lines = [
+        f"台股智研｜{display_name} 的個人觀察名單",
+        f"資料日期：{status.get('last_date', '無資料')}",
+        "",
+        "觀察名單技術建議",
+    ]
+    if not rows:
+        lines.append("目前尚未加入觀察股票，請先回網站加入觀察名單。")
+    for item in rows:
+        lines.extend([
+            "",
+            f"{item['code']} {item['name']}｜AI {item.get('score', '無資料')}｜{item.get('signal', '資料不足')}",
+            f"收盤：{fmt_value(item.get('close'))}｜20D {fmt_value(item.get('return_20d'))}%｜RSI {fmt_value(item.get('rsi_14'))}",
+            f"買點：{item.get('buy_zone', '無資料')}",
+            f"賣點：{item.get('sell_zone', '無資料')}",
+            f"停損：{item.get('stop', '無資料')}",
+            f"建議：{_simple_watch_advice(item)}",
+        ])
+    lines.extend([
+        "",
+        "提醒：這是系統依技術面與風控條件產生的研究提醒，不是保證獲利或直接下單指令。",
+    ])
+    return "\n".join(lines)
+
+
+def _send_telegram_to_chat(chat_id: str, message: str) -> dict:
+    config_path = Path(__file__).resolve().parents[1] / "config" / "notify.json"
+    if not config_path.exists():
+        raise RuntimeError("主機尚未設定 Telegram Bot token。")
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    bot_token = (config.get("telegram") or {}).get("bot_token")
+    if not bot_token or "PASTE_" in str(bot_token):
+        raise RuntimeError("主機 Telegram Bot token 尚未設定完成。")
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = json.dumps(
+        {"chat_id": chat_id, "text": message[:3900], "disable_web_page_preview": True},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    request = Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urlopen(request, timeout=30) as response:
+            raw = response.read().decode("utf-8")
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Telegram 發送失敗：HTTP {exc.code} {detail}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Telegram 發送失敗：{exc}") from exc
+    return json.loads(raw) if raw else {"ok": True}
+
+
+def fmt_value(value, digits: int = 2) -> str:
+    if value is None:
+        return "無資料"
+    if isinstance(value, (int, float)):
+        return f"{value:.{digits}f}"
+    return str(value)
+
+
+def _simple_watch_advice(item: dict) -> str:
+    score = item.get("score")
+    ret20 = item.get("return_20d")
+    rsi14 = item.get("rsi_14")
+    if rsi14 is not None and rsi14 >= 75:
+        return "短線偏熱，已有部位可分批停利，未進場不宜追高。"
+    if ret20 is not None and ret20 <= -10:
+        return "短線轉弱，先等止跌與重新站回月線再評估。"
+    if score is not None and score >= 70:
+        return "訊號偏強，可用買點區分批觀察，務必搭配停損。"
+    return "維持觀察，等待量價與均線結構更明確。"
 
 
 def _watchlist_codes(db_path: Path) -> list[str]:
@@ -2601,11 +2866,22 @@ INDEX_HTML = r"""<!doctype html>
     <div class="page" id="notifyPage">
       <div class="grid">
         <section class="wide">
-          <h2>Telegram 推播</h2>
+          <h2>個人 Telegram 推播</h2>
+          <div class="toolbar">
+            <input id="notifyName" placeholder="你的名稱，例如 Kevin" aria-label="推播使用者名稱">
+            <button type="button" onclick="runAction(createUserProfile, '正在建立個人推播設定...')">建立個人設定</button>
+          </div>
+          <div class="toolbar">
+            <input id="telegramChatId" placeholder="Telegram chat_id" aria-label="Telegram chat id">
+            <button type="button" onclick="runAction(saveUserTelegram, '正在儲存 Telegram...')">儲存 Telegram</button>
+            <button type="button" onclick="runAction(sendUserTelegramTest, '正在發送測試推播...')">發送測試推播</button>
+          </div>
+          <div class="hint" id="notifyHint">朋友可建立自己的個人設定、觀察名單與 Telegram 推播，不會影響主機名單。</div>
           <div class="content"><dl>
-            <dt>每日排程</dt><dd>週一至週五 15:30 自動更新並推播</dd>
-            <dt>推播內容</dt><dd>市場摘要、觀察名單、AI 盯盤、買點賣點停損、AI 訊號備選</dd>
-            <dt>手動執行</dt><dd>回到選單按「Preview push notification」或「Send Telegram report」</dd>
+            <dt>個人代碼</dt><dd id="notifyUserKey">尚未建立</dd>
+            <dt>推播狀態</dt><dd id="notifyTelegramStatus">尚未設定</dd>
+            <dt>推播內容</dt><dd>個人觀察名單、AI 分數、買點、賣點、停損與操作提醒</dd>
+            <dt>自動排程</dt><dd>正式主機可每天盤後批次發送給所有已啟用 Telegram 的使用者</dd>
           </dl></div>
         </section>
       </div>
@@ -2636,6 +2912,8 @@ INDEX_HTML = r"""<!doctype html>
     const pctClass = value => value > 0 ? "positive" : value < 0 ? "negative" : "";
     let publicDemoMode = false;
     const publicWatchlistKey = "stock_v1_public_watchlist";
+    const userKeyStorageKey = "stock_v1_user_key";
+    let currentUserKey = localStorage.getItem(userKeyStorageKey) || "";
     async function getJson(url) {
       const response = await fetch(url);
       const data = await response.json();
@@ -2649,6 +2927,7 @@ INDEX_HTML = r"""<!doctype html>
       } catch (error) {
         publicDemoMode = false;
       }
+      await loadUserProfile();
     }
     function localWatchlistCodes() {
       try {
@@ -2664,6 +2943,7 @@ INDEX_HTML = r"""<!doctype html>
       return clean;
     }
     async function getWatchlistData() {
+      if (currentUserKey) return getJson(`/api/user/watchlist?user_key=${encodeURIComponent(currentUserKey)}`);
       if (!publicDemoMode) return getJson("/api/watchlist");
       const codes = localWatchlistCodes();
       return getJson(`/api/watchlist?codes=${encodeURIComponent(codes.join(","))}`);
@@ -3694,7 +3974,9 @@ INDEX_HTML = r"""<!doctype html>
       const watchData = await getWatchlistData();
       const majors = watchData.watchlist || data.majors || [];
       renderMajors(document.getElementById("watchMajorsTable"), majors);
-      const modeText = publicDemoMode ? "公開展示模式：觀察名單只存在此瀏覽器，不會影響主機與推播。" : "觀察名單會保存在本機資料庫，可同步到即時看盤與推播。";
+      const modeText = currentUserKey
+        ? "個人模式：觀察名單會綁定你的使用者代碼，推播只送到你的 Telegram。"
+        : publicDemoMode ? "公開展示模式：觀察名單只存在此瀏覽器，不會影響主機與推播。" : "觀察名單會保存在本機資料庫，可同步到即時看盤與推播。";
       document.getElementById("watchlistHint").textContent = `目前觀察 ${majors.length} 檔。${modeText}`;
       renderDl(document.getElementById("watchAfterSummary"), [
         ["盤後定位", "這裡只保留觀察名單與盤後摘要，AI 智選、強勢排行與量能焦點集中到股票探索。"],
@@ -3705,6 +3987,12 @@ INDEX_HTML = r"""<!doctype html>
     }
     async function addWatchlistCode() {
       const code = document.getElementById("watchlistCode").value.trim();
+      if (currentUserKey) {
+        const data = await getJson(`/api/user/watchlist/add?user_key=${encodeURIComponent(currentUserKey)}&code=${encodeURIComponent(code)}`);
+        renderMajors(document.getElementById("watchMajorsTable"), data.watchlist || []);
+        document.getElementById("watchlistHint").textContent = `已加入 ${code}。這是你的個人觀察名單。`;
+        return;
+      }
       if (publicDemoMode) {
         const codes = saveLocalWatchlist([...localWatchlistCodes(), code]);
         const data = await getJson(`/api/watchlist?codes=${encodeURIComponent(codes.join(","))}`);
@@ -3717,6 +4005,12 @@ INDEX_HTML = r"""<!doctype html>
       document.getElementById("watchlistHint").textContent = `已加入 ${code}，目前觀察 ${(data.watchlist || []).length} 檔。`;
     }
     async function removeWatchlistCode(code) {
+      if (currentUserKey) {
+        const data = await getJson(`/api/user/watchlist/remove?user_key=${encodeURIComponent(currentUserKey)}&code=${encodeURIComponent(code)}`);
+        renderMajors(document.getElementById("watchMajorsTable"), data.watchlist || []);
+        document.getElementById("watchlistHint").textContent = `已移除 ${code}。這是你的個人觀察名單。`;
+        return;
+      }
       if (publicDemoMode) {
         const codes = saveLocalWatchlist(localWatchlistCodes().filter(item => item !== code));
         const data = await getJson(`/api/watchlist?codes=${encodeURIComponent(codes.join(","))}`);
@@ -3745,6 +4039,55 @@ INDEX_HTML = r"""<!doctype html>
     function openHubStock() {
       const code = document.getElementById("hubCode").value.trim() || "2330";
       openStock(code);
+    }
+    async function loadUserProfile() {
+      if (!currentUserKey) {
+        updateNotifyUi(null);
+        return;
+      }
+      try {
+        const data = await getJson(`/api/user/profile?user_key=${encodeURIComponent(currentUserKey)}`);
+        updateNotifyUi(data.user);
+      } catch (error) {
+        localStorage.removeItem(userKeyStorageKey);
+        currentUserKey = "";
+        updateNotifyUi(null);
+      }
+    }
+    function updateNotifyUi(user) {
+      const keyEl = document.getElementById("notifyUserKey");
+      const statusEl = document.getElementById("notifyTelegramStatus");
+      const hintEl = document.getElementById("notifyHint");
+      if (!keyEl || !statusEl || !hintEl) return;
+      if (!user) {
+        keyEl.textContent = "尚未建立";
+        statusEl.textContent = "尚未設定";
+        hintEl.textContent = "請先建立個人設定，再儲存 Telegram chat_id。";
+        return;
+      }
+      keyEl.textContent = user.user_key;
+      document.getElementById("telegramChatId").value = user.telegram_chat_id || "";
+      statusEl.textContent = user.telegram_enabled ? `已啟用：${user.telegram_chat_id}` : "尚未啟用";
+      hintEl.textContent = `${user.display_name} 的個人設定已啟用。請妥善保存個人代碼；同一個瀏覽器會自動記住。`;
+    }
+    async function createUserProfile() {
+      const name = document.getElementById("notifyName").value.trim() || "朋友";
+      const data = await getJson(`/api/user/create?name=${encodeURIComponent(name)}`);
+      currentUserKey = data.user.user_key;
+      localStorage.setItem(userKeyStorageKey, currentUserKey);
+      updateNotifyUi(data.user);
+      await fetchWatch();
+    }
+    async function saveUserTelegram() {
+      if (!currentUserKey) throw new Error("請先建立個人設定。");
+      const chatId = document.getElementById("telegramChatId").value.trim();
+      const data = await getJson(`/api/user/telegram/save?user_key=${encodeURIComponent(currentUserKey)}&chat_id=${encodeURIComponent(chatId)}`);
+      updateNotifyUi(data.user);
+    }
+    async function sendUserTelegramTest() {
+      if (!currentUserKey) throw new Error("請先建立個人設定。");
+      const data = await getJson(`/api/user/telegram/test?user_key=${encodeURIComponent(currentUserKey)}`);
+      document.getElementById("notifyHint").textContent = data.message || "測試推播已送出。";
     }
     let realtimeTimer = null;
     let selectedRealtimeCode = "";
