@@ -86,3 +86,41 @@ https://taiwan-stock-ai.onrender.com
 ## 安全提醒
 
 不要把 `config/notify.json` 上傳到公開 GitHub，裡面可能有 Telegram / LINE token。
+
+## Telegram 問答 Bot
+
+正式版 Render 使用 Webhook：
+
+```bash
+python -m stock_v1 telegram-webhook --url https://你的-render網址/api/telegram/webhook
+```
+
+本機版使用 Polling：
+
+```powershell
+python -m stock_v1 telegram-poll
+```
+
+可在 Telegram 輸入：
+
+```text
+2330
+分析 2454
+加入 2367
+移除 2367
+我的觀察名單
+AI智選
+幫助
+```
+
+正式版與本機版都需要設定 Telegram Bot Token：
+
+```text
+STOCK_V1_TELEGRAM_BOT_TOKEN=你的 Telegram Bot Token
+```
+
+本機也可以繼續使用：
+
+```text
+config/notify.json
+```

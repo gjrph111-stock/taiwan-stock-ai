@@ -111,6 +111,19 @@ def _make_handler(db_path: Path):
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=500)
 
+        def do_POST(self):
+            parsed = urlparse(self.path)
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+                raw = self.rfile.read(length) if length else b"{}"
+                payload = json.loads(raw.decode("utf-8") or "{}")
+                if parsed.path == "/api/telegram/webhook":
+                    self._send_json(api_telegram_webhook(db_path, payload))
+                else:
+                    self._send_json({"error": "not found"}, status=404)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+
         def log_message(self, format, *args):
             return
 
@@ -761,6 +774,72 @@ def send_enabled_user_telegrams(db_path: Path, limit: int = 5) -> dict:
     return {"users": len(users), "sent": sent, "failures": failures}
 
 
+def api_telegram_webhook(db_path: Path, payload: dict) -> dict:
+    message = payload.get("message") or payload.get("edited_message") or {}
+    text = str(message.get("text") or "").strip()
+    chat = message.get("chat") or {}
+    chat_id = str(chat.get("id") or "").strip()
+    if not chat_id or not text:
+        return {"ok": True, "ignored": True}
+    first_name = str(chat.get("first_name") or chat.get("username") or "Telegram 使用者")
+    reply = handle_telegram_text(db_path, chat_id, text, first_name)
+    _send_telegram_to_chat(chat_id, reply)
+    return {"ok": True}
+
+
+def handle_telegram_text(db_path: Path, chat_id: str, text: str, display_name: str = "Telegram 使用者") -> str:
+    normalized = text.strip()
+    lowered = normalized.lower()
+    if lowered in {"/start", "start", "開始"}:
+        user = _ensure_telegram_user(db_path, chat_id, display_name)
+        return (
+            f"已建立/綁定個人設定：{user['display_name']}\n"
+            "你可以直接輸入股票代號，例如 2330。\n\n"
+            + _telegram_help_text()
+        )
+    if lowered in {"/help", "help", "幫助", "說明"}:
+        return _telegram_help_text()
+
+    user = _ensure_telegram_user(db_path, chat_id, display_name)
+    code = _extract_stock_code(normalized)
+
+    if normalized.startswith(("加入", "新增", "+")) and code:
+        api_user_watchlist_add(db_path, user["user_key"], code)
+        return f"已加入 {code} 到你的個人觀察名單。"
+    if normalized.startswith(("移除", "刪除", "-")) and code:
+        api_user_watchlist_remove(db_path, user["user_key"], code)
+        return f"已從你的個人觀察名單移除 {code}。"
+    if normalized in {"我的觀察名單", "觀察名單", "watchlist"}:
+        return _format_telegram_watchlist(db_path, user["user_key"])
+    if normalized.upper() in {"TOP5", "AI", "AI智選", "AI 智選"}:
+        return _format_telegram_top_signals(db_path, 5)
+    if code:
+        return _format_telegram_stock_answer(db_path, code)
+    return "我看不懂這個指令。\n\n" + _telegram_help_text()
+
+
+def poll_telegram_updates(db_path: Path, once: bool = False, interval: int = 3) -> None:
+    offset = None
+    print("Telegram polling started. Press Ctrl+C to stop.")
+    while True:
+        params = {"timeout": 25}
+        if offset is not None:
+            params["offset"] = offset
+        payload = _telegram_api("getUpdates", params)
+        for update in payload.get("result") or []:
+            offset = int(update["update_id"]) + 1
+            api_telegram_webhook(db_path, update)
+        if once:
+            return
+        import time as _time
+
+        _time.sleep(max(1, interval))
+
+
+def set_telegram_webhook(url: str) -> dict:
+    return _telegram_api("setWebhook", {"url": url})
+
+
 def api_realtime(db_path: Path, raw_codes: str) -> dict:
     codes = [code.strip() for code in raw_codes.split(",") if code.strip()]
     with _connect(db_path) as conn:
@@ -1009,6 +1088,125 @@ def _user_watchlist_codes(db_path: Path, user_key: str) -> list[str]:
     return [row["code"] for row in rows]
 
 
+def _ensure_telegram_user(db_path: Path, chat_id: str, display_name: str) -> sqlite3.Row:
+    with _connect(db_path) as conn:
+        _ensure_user_tables(conn)
+        row = conn.execute(
+            "SELECT * FROM app_users WHERE telegram_chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+        if row:
+            return row
+        user_key = secrets.token_urlsafe(18)
+        conn.execute(
+            """
+            INSERT INTO app_users (user_key, display_name, telegram_chat_id, telegram_enabled, created_at, updated_at)
+            VALUES (?, ?, ?, 1, datetime('now'), datetime('now'))
+            """,
+            (user_key, display_name[:40] or "Telegram 使用者", chat_id),
+        )
+        conn.executemany(
+            "INSERT OR IGNORE INTO user_watchlist (user_key, code, created_at) VALUES (?, ?, datetime('now'))",
+            [(user_key, code) for code in ["2330", "2367", "2454"]],
+        )
+        conn.commit()
+        return conn.execute("SELECT * FROM app_users WHERE user_key = ?", (user_key,)).fetchone()
+
+
+def _extract_stock_code(text: str) -> str | None:
+    for token in text.replace("：", " ").replace(":", " ").replace(",", " ").split():
+        clean = token.strip().lstrip("+-#")
+        if clean.isdigit() and 4 <= len(clean) <= 6:
+            return clean[:6]
+    if text.strip().isdigit() and 4 <= len(text.strip()) <= 6:
+        return text.strip()
+    return None
+
+
+def _telegram_help_text() -> str:
+    return "\n".join(
+        [
+            "可用指令：",
+            "2330｜查個股分析",
+            "分析 2454｜查個股買點、賣點、停損",
+            "加入 2367｜加入個人觀察名單",
+            "移除 2367｜移除個人觀察名單",
+            "我的觀察名單｜查看自己的股票提醒",
+            "AI智選｜查看 AI Top 5",
+        ]
+    )
+
+
+def _format_telegram_stock_answer(db_path: Path, code: str) -> str:
+    stock = api_stock(db_path, code)
+    if stock.get("error"):
+        return stock["error"]
+    signal = api_stock_signal(db_path, code)
+    watch = _watch_snapshot(db_path, code) or {}
+    latest = stock.get("latest") or {}
+    lines = [
+        f"{stock['code']} {stock.get('short_name') or stock['name']}",
+        f"產業：{stock.get('industry', '無資料')}",
+        f"日期：{latest.get('date', '無資料')}",
+        f"收盤：{fmt_value(latest.get('close'))}",
+    ]
+    if not signal.get("error"):
+        lines.extend(
+            [
+                f"AI 分數：{fmt_value(signal.get('risk_adjusted_score'), 1)}｜{signal.get('signal', '資料不足')}",
+                f"20D：{fmt_value(signal.get('return_20d'))}%｜60D：{fmt_value(signal.get('return_60d'))}%",
+                f"回撤：{fmt_value(signal.get('drawdown_pct'))}%",
+            ]
+        )
+    lines.extend(
+        [
+            f"買點：{watch.get('buy_zone', '無資料')}",
+            f"賣點：{watch.get('sell_zone', '無資料')}",
+            f"停損：{watch.get('stop', '無資料')}",
+            f"建議：{_simple_watch_advice(watch) if watch else '資料不足'}",
+            "",
+            "提醒：這是研究輔助，不是保證獲利或直接下單指令。",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _format_telegram_watchlist(db_path: Path, user_key: str) -> str:
+    rows = api_user_watchlist(db_path, user_key).get("watchlist", [])
+    if not rows:
+        return "你的觀察名單目前是空的。可以輸入：加入 2330"
+    lines = ["你的觀察名單"]
+    for item in rows[:8]:
+        lines.extend(
+            [
+                "",
+                f"{item['code']} {item['name']}｜AI {fmt_value(item.get('score'), 1)}｜{item.get('signal', '資料不足')}",
+                f"收盤 {fmt_value(item.get('close'))}｜20D {fmt_value(item.get('return_20d'))}%｜RSI {fmt_value(item.get('rsi_14'))}",
+                f"買點 {item.get('buy_zone', '無資料')}｜停損 {item.get('stop', '無資料')}",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _format_telegram_top_signals(db_path: Path, limit: int = 5) -> str:
+    data = api_signals(db_path, limit)
+    rows = data.get("top_signals") or []
+    if not rows:
+        return "目前沒有 AI 智選資料。"
+    lines = [f"AI 智選 Top {limit}"]
+    for item in rows[:limit]:
+        lines.extend(
+            [
+                "",
+                f"{item['code']} {item.get('short_name') or short_name(item['name'])}｜{item['score']}｜{item['signal']}",
+                f"收盤 {fmt_value(item.get('close'))}｜20D {fmt_value(item.get('return_20d'))}%｜量比 {fmt_value(item.get('volume_ratio'))}",
+                f"買點：{item.get('entry_zone', '無資料')}",
+                f"停損：{item.get('stop', '無資料')}",
+            ]
+        )
+    return "\n".join(lines)
+
+
 def _build_user_daily_message(db_path: Path, user_key: str, display_name: str, limit: int = 5) -> str:
     status = api_status(db_path)
     codes = _user_watchlist_codes(db_path, user_key)
@@ -1039,19 +1237,17 @@ def _build_user_daily_message(db_path: Path, user_key: str, display_name: str, l
 
 
 def _send_telegram_to_chat(chat_id: str, message: str) -> dict:
-    config_path = Path(__file__).resolve().parents[1] / "config" / "notify.json"
-    bot_token = os.environ.get("STOCK_V1_TELEGRAM_BOT_TOKEN", "").strip()
-    if not bot_token and config_path.exists():
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-        bot_token = str((config.get("telegram") or {}).get("bot_token") or "").strip()
-    if not bot_token or "PASTE_" in str(bot_token):
-        raise RuntimeError("主機 Telegram Bot token 尚未設定完成。請設定 STOCK_V1_TELEGRAM_BOT_TOKEN。")
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = json.dumps(
+    return _telegram_api(
+        "sendMessage",
         {"chat_id": chat_id, "text": message[:3900], "disable_web_page_preview": True},
-        ensure_ascii=False,
-    ).encode("utf-8")
-    request = Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+    )
+
+
+def _telegram_api(method: str, payload: dict) -> dict:
+    bot_token = _telegram_bot_token()
+    url = f"https://api.telegram.org/bot{bot_token}/{method}"
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
     try:
         with urlopen(request, timeout=30) as response:
             raw = response.read().decode("utf-8")
@@ -1061,6 +1257,17 @@ def _send_telegram_to_chat(chat_id: str, message: str) -> dict:
     except URLError as exc:
         raise RuntimeError(f"Telegram 發送失敗：{exc}") from exc
     return json.loads(raw) if raw else {"ok": True}
+
+
+def _telegram_bot_token() -> str:
+    config_path = Path(__file__).resolve().parents[1] / "config" / "notify.json"
+    bot_token = os.environ.get("STOCK_V1_TELEGRAM_BOT_TOKEN", "").strip()
+    if not bot_token and config_path.exists():
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        bot_token = str((config.get("telegram") or {}).get("bot_token") or "").strip()
+    if not bot_token or "PASTE_" in str(bot_token):
+        raise RuntimeError("主機 Telegram Bot token 尚未設定完成。請設定 STOCK_V1_TELEGRAM_BOT_TOKEN。")
+    return bot_token
 
 
 def fmt_value(value, digits: int = 2) -> str:

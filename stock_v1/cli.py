@@ -29,7 +29,7 @@ from .reports import (
     print_watchlist,
 )
 from .update import update_prices, update_universe
-from .web import run as run_web, send_enabled_user_telegrams
+from .web import poll_telegram_updates, run as run_web, send_enabled_user_telegrams, set_telegram_webhook
 
 
 def main() -> None:
@@ -116,6 +116,13 @@ def main() -> None:
 
     user_telegram_parser = subparsers.add_parser("notify-users", help="Send personal Telegram reports to enabled users")
     user_telegram_parser.add_argument("--limit", type=int, default=5, help="Rows per user watchlist")
+
+    webhook_parser = subparsers.add_parser("telegram-webhook", help="Set Telegram webhook URL")
+    webhook_parser.add_argument("--url", required=True, help="Webhook URL, e.g. https://example.onrender.com/api/telegram/webhook")
+
+    poll_parser = subparsers.add_parser("telegram-poll", help="Run local Telegram bot polling")
+    poll_parser.add_argument("--once", action="store_true", help="Poll one batch then exit")
+    poll_parser.add_argument("--interval", type=int, default=3, help="Seconds between polling batches")
 
     line_parser = subparsers.add_parser("notify-line", help="Send daily report to LINE")
     line_parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Notification config path")
@@ -277,6 +284,17 @@ def main() -> None:
         conn.close()
         result = send_enabled_user_telegrams(Path(args.db), args.limit)
         print(result)
+        return
+
+    if args.command == "telegram-webhook":
+        conn.close()
+        result = set_telegram_webhook(args.url)
+        print(result)
+        return
+
+    if args.command == "telegram-poll":
+        conn.close()
+        poll_telegram_updates(Path(args.db), once=args.once, interval=args.interval)
         return
 
     if args.command == "notify-line":
