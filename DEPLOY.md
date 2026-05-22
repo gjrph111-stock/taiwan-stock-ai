@@ -66,7 +66,16 @@ Render 請加入：
 
 ```text
 STOCK_V1_DB_PATH=data/tw_stocks_deploy.sqlite
+STOCK_V1_PUBLIC_DEMO=0
 ```
+
+`render.yaml` 已設定 `plan: free`，Render 會提供固定網址：
+
+```text
+https://taiwan-stock-ai.onrender.com
+```
+
+若此名稱已被使用，Render 會要求改服務名稱，網址也會跟著改。
 
 正式營運時建議改成：
 

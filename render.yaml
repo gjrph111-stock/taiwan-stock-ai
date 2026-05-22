@@ -1,10 +1,11 @@
 services:
   - type: web
     name: taiwan-stock-ai
-    env: python
-    plan: starter
+    runtime: python
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python -m stock_v1 web --host 0.0.0.0
+    healthCheckPath: /api/status
     envVars:
       - key: HOST
         value: 0.0.0.0
@@ -12,3 +13,5 @@ services:
         value: data/tw_stocks_deploy.sqlite
       - key: STOCK_V1_ALLOWED_ORIGINS
         value: "*"
+      - key: STOCK_V1_PUBLIC_DEMO
+        value: "0"
