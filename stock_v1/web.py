@@ -48,6 +48,8 @@ def _make_handler(db_path: Path):
                     self._send_html(INDEX_HTML)
                 elif parsed.path == "/api/status":
                     self._send_json(api_status(db_path))
+                elif parsed.path == "/api/public-config":
+                    self._send_json(api_public_config())
                 elif parsed.path == "/api/stock":
                     self._send_json(api_stock(db_path, _param(params, "code", "2330")))
                 elif parsed.path == "/api/indicators":
@@ -77,7 +79,7 @@ def _make_handler(db_path: Path):
                 elif parsed.path == "/api/news":
                     self._send_json(api_news(db_path, _param(params, "code", "2330")))
                 elif parsed.path == "/api/watchlist":
-                    self._send_json(api_watchlist(db_path))
+                    self._send_json(api_watchlist(db_path, _param(params, "codes", "")))
                 elif parsed.path == "/api/watchlist/add":
                     self._send_json(api_watchlist_add(db_path, _param(params, "code", "")))
                 elif parsed.path == "/api/watchlist/remove":
@@ -137,6 +139,10 @@ def _allowed_origin(origin: str | None) -> str | None:
     if origin and origin.rstrip("/") in allowed:
         return origin
     return None
+
+
+def _public_demo_mode() -> bool:
+    return os.environ.get("STOCK_V1_PUBLIC_DEMO", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def api_status(db_path: Path) -> dict:
@@ -563,13 +569,22 @@ def _market_session() -> dict:
     }
 
 
-def api_watchlist(db_path: Path) -> dict:
-    rows = [_watch_snapshot(db_path, code) for code in _watchlist_codes(db_path)]
+def api_public_config() -> dict:
+    return {"public_demo": _public_demo_mode()}
+
+
+def api_watchlist(db_path: Path, raw_codes: str = "") -> dict:
+    codes = [code.strip() for code in raw_codes.split(",") if code.strip()]
+    if not codes:
+        codes = _watchlist_codes(db_path)
+    rows = [_watch_snapshot(db_path, code) for code in codes]
     rows = [row for row in rows if row]
     return {"watchlist": rows, "codes": [row["code"] for row in rows]}
 
 
 def api_watchlist_add(db_path: Path, code: str) -> dict:
+    if _public_demo_mode():
+        return {"error": "公開展示模式不會修改主機觀察名單，請使用瀏覽器本機觀察名單。"}
     code = code.strip()
     if not code:
         return {"error": "請輸入股票代號。"}
@@ -591,6 +606,8 @@ def api_watchlist_add(db_path: Path, code: str) -> dict:
 
 
 def api_watchlist_remove(db_path: Path, code: str) -> dict:
+    if _public_demo_mode():
+        return {"error": "公開展示模式不會修改主機觀察名單，請使用瀏覽器本機觀察名單。"}
     code = code.strip()
     if not code:
         return {"error": "請輸入股票代號。"}
@@ -2617,11 +2634,39 @@ INDEX_HTML = r"""<!doctype html>
       return value;
     };
     const pctClass = value => value > 0 ? "positive" : value < 0 ? "negative" : "";
+    let publicDemoMode = false;
+    const publicWatchlistKey = "stock_v1_public_watchlist";
     async function getJson(url) {
       const response = await fetch(url);
       const data = await response.json();
       if (!response.ok || data.error) throw new Error(data.error || "請求失敗");
       return data;
+    }
+    async function initPublicConfig() {
+      try {
+        const config = await getJson("/api/public-config");
+        publicDemoMode = !!config.public_demo;
+      } catch (error) {
+        publicDemoMode = false;
+      }
+    }
+    function localWatchlistCodes() {
+      try {
+        const saved = JSON.parse(localStorage.getItem(publicWatchlistKey) || "[]");
+        return Array.isArray(saved) && saved.length ? saved : ["2330", "2367", "2454"];
+      } catch (error) {
+        return ["2330", "2367", "2454"];
+      }
+    }
+    function saveLocalWatchlist(codes) {
+      const clean = [...new Set(codes.map(code => String(code).trim()).filter(Boolean))];
+      localStorage.setItem(publicWatchlistKey, JSON.stringify(clean));
+      return clean;
+    }
+    async function getWatchlistData() {
+      if (!publicDemoMode) return getJson("/api/watchlist");
+      const codes = localWatchlistCodes();
+      return getJson(`/api/watchlist?codes=${encodeURIComponent(codes.join(","))}`);
     }
     function renderDl(target, rows) {
       target.innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
@@ -3646,8 +3691,11 @@ INDEX_HTML = r"""<!doctype html>
       document.getElementById("watchHighs").textContent = fmt(data.summary.new_high_60, 0);
       document.getElementById("watchSma20").textContent = fmt(data.summary.above_sma20, 0);
       document.getElementById("watchSma60").textContent = fmt(data.summary.above_sma60, 0);
-      renderMajors(document.getElementById("watchMajorsTable"), data.majors);
-      document.getElementById("watchlistHint").textContent = `目前觀察 ${data.majors.length} 檔，可同步到即時看盤。`;
+      const watchData = await getWatchlistData();
+      const majors = watchData.watchlist || data.majors || [];
+      renderMajors(document.getElementById("watchMajorsTable"), majors);
+      const modeText = publicDemoMode ? "公開展示模式：觀察名單只存在此瀏覽器，不會影響主機與推播。" : "觀察名單會保存在本機資料庫，可同步到即時看盤與推播。";
+      document.getElementById("watchlistHint").textContent = `目前觀察 ${majors.length} 檔。${modeText}`;
       renderDl(document.getElementById("watchAfterSummary"), [
         ["盤後定位", "這裡只保留觀察名單與盤後摘要，AI 智選、強勢排行與量能焦點集中到股票探索。"],
         ["60 日新高", `${fmt(data.summary.new_high_60, 0)} 檔`],
@@ -3657,17 +3705,31 @@ INDEX_HTML = r"""<!doctype html>
     }
     async function addWatchlistCode() {
       const code = document.getElementById("watchlistCode").value.trim();
+      if (publicDemoMode) {
+        const codes = saveLocalWatchlist([...localWatchlistCodes(), code]);
+        const data = await getJson(`/api/watchlist?codes=${encodeURIComponent(codes.join(","))}`);
+        renderMajors(document.getElementById("watchMajorsTable"), data.watchlist || []);
+        document.getElementById("watchlistHint").textContent = `已加入 ${code}。公開展示模式只會更新此瀏覽器，不會影響你的主機觀察名單。`;
+        return;
+      }
       const data = await getJson(`/api/watchlist/add?code=${encodeURIComponent(code)}`);
       renderMajors(document.getElementById("watchMajorsTable"), data.watchlist || []);
       document.getElementById("watchlistHint").textContent = `已加入 ${code}，目前觀察 ${(data.watchlist || []).length} 檔。`;
     }
     async function removeWatchlistCode(code) {
+      if (publicDemoMode) {
+        const codes = saveLocalWatchlist(localWatchlistCodes().filter(item => item !== code));
+        const data = await getJson(`/api/watchlist?codes=${encodeURIComponent(codes.join(","))}`);
+        renderMajors(document.getElementById("watchMajorsTable"), data.watchlist || []);
+        document.getElementById("watchlistHint").textContent = `已移除 ${code}。公開展示模式只會更新此瀏覽器。`;
+        return;
+      }
       const data = await getJson(`/api/watchlist/remove?code=${encodeURIComponent(code)}`);
       renderMajors(document.getElementById("watchMajorsTable"), data.watchlist || []);
       document.getElementById("watchlistHint").textContent = `已移除 ${code}，目前觀察 ${(data.watchlist || []).length} 檔。`;
     }
     async function useWatchlistRealtime() {
-      const data = await getJson("/api/watchlist");
+      const data = await getWatchlistData();
       const codes = (data.codes || []).join(",");
       if (!codes) {
         setStatus("觀察名單是空的，請先加入股票。");
@@ -3689,7 +3751,7 @@ INDEX_HTML = r"""<!doctype html>
     async function realtimeCodesFromWatchlist() {
       const manual = document.getElementById("realtimeCodes").value.trim();
       if (manual) return manual;
-      const data = await getJson("/api/watchlist");
+      const data = await getWatchlistData();
       const codes = (data.codes || []).join(",");
       if (codes) {
         document.getElementById("realtimeCodes").value = codes;
@@ -3793,7 +3855,8 @@ INDEX_HTML = r"""<!doctype html>
     document.getElementById("hubCode").addEventListener("keydown", event => {
       if (event.key === "Enter") openHubStock();
     });
-    fetchStatus()
+    initPublicConfig()
+      .then(() => fetchStatus())
       .then(() => fetchStock())
       .then(() => setStatus("準備就緒。排行與策略會在切換頁面時載入。"))
       .catch(error => {

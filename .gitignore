@@ -2,6 +2,8 @@ __pycache__/
 *.py[cod]
 .venv/
 web*.log
+cloudflared*.log
+tools/
 logs/
 reports/
 config/notify.json
