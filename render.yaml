@@ -15,3 +15,5 @@ services:
         value: "*"
       - key: STOCK_V1_PUBLIC_DEMO
         value: "0"
+      - key: STOCK_V1_TELEGRAM_BOT_TOKEN
+        sync: false

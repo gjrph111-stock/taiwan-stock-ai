@@ -67,6 +67,7 @@ Render 請加入：
 ```text
 STOCK_V1_DB_PATH=data/tw_stocks_deploy.sqlite
 STOCK_V1_PUBLIC_DEMO=0
+STOCK_V1_TELEGRAM_BOT_TOKEN=你的 Telegram Bot Token
 ```
 
 `render.yaml` 已設定 `plan: free`，Render 會提供固定網址：

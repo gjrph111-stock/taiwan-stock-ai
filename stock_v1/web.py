@@ -1040,12 +1040,12 @@ def _build_user_daily_message(db_path: Path, user_key: str, display_name: str, l
 
 def _send_telegram_to_chat(chat_id: str, message: str) -> dict:
     config_path = Path(__file__).resolve().parents[1] / "config" / "notify.json"
-    if not config_path.exists():
-        raise RuntimeError("主機尚未設定 Telegram Bot token。")
-    config = json.loads(config_path.read_text(encoding="utf-8"))
-    bot_token = (config.get("telegram") or {}).get("bot_token")
+    bot_token = os.environ.get("STOCK_V1_TELEGRAM_BOT_TOKEN", "").strip()
+    if not bot_token and config_path.exists():
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        bot_token = str((config.get("telegram") or {}).get("bot_token") or "").strip()
     if not bot_token or "PASTE_" in str(bot_token):
-        raise RuntimeError("主機 Telegram Bot token 尚未設定完成。")
+        raise RuntimeError("主機 Telegram Bot token 尚未設定完成。請設定 STOCK_V1_TELEGRAM_BOT_TOKEN。")
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = json.dumps(
         {"chat_id": chat_id, "text": message[:3900], "disable_web_page_preview": True},
