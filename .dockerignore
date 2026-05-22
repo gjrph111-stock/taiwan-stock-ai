@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+web*.log
+logs/
+reports/
+config/notify.json
+data/*.sqlite-shm
+data/*.sqlite-wal
+.env
+.git/

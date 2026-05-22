@@ -1,0 +1,10 @@
+{
+  "telegram": {
+    "bot_token": "PASTE_TELEGRAM_BOT_TOKEN_HERE",
+    "chat_id": "PASTE_TELEGRAM_CHAT_ID_HERE"
+  },
+  "line": {
+    "channel_access_token": "PASTE_LINE_CHANNEL_ACCESS_TOKEN_HERE",
+    "to": "PASTE_LINE_USER_OR_GROUP_ID_HERE"
+  }
+}
