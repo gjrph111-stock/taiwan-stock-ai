@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -235,10 +236,10 @@ def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> dict:
 
 def send_telegram(message: str, config: dict) -> dict:
     telegram = config.get("telegram", {})
-    bot_token = telegram.get("bot_token")
-    chat_id = telegram.get("chat_id")
+    bot_token = os.environ.get("STOCK_V1_TELEGRAM_BOT_TOKEN", "").strip() or telegram.get("bot_token")
+    chat_id = os.environ.get("STOCK_V1_TELEGRAM_CHAT_ID", "").strip() or telegram.get("chat_id")
     if not bot_token or not chat_id or "PASTE_" in bot_token or "PASTE_" in chat_id:
-        raise ValueError("Telegram bot_token/chat_id is not configured in config/notify.json.")
+        raise ValueError("Telegram bot_token/chat_id is not configured in config/notify.json or environment variables.")
 
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {

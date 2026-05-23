@@ -2506,6 +2506,36 @@ INDEX_HTML = r"""<!doctype html>
       font-weight: 900;
       border-bottom: 1px solid #1f2933;
     }
+    .order-ratio {
+      display: grid;
+      grid-template-columns: 86px 1fr 86px;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      color: #00e676;
+      background: #020303;
+      border-bottom: 1px solid #1f2933;
+      font-size: 13px;
+      font-weight: 900;
+    }
+    .order-ratio span:last-child {
+      color: #ef4444;
+      text-align: right;
+    }
+    .order-ratio b {
+      display: block;
+      height: 16px;
+      background: #b91c1c;
+      border-radius: 999px;
+      overflow: hidden;
+      position: relative;
+    }
+    .order-ratio i {
+      display: block;
+      height: 100%;
+      background: #00a000;
+      border-radius: 999px 0 0 999px;
+    }
     .terminal-chart .chart {
       height: 370px;
       border: 0;
@@ -3107,6 +3137,11 @@ INDEX_HTML = r"""<!doctype html>
       <div class="realtime-terminal">
         <section class="terminal-chart">
           <div class="terminal-head" id="realtimeTerminalHead">請先載入觀察名單</div>
+          <div class="order-ratio" id="orderRatioBar">
+            <span>內盤 50.00%</span>
+            <b><i style="width:50%"></i></b>
+            <span>外盤 50.00%</span>
+          </div>
           <svg id="realtimeTrendChart" class="chart" role="img" aria-label="即時走勢圖"></svg>
           <div class="terminal-volume" id="realtimeTrendSummary"></div>
           <div class="note" id="realtimeTrendNotice">點擊股票列查看即時走勢。</div>
@@ -3493,6 +3528,7 @@ INDEX_HTML = r"""<!doctype html>
       if (head) {
         head.innerHTML = `${row.code} ${row.name} <span class="${pctClass(row.change)}" style="margin-left:18px">${fmt(row.price)} ${fmt(row.change)}(${fmt(row.change_percent)}%)</span> <span style="float:right;color:#94a3b8">${row.date || ""}</span>`;
       }
+      renderOrderRatio(row);
       const tape = document.getElementById("realtimeTape");
       const depth = document.getElementById("realtimeDepth");
       if (!tape || !depth) return;
@@ -3518,6 +3554,19 @@ INDEX_HTML = r"""<!doctype html>
           <span>${fmt(item.qty, 0)}</span>
         </div>
       `).join("");
+    }
+    function renderOrderRatio(row) {
+      const target = document.getElementById("orderRatioBar");
+      if (!target || !row) return;
+      const pct = Math.max(-8, Math.min(8, Number(row.change_percent || 0)));
+      const outer = Math.max(15, Math.min(85, 50 + pct * 4));
+      const inner = 100 - outer;
+      target.innerHTML = `
+        <span>${fmt(inner)}%</span>
+        <b><i style="width:${inner}%"></i></b>
+        <span>${fmt(outer)}%</span>
+      `;
+      target.title = "內外盤比例目前為代理估算值；接入逐筆成交 API 後會改為真實內外盤。";
     }
     function renderAiMonitor(target, rows) {
       if (!rows.length) {
@@ -3929,6 +3978,7 @@ INDEX_HTML = r"""<!doctype html>
       if (head) {
         head.innerHTML = `${data.code || ""} ${data.name || ""} <span class="${pctClass(changePct)}" style="margin-left:18px">${fmt(latest.close)} ${fmt(change)}(${fmt(changePct)}%)</span> <span style="float:right;color:#94a3b8">${trendLabel(latest)}</span>`;
       }
+      renderOrderRatio({ change_percent: changePct });
       notice.textContent = `${data.code || ""} ${data.name || ""}｜${data.message || "走勢已更新"}`;
     }
     function renderRealtimeTrendChart(target, rows) {

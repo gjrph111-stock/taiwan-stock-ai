@@ -68,6 +68,7 @@ Render 請加入：
 STOCK_V1_DB_PATH=data/tw_stocks_deploy.sqlite
 STOCK_V1_PUBLIC_DEMO=0
 STOCK_V1_TELEGRAM_BOT_TOKEN=你的 Telegram Bot Token
+STOCK_V1_TELEGRAM_CHAT_ID=你的 Telegram chat_id
 ```
 
 `render.yaml` 已設定 `plan: free`，Render 會提供固定網址：
@@ -131,3 +132,37 @@ STOCK_V1_TELEGRAM_BOT_TOKEN=你的 Telegram Bot Token
 ```text
 config/notify.json
 ```
+
+## 推播排程
+
+盤中 AI 盯盤只允許台北時間週一至週五 09:00-14:00 發送：
+
+```bash
+python -m stock_v1 notify-intraday --limit 5
+```
+
+盤後分析報告與 AI TOP5：
+
+```bash
+python -m stock_v1 notify-after-hours --limit 5
+```
+
+朋友個人推播：
+
+```bash
+python -m stock_v1 notify-users --limit 5
+```
+
+Render Cron Job 使用 UTC 時區。台北時間 09:00-14:00 對應 UTC 01:00-06:00，可用：
+
+```text
+*/30 1-6 * * MON-FRI
+```
+
+盤後 15:30 台北時間對應 UTC 07:30，可用：
+
+```text
+30 7 * * MON-FRI
+```
+
+提醒：Render Cron Jobs 是獨立服務，官方文件說 cron job 沒有 free plan，會有最低月費。確認費用後再在 Render Dashboard 建立。
