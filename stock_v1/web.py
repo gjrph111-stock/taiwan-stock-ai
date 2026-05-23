@@ -2375,8 +2375,8 @@ INDEX_HTML = r"""<!doctype html>
       font-weight: 800;
     }
     .chart-hover-info {
-      min-height: 34px;
-      padding: 8px 12px;
+      min-height: 24px;
+      padding: 4px 10px;
       color: #dbeafe;
       font-size: 13px;
       font-weight: 800;
@@ -2385,7 +2385,7 @@ INDEX_HTML = r"""<!doctype html>
       border-bottom: 1px solid rgba(56,189,248,.12);
     }
     .chart-shell {
-      padding: 12px;
+      padding: 8px 8px 4px;
       background: #070d16;
     }
     .trading-desk .chart {
@@ -2402,8 +2402,8 @@ INDEX_HTML = r"""<!doctype html>
     .technical-strip {
       display: grid;
       grid-template-columns: repeat(4, minmax(230px, 1fr));
-      gap: 10px;
-      padding: 10px;
+      gap: 6px;
+      padding: 6px 8px 8px;
       background: #070d16;
     }
     .technical-strip.collapsed {
@@ -2413,13 +2413,13 @@ INDEX_HTML = r"""<!doctype html>
       display: flex;
       gap: 8px;
       flex-wrap: wrap;
-      padding: 10px 12px;
+      padding: 6px 8px;
       background: linear-gradient(90deg, #08111f, #111d2f);
       border: 1px solid rgba(56,189,248,.18);
-      border-radius: 10px;
+      border-radius: 8px;
     }
     .technical-attachment-bar button {
-      height: 32px;
+      height: 28px;
       background: rgba(14,165,233,.12);
       border-color: rgba(125,211,252,.28);
       color: #dbeafe;
@@ -2452,14 +2452,20 @@ INDEX_HTML = r"""<!doctype html>
       font-weight: 900;
     }
     .mini-chart-panel .content {
-      padding: 8px;
+      padding: 4px 6px;
       background: #070d16;
     }
     .mini-chart-panel.expanded {
       grid-column: 1 / -1;
     }
     .mini-chart-panel.expanded .chart {
-      height: 430px !important;
+      height: 280px !important;
+    }
+    .sync-cursor {
+      pointer-events: none;
+      stroke: #facc15;
+      stroke-width: 1.4;
+      opacity: 0;
     }
     .zoom-btn {
       height: 26px;
@@ -4147,6 +4153,7 @@ INDEX_HTML = r"""<!doctype html>
       const caption = document.getElementById("chartCaption");
       if (caption) caption.textContent = chartModeCaptions[mode] || chartModeCaptions.all;
       renderCandlestickChart(document.getElementById("priceChart"), currentPriceRows, mode);
+      setSyncedCursor(currentPriceRows.length - 1);
     }
     async function setStockInterval(interval, button) {
       currentStockInterval = interval;
@@ -4170,6 +4177,7 @@ INDEX_HTML = r"""<!doctype html>
       renderKdChart(document.getElementById("kdChart"), currentPriceRows);
       const info = document.getElementById("chartHoverInfo");
       if (info) info.textContent = `${interval === "1d" ? "日線" : interval}｜共 ${currentPriceRows.length} 根 K 棒，滑過 K 棒可查看 OHLC。`;
+      setSyncedCursor(currentPriceRows.length - 1);
     }
     function aggregateDailyRows(rows, mode) {
       const groups = new Map();
@@ -4214,6 +4222,10 @@ INDEX_HTML = r"""<!doctype html>
       panels.forEach(panel => {
         const shouldShow = mode === "all" || panel.dataset.techPanel === mode;
         panel.classList.toggle("hidden", !shouldShow);
+        const isSingle = mode !== "all" && shouldShow;
+        panel.classList.toggle("expanded", isSingle);
+        const btn = panel.querySelector(".zoom-btn");
+        if (btn) btn.textContent = isSingle ? "縮小" : "放大";
       });
     }
     function showChipAttachment(mode) {
@@ -4300,6 +4312,34 @@ INDEX_HTML = r"""<!doctype html>
       const changePct = Number(row.open) ? change / Number(row.open) * 100 : null;
       target.textContent = `${trendLabel(row)}｜開 ${fmt(row.open)} 高 ${fmt(row.high)} 低 ${fmt(row.low)} 收 ${fmt(row.close)}｜量 ${fmt(row.volume, 0)}｜單棒 ${fmt(change)} / ${fmt(changePct)}%`;
     }
+    function setSyncedCursor(index, rowCount = currentPriceRows.length) {
+      const ratio = rowCount > 1 ? index / (rowCount - 1) : 1;
+      const infoIndex = currentPriceRows.length > 1 ? Math.round(ratio * (currentPriceRows.length - 1)) : index;
+      showCandleInfo(infoIndex);
+      document.querySelectorAll(".sync-cursor").forEach(line => {
+        const width = Number(line.dataset.width || 1000);
+        const left = Number(line.dataset.left || 54);
+        const right = Number(line.dataset.right || 18);
+        const x = left + ratio * (width - left - right);
+        line.setAttribute("x1", x);
+        line.setAttribute("x2", x);
+        line.style.opacity = "1";
+      });
+    }
+    function syncCursorLayer(rows, width, height, pad, bottom = height - pad.bottom) {
+      if (!rows || rows.length < 2) return "";
+      const plotW = width - pad.left - pad.right;
+      const step = plotW / (rows.length - 1);
+      const zoneW = Math.max(5, Math.min(18, plotW / rows.length));
+      const zones = rows.map((row, index) => {
+        const cx = pad.left + index * step;
+        const x = Math.max(pad.left, cx - zoneW / 2);
+        const w = Math.min(zoneW, width - pad.right - x);
+        const title = row.open === undefined ? trendLabel(row) : `${trendLabel(row)} O:${fmt(row.open)} H:${fmt(row.high)} L:${fmt(row.low)} C:${fmt(row.close)} V:${fmt(row.volume, 0)}`;
+        return `<rect x="${x}" y="${pad.top}" width="${w}" height="${bottom - pad.top}" fill="transparent" onmousemove="setSyncedCursor(${index}, ${rows.length})"><title>${title}</title></rect>`;
+      }).join("");
+      return `<line class="sync-cursor" data-width="${width}" data-left="${pad.left}" data-right="${pad.right}" y1="${pad.top}" y2="${bottom}"></line>${zones}`;
+    }
     function renderCandlestickChart(target, rows, mode = "all") {
       const width = 1000;
       const height = 420;
@@ -4334,9 +4374,6 @@ INDEX_HTML = r"""<!doctype html>
         return `
           <line x1="${cx}" y1="${y(high)}" x2="${cx}" y2="${y(low)}" stroke="${color}" stroke-width="1"></line>
           <rect x="${cx - candleW / 2}" y="${bodyY}" width="${candleW}" height="${bodyH}" fill="${color}" opacity="0.86"></rect>
-          <rect x="${cx - candleW}" y="${pad.top}" width="${candleW * 2}" height="${volumeBottom - pad.top}" fill="transparent" onmousemove="showCandleInfo(${index})">
-            <title>${trendLabel(row)} O:${fmt(open)} H:${fmt(high)} L:${fmt(low)} C:${fmt(close)} V:${fmt(row.volume, 0)}</title>
-          </rect>
         `;
       }).join("");
       const ma5 = smaValues(closes, 5);
@@ -4377,10 +4414,11 @@ INDEX_HTML = r"""<!doctype html>
         <text class="chart-label" x="${width - pad.right + 8}" y="${latestY + 4}">${fmt(latest)}</text>
         ${showLevels ? `<text class="chart-label" x="${width - pad.right + 8}" y="${y(recentHigh) + 4}">壓力</text>` : ""}
         ${showLevels ? `<text class="chart-label" x="${width - pad.right + 8}" y="${y(recentLow) + 4}">支撐</text>` : ""}
-        ${showMa ? `<text class="chart-label" x="${pad.left + 8}" y="22" fill="#38bdf8">SMA(5) ${fmt(ma5.at(-1))}</text>` : ""}
-        ${showMa ? `<text class="chart-label" x="${pad.left + 166}" y="22" fill="#f59e0b">SMA(10) ${fmt(ma10.at(-1))}</text>` : ""}
-        ${showMa ? `<text class="chart-label" x="${pad.left + 340}" y="22" fill="#a855f7">SMA(20) ${fmt(ma20.at(-1))}</text>` : ""}
-        ${showBollinger ? `<text class="chart-label" x="${width - 190}" y="22" fill="#a78bfa">布林 ${fmt(upper.at(-1))}/${fmt(lower.at(-1))}</text>` : ""}
+        ${showMa ? `<text class="chart-label" x="${pad.left + 8}" y="22" style="fill:#38bdf8">SMA(5) ${fmt(ma5.at(-1))}</text>` : ""}
+        ${showMa ? `<text class="chart-label" x="${pad.left + 166}" y="22" style="fill:#f59e0b">SMA(10) ${fmt(ma10.at(-1))}</text>` : ""}
+        ${showMa ? `<text class="chart-label" x="${pad.left + 340}" y="22" style="fill:#a855f7">SMA(20) ${fmt(ma20.at(-1))}</text>` : ""}
+        ${showBollinger ? `<text class="chart-label" x="${width - 190}" y="22" style="fill:#a78bfa">布林 ${fmt(upper.at(-1))}/${fmt(lower.at(-1))}</text>` : ""}
+        ${syncCursorLayer(rows, width, height, pad, height - pad.bottom)}
       `;
     }
     function renderVolumeChart(target, rows) {
@@ -4409,6 +4447,7 @@ INDEX_HTML = r"""<!doctype html>
         <text class="chart-label" x="8" y="${pad.top + 8}">${fmt(max, 0)}</text>
         <text class="chart-label" x="${pad.left}" y="${height - 10}">${trendLabel(rows[0])}</text>
         <text class="chart-label" x="${width - pad.right}" y="${height - 10}" text-anchor="end">${trendLabel(rows[rows.length - 1])}</text>
+        ${syncCursorLayer(rows, width, height, pad)}
       `;
     }
     function renderRsiChart(target, rows) {
@@ -4436,6 +4475,7 @@ INDEX_HTML = r"""<!doctype html>
         <text class="chart-label" x="8" y="${y(30) + 4}">30</text>
         <text class="chart-label" x="${pad.left}" y="${height - 10}">${rows[0].date || ""}</text>
         <text class="chart-label" x="${width - pad.right}" y="${height - 10}" text-anchor="end">${rows[rows.length - 1].date || ""}</text>
+        ${syncCursorLayer(rows, width, height, pad)}
       `;
     }
     function renderMacdChart(target, rows) {
@@ -4475,6 +4515,7 @@ INDEX_HTML = r"""<!doctype html>
         <text class="chart-label" x="${width - pad.right}" y="${height - 10}" text-anchor="end">${rows[rows.length - 1].date || ""}</text>
         <text class="chart-label" x="${width - 128}" y="22">MACD</text>
         <text class="chart-label" x="${width - 70}" y="22">Signal</text>
+        ${syncCursorLayer(rows, width, height, pad)}
       `;
     }
     function renderKdChart(target, rows) {
@@ -4503,6 +4544,7 @@ INDEX_HTML = r"""<!doctype html>
         <text class="chart-label" x="${pad.left}" y="${height - 10}">${rows[0].date || ""}</text>
         <text class="chart-label" x="${width - pad.right}" y="${height - 10}" text-anchor="end">${rows[rows.length - 1].date || ""}</text>
         <text class="chart-label" x="${width - 80}" y="22">K / D</text>
+        ${syncCursorLayer(rows, width, height, pad)}
       `;
     }
     function renderInstitutionalChart(target, data, mode = "foreign") {
@@ -4546,6 +4588,7 @@ INDEX_HTML = r"""<!doctype html>
         <text class="chart-label" x="8" y="${height - pad.bottom}">-${fmt(maxAbs, 0)}</text>
         <text class="chart-label" x="${pad.left}" y="${height - 10}">${rows[0].date || ""}</text>
         <text class="chart-label" x="${width - pad.right}" y="${height - 10}" text-anchor="end">${rows[rows.length - 1].date || ""}</text>
+        ${syncCursorLayer(rows, width, height, pad)}
       `;
     }
     async function fetchStatus() {
@@ -4595,7 +4638,7 @@ INDEX_HTML = r"""<!doctype html>
       renderKdChart(document.getElementById("kdChart"), prices.prices);
       currentInstitutional = institutional;
       renderInstitutionalChart(document.getElementById("institutionalChart"), institutional, currentChipMode);
-      showCandleInfo(currentPriceRows.length - 1);
+      setSyncedCursor(currentPriceRows.length - 1);
       renderTradePlan(document.getElementById("tradePlan"), buildTradePlan(stock, ind, signal, prices.prices));
       renderAnalysisFacets(document.getElementById("analysisFacets"), monitor);
       const fundamentalTarget = document.getElementById("fundamentalResearch");
