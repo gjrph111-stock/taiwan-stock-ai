@@ -153,7 +153,15 @@ python -m stock_v1 notify-after-hours --limit 5
 python -m stock_v1 notify-users --limit 5
 ```
 
-Render Cron Job 使用 UTC 時區。台北時間 09:00-14:00 對應 UTC 01:00-06:00，可用：
+如果不要任何付費，不要建立 Render Cron Job。Render Cron Job 是獨立服務，官方文件說沒有 free plan，會有最低月費。
+
+免費替代方式：
+
+- 手動在 Render Shell 或本機執行推播指令。
+- 使用本機 Windows 工作排程，但電腦必須開著。
+- 之後若要雲端免費排程，可改用 GitHub Actions，但需要另外處理資料庫同步與 token secrets。
+
+Render Cron Job 使用 UTC 時區。若未來確認要付費排程，台北時間 09:00-14:00 對應 UTC 01:00-06:00，可用：
 
 ```text
 */30 1-6 * * MON-FRI
@@ -165,4 +173,4 @@ Render Cron Job 使用 UTC 時區。台北時間 09:00-14:00 對應 UTC 01:00-06
 30 7 * * MON-FRI
 ```
 
-提醒：Render Cron Jobs 是獨立服務，官方文件說 cron job 沒有 free plan，會有最低月費。確認費用後再在 Render Dashboard 建立。
+提醒：在你明確同意前，不要建立 Render Cron Job。

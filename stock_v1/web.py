@@ -1665,6 +1665,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     .page { display: none; }
     .page.active { display: grid; gap: 16px; }
+    .overview-only.hidden { display: none; }
     .toolbar, .metrics, .grid {
       display: grid;
       gap: 12px;
@@ -2946,9 +2947,36 @@ INDEX_HTML = r"""<!doctype html>
     }
     @media (max-width: 820px) {
       header { display: block; }
-      .app-shell { grid-template-columns: 1fr; padding: 12px; }
-      .sidebar { position: static; }
-      .hero-panel, .hero-stat-grid, .market-strip, .module-grid, .diagnosis, .watch-grid, .strategy-advice, .strategy-kpis, .strategy-stock-grid, .strategy-guide, .trading-desk, .desk-side, .trade-kpis, .technical-strip, .fundamental-grid, .fundamental-visuals, .research-command, .research-score-row, .research-list-grid, .news-grid, .inner-grid, .explore-hero, .trend-summary { grid-template-columns: 1fr; }
+      body { font-size: 14px; }
+      .app-shell { grid-template-columns: 1fr; padding: 8px; }
+      .sidebar {
+        position: sticky;
+        top: 0;
+        z-index: 20;
+        padding: 8px;
+        border-radius: 10px;
+      }
+      .nav-list {
+        display: flex;
+        overflow-x: auto;
+        gap: 8px;
+        padding-bottom: 2px;
+      }
+      .nav-item {
+        min-width: 96px;
+        grid-template-columns: 24px auto;
+        padding: 8px;
+        white-space: nowrap;
+      }
+      .sidebar-title { display: none; }
+      .hero-panel, .hero-stat-grid, .market-strip, .module-grid, .diagnosis, .watch-grid, .strategy-advice, .strategy-kpis, .strategy-stock-grid, .strategy-guide, .trading-desk, .desk-side, .trade-kpis, .technical-strip, .fundamental-grid, .fundamental-visuals, .research-command, .research-score-row, .research-list-grid, .news-grid, .inner-grid, .explore-hero, .trend-summary, .realtime-terminal { grid-template-columns: 1fr; }
+      .terminal-chart, .terminal-watch { grid-column: auto; grid-row: auto; }
+      .desk-side dl { grid-template-columns: 1fr; }
+      .desk-side .diagnosis { grid-template-columns: 1fr; }
+      .trading-desk .chart { height: 360px; }
+      .mini-chart-panel .chart { height: 220px; }
+      .terminal-chart .chart { height: 300px; }
+      .radar-stage { grid-template-columns: 1fr; }
       .toolbar, .watch-tools, .grid, .explore-actions { grid-template-columns: 1fr; }
       .desk-chart-toolbar {
         display: grid;
@@ -2965,6 +2993,7 @@ INDEX_HTML = r"""<!doctype html>
         padding: 0 8px;
       }
       dl { grid-template-columns: 1fr; }
+      .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
     }
   </style>
 </head>
@@ -2993,14 +3022,14 @@ INDEX_HTML = r"""<!doctype html>
       </nav>
     </aside>
   <main class="workspace">
-    <div class="dashboard-note">
+    <div class="dashboard-note overview-only">
       <div>
         <strong>智能投資決策中心</strong><br>
         <span>整合上市櫃資料、AI 訊號分數、策略回測與 Telegram 盤後推播，協助快速建立每日觀察名單。</span>
       </div>
       <div class="pill">V1 研究模式</div>
     </div>
-    <div class="toolbar">
+    <div class="toolbar overview-only">
       <input id="code" value="2330" aria-label="股票代號">
       <button type="button" class="primary" id="loadStock" onclick="searchStock()">智能搜尋</button>
       <button type="button" id="loadScan" onclick="runAction(fetchScan, '正在載入市場掃描...')">市場排行榜</button>
@@ -4529,13 +4558,12 @@ INDEX_HTML = r"""<!doctype html>
       currentStockInterval = "1d";
       document.querySelectorAll("[data-interval]").forEach(tab => tab.classList.toggle("active", tab.dataset.interval === "1d"));
       const encoded = encodeURIComponent(codeValue);
-      const [stock, ind, prices, signal, monitor, fundamental, institutional] = await Promise.all([
+      const [stock, ind, prices, signal, monitor, institutional] = await Promise.all([
         getJson(`/api/stock?code=${encoded}`),
         getJson(`/api/indicators?code=${encoded}`),
         getJson(`/api/prices?code=${encoded}&limit=160`),
         getJson(`/api/stock-signal?code=${encoded}`),
         getJson(`/api/ai-monitor-stock?code=${encoded}`),
-        getJson(`/api/fundamental?code=${encoded}`),
         getJson(`/api/institutional?code=${encoded}`),
       ]);
       currentPriceRows = prices.prices || [];
@@ -4570,7 +4598,13 @@ INDEX_HTML = r"""<!doctype html>
       showCandleInfo(currentPriceRows.length - 1);
       renderTradePlan(document.getElementById("tradePlan"), buildTradePlan(stock, ind, signal, prices.prices));
       renderAnalysisFacets(document.getElementById("analysisFacets"), monitor);
-      renderFundamentalResearch(document.getElementById("fundamentalResearch"), fundamental);
+      const fundamentalTarget = document.getElementById("fundamentalResearch");
+      fundamentalTarget.innerHTML = `<div class="fundamental-card"><span>基本面研究</span><strong>背景載入中</strong><ul><li>先顯示 K 線與交易計畫，研究報告稍後補上。</li></ul></div>`;
+      getJson(`/api/fundamental?code=${encoded}`)
+        .then(fundamental => renderFundamentalResearch(fundamentalTarget, fundamental))
+        .catch(error => {
+          fundamentalTarget.innerHTML = `<div class="fundamental-card"><span>基本面研究</span><strong>暫時不可用</strong><ul><li>${error.message}</li></ul></div>`;
+        });
       const newsTarget = document.getElementById("newsResearch");
       newsTarget.innerHTML = `<div class="news-card"><span>新聞掃描</span><a href="#">正在背景掃描最新新聞...</a><small>核心分析已先完成，不等待新聞來源。</small></div>`;
       getJson(`/api/news?code=${encoded}`)
@@ -4586,6 +4620,7 @@ INDEX_HTML = r"""<!doctype html>
     function activatePage(pageId) {
       document.querySelectorAll(".page").forEach(page => page.classList.remove("active"));
       document.getElementById(pageId).classList.add("active");
+      document.querySelectorAll(".overview-only").forEach(item => item.classList.toggle("hidden", pageId !== "overview"));
       document.querySelectorAll(".nav-item").forEach(item => item.classList.remove("active"));
       const nav = document.querySelector(`[data-page="${pageId}"]`);
       if (nav) nav.classList.add("active");
