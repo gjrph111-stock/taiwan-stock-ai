@@ -1974,8 +1974,8 @@ INDEX_HTML = r"""<!doctype html>
       border: 1px solid var(--line);
       border-radius: 8px;
     }
-    #priceChart { height: clamp(310px, 44vh, 410px); }
-    #rsiChart, #macdChart, #kdChart, #volumeChart, #institutionalChart { height: clamp(170px, 24vh, 230px); }
+    #priceChart { height: clamp(340px, 48vh, 460px); }
+    #rsiChart, #macdChart, #kdChart, #volumeChart, #institutionalChart { height: clamp(200px, 28vh, 270px); }
     #realtimeTrendChart { height: 320px; }
     .chart-line {
       fill: none;
@@ -2425,6 +2425,17 @@ INDEX_HTML = r"""<!doctype html>
       min-width: 0;
       display: grid;
       grid-template-rows: auto auto auto;
+      overflow-x: auto;
+      cursor: grab;
+      scrollbar-color: #38bdf8 #0b1626;
+      scrollbar-width: thin;
+    }
+    .chart-stack.dragging {
+      cursor: grabbing;
+      user-select: none;
+    }
+    .chart-canvas {
+      min-width: 1480px;
     }
     .trading-desk .chart {
       background:
@@ -3012,6 +3023,7 @@ INDEX_HTML = r"""<!doctype html>
       .attachment-rail button { min-width: 72px; }
       #priceChart { height: 330px; }
       #rsiChart, #macdChart, #kdChart, #volumeChart, #institutionalChart { height: 190px; }
+      .chart-canvas { min-width: 1180px; }
       .terminal-chart .chart { height: 300px; }
       .radar-stage { grid-template-columns: 1fr; }
       .toolbar, .watch-tools, .grid, .explore-actions { grid-template-columns: 1fr; }
@@ -3276,30 +3288,32 @@ INDEX_HTML = r"""<!doctype html>
                 <button type="button" onclick="showChipAttachment('investment')">投信</button>
                 <button type="button" onclick="showChipAttachment('retail_proxy')">散戶</button>
               </div>
-              <div class="chart-stack">
-                <div class="chart-shell"><svg id="priceChart" class="chart" role="img" aria-label="K 線圖"></svg></div>
-                <div class="chart-hover-info" id="chartHoverInfo">滑過 K 棒可查看開高低收、成交量與時間。</div>
-                <div class="technical-strip" id="technicalStrip">
-                  <section class="mini-chart-panel hidden" data-tech-panel="volume">
-                    <h3><span>成交量</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">放大</button></h3>
-                    <div class="content"><svg id="volumeChart" class="chart" role="img" aria-label="成交量圖"></svg></div>
-                  </section>
-                  <section class="mini-chart-panel hidden" data-tech-panel="rsi">
-                    <h3><span>RSI 14</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">放大</button></h3>
-                    <div class="content"><svg id="rsiChart" class="chart" role="img" aria-label="RSI 技術圖"></svg></div>
-                  </section>
-                  <section class="mini-chart-panel expanded" data-tech-panel="macd">
-                    <h3><span>MACD 12 / 26 / 9</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">縮小</button></h3>
-                    <div class="content"><svg id="macdChart" class="chart" role="img" aria-label="MACD 技術圖"></svg></div>
-                  </section>
-                  <section class="mini-chart-panel hidden" data-tech-panel="kd">
-                    <h3><span>KD 9</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">放大</button></h3>
-                    <div class="content"><svg id="kdChart" class="chart" role="img" aria-label="KD 技術圖"></svg></div>
-                  </section>
-                  <section class="mini-chart-panel hidden" data-tech-panel="chips">
-                    <h3><span id="chipChartTitle">外資買賣超</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">放大</button></h3>
-                    <div class="content"><svg id="institutionalChart" class="chart" role="img" aria-label="法人買賣超圖"></svg></div>
-                  </section>
+              <div class="chart-stack" id="chartStack">
+                <div class="chart-canvas">
+                  <div class="chart-shell"><svg id="priceChart" class="chart" role="img" aria-label="K 線圖"></svg></div>
+                  <div class="chart-hover-info" id="chartHoverInfo">滑過 K 棒可查看開高低收、成交量與時間。</div>
+                  <div class="technical-strip" id="technicalStrip">
+                    <section class="mini-chart-panel hidden" data-tech-panel="volume">
+                      <h3><span>成交量</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">放大</button></h3>
+                      <div class="content"><svg id="volumeChart" class="chart" role="img" aria-label="成交量圖"></svg></div>
+                    </section>
+                    <section class="mini-chart-panel hidden" data-tech-panel="rsi">
+                      <h3><span>RSI 14</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">放大</button></h3>
+                      <div class="content"><svg id="rsiChart" class="chart" role="img" aria-label="RSI 技術圖"></svg></div>
+                    </section>
+                    <section class="mini-chart-panel expanded" data-tech-panel="macd">
+                      <h3><span>MACD 12 / 26 / 9</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">縮小</button></h3>
+                      <div class="content"><svg id="macdChart" class="chart" role="img" aria-label="MACD 技術圖"></svg></div>
+                    </section>
+                    <section class="mini-chart-panel hidden" data-tech-panel="kd">
+                      <h3><span>KD 9</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">放大</button></h3>
+                      <div class="content"><svg id="kdChart" class="chart" role="img" aria-label="KD 技術圖"></svg></div>
+                    </section>
+                    <section class="mini-chart-panel hidden" data-tech-panel="chips">
+                      <h3><span id="chipChartTitle">外資買賣超</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">放大</button></h3>
+                      <div class="content"><svg id="institutionalChart" class="chart" role="img" aria-label="法人買賣超圖"></svg></div>
+                    </section>
+                  </div>
                 </div>
               </div>
             </div>
@@ -4208,6 +4222,7 @@ INDEX_HTML = r"""<!doctype html>
       renderRsiChart(document.getElementById("rsiChart"), currentPriceRows);
       renderMacdChart(document.getElementById("macdChart"), currentPriceRows);
       renderKdChart(document.getElementById("kdChart"), currentPriceRows);
+      renderInstitutionalChart(document.getElementById("institutionalChart"), currentInstitutional || { rows: [] }, currentChipMode);
       const info = document.getElementById("chartHoverInfo");
       if (info) info.textContent = `${interval === "1d" ? "日線" : interval}｜共 ${currentPriceRows.length} 根 K 棒，滑過 K 棒可查看 OHLC。`;
       setSyncedCursor(currentPriceRows.length - 1);
@@ -4265,6 +4280,50 @@ INDEX_HTML = r"""<!doctype html>
       currentChipMode = mode;
       showTechnicalAttachment("chips");
       renderInstitutionalChart(document.getElementById("institutionalChart"), currentInstitutional || { rows: [] }, mode);
+    }
+    function alignInstitutionalRows(data, priceRows) {
+      const source = data.rows || [];
+      if (!source.length || !priceRows.length) return [];
+      const byDate = new Map(source.map(row => [row.date, row]));
+      return priceRows.map(row => {
+        const date = row.date || (row.time || "").slice(0, 10);
+        const matched = byDate.get(date);
+        return {
+          date,
+          label: row.label || row.time || row.date,
+          foreign: matched ? Number(matched.foreign || 0) : null,
+          investment: matched ? Number(matched.investment || 0) : null,
+          retail_proxy: matched ? Number(matched.retail_proxy || 0) : null,
+          hasInstitutional: Boolean(matched),
+        };
+      });
+    }
+    function installChartDrag() {
+      const stack = document.getElementById("chartStack");
+      if (!stack || stack.dataset.dragReady) return;
+      stack.dataset.dragReady = "1";
+      let dragging = false;
+      let startX = 0;
+      let startScroll = 0;
+      stack.addEventListener("pointerdown", event => {
+        dragging = true;
+        startX = event.clientX;
+        startScroll = stack.scrollLeft;
+        stack.classList.add("dragging");
+        stack.setPointerCapture(event.pointerId);
+      });
+      stack.addEventListener("pointermove", event => {
+        if (!dragging) return;
+        stack.scrollLeft = startScroll - (event.clientX - startX);
+      });
+      const stop = event => {
+        dragging = false;
+        stack.classList.remove("dragging");
+        if (event.pointerId !== undefined && stack.hasPointerCapture(event.pointerId)) stack.releasePointerCapture(event.pointerId);
+      };
+      stack.addEventListener("pointerup", stop);
+      stack.addEventListener("pointercancel", stop);
+      stack.addEventListener("pointerleave", stop);
     }
     function buildTradePlan(stock, ind, signal, rows) {
       if (!rows || !rows.length) return null;
@@ -4555,7 +4614,7 @@ INDEX_HTML = r"""<!doctype html>
       const data = kdValues(rows, 9);
       const width = 1000;
       const height = 220;
-      const pad = { left: 54, right: 18, top: 18, bottom: 34 };
+      const pad = { left: 54, right: 72, top: 18, bottom: 34 };
       target.setAttribute("viewBox", `0 0 ${width} ${height}`);
       const valid = data.filter(row => row.k !== null);
       if (valid.length < 2) {
@@ -4581,7 +4640,7 @@ INDEX_HTML = r"""<!doctype html>
       `;
     }
     function renderInstitutionalChart(target, data, mode = "foreign") {
-      const rows = (data.rows || []).slice(-45);
+      const rows = alignInstitutionalRows(data, currentPriceRows);
       const width = 1000;
       const height = 240;
       const pad = { left: 54, right: 72, top: 18, bottom: 36 };
@@ -4595,7 +4654,7 @@ INDEX_HTML = r"""<!doctype html>
       const key = colors[mode] ? mode : "foreign";
       const title = document.getElementById("chipChartTitle");
       if (title) title.textContent = `${labels[key]}買賣超`;
-      const all = rows.map(row => Number(row[key] || 0)).filter(Number.isFinite);
+      const all = rows.map(row => row.hasInstitutional ? Number(row[key] || 0) : null).filter(Number.isFinite);
       const maxAbs = Math.max(...all.map(Math.abs), 1);
       const plotW = width - pad.left - pad.right;
       const plotH = height - pad.top - pad.bottom;
@@ -4604,6 +4663,7 @@ INDEX_HTML = r"""<!doctype html>
       const barW = Math.max(3, Math.min(11, groupW * .62));
       const y = value => zeroY - (Number(value) / maxAbs) * (plotH / 2 - 8);
       const bars = rows.map((row, index) => {
+        if (!row.hasInstitutional) return "";
         const value = Number(row[key] || 0);
         const yy = y(value);
         const top = Math.min(yy, zeroY);
@@ -4619,8 +4679,8 @@ INDEX_HTML = r"""<!doctype html>
         <text class="chart-label" x="${width - 158}" y="22" fill="${colors[key]}">${labels[key]}｜紅買超 綠賣超</text>
         <text class="chart-label" x="8" y="${pad.top + 8}">${fmt(maxAbs, 0)}</text>
         <text class="chart-label" x="8" y="${height - pad.bottom}">-${fmt(maxAbs, 0)}</text>
-        <text class="chart-label" x="${pad.left}" y="${height - 10}">${rows[0].date || ""}</text>
-        <text class="chart-label" x="${width - pad.right}" y="${height - 10}" text-anchor="end">${rows[rows.length - 1].date || ""}</text>
+        <text class="chart-label" x="${pad.left}" y="${height - 10}">${trendLabel(rows[0])}</text>
+        <text class="chart-label" x="${width - pad.right}" y="${height - 10}" text-anchor="end">${trendLabel(rows[rows.length - 1])}</text>
         ${syncCursorLayer(rows, width, height, pad)}
       `;
     }
@@ -4672,6 +4732,7 @@ INDEX_HTML = r"""<!doctype html>
       currentInstitutional = institutional;
       renderInstitutionalChart(document.getElementById("institutionalChart"), institutional, currentChipMode);
       setSyncedCursor(currentPriceRows.length - 1);
+      installChartDrag();
       renderTradePlan(document.getElementById("tradePlan"), buildTradePlan(stock, ind, signal, prices.prices));
       renderAnalysisFacets(document.getElementById("analysisFacets"), monitor);
       const fundamentalTarget = document.getElementById("fundamentalResearch");
@@ -4701,6 +4762,7 @@ INDEX_HTML = r"""<!doctype html>
       document.querySelectorAll(".nav-item").forEach(item => item.classList.remove("active"));
       const nav = document.querySelector(`[data-page="${pageId}"]`);
       if (nav) nav.classList.add("active");
+      if (pageId === "stockPage") installChartDrag();
     }
     function searchStock() {
       activatePage("stockPage");
