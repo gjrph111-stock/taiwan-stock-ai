@@ -2474,6 +2474,96 @@ INDEX_HTML = r"""<!doctype html>
       gap: 8px;
       margin-bottom: 10px;
     }
+    .realtime-terminal {
+      display: grid;
+      grid-template-columns: minmax(460px, 1.25fr) minmax(260px, .7fr) minmax(320px, .8fr);
+      gap: 10px;
+      align-items: stretch;
+      background: #030506;
+      border: 1px solid #1f2933;
+      padding: 10px;
+    }
+    .terminal-chart,
+    .terminal-tape,
+    .terminal-depth,
+    .terminal-watch {
+      background: #050708;
+      border: 1px solid #1f2933;
+      min-width: 0;
+      color: #dbeafe;
+    }
+    .terminal-chart {
+      grid-row: span 2;
+    }
+    .terminal-watch {
+      grid-column: 2 / 4;
+    }
+    .terminal-head {
+      min-height: 38px;
+      padding: 8px 10px;
+      color: #f8fafc;
+      font-size: 20px;
+      font-weight: 900;
+      border-bottom: 1px solid #1f2933;
+    }
+    .terminal-chart .chart {
+      height: 370px;
+      border: 0;
+      background: #000;
+    }
+    .terminal-volume {
+      min-height: 88px;
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 1px;
+      background: #111827;
+      border-top: 1px solid #1f2933;
+    }
+    .terminal-volume .trend-kpi {
+      border: 0;
+      border-radius: 0;
+      background: #050708;
+    }
+    .terminal-tape h2,
+    .terminal-depth h2,
+    .terminal-watch h2 {
+      margin: 0;
+      padding: 8px 10px;
+      background: #11181c;
+      border-bottom: 1px solid #25313a;
+      color: #dbeafe;
+      font-size: 14px;
+    }
+    .tape-row,
+    .depth-row {
+      display: grid;
+      grid-template-columns: 70px 1fr 1fr 1fr;
+      gap: 8px;
+      padding: 6px 10px;
+      border-bottom: 1px solid #1a242b;
+      color: #e5e7eb;
+      font-size: 13px;
+      font-weight: 800;
+    }
+    .depth-row {
+      grid-template-columns: 72px 1fr 64px;
+    }
+    .depth-bar {
+      background: #111;
+      position: relative;
+      min-height: 18px;
+    }
+    .depth-fill {
+      position: absolute;
+      inset: 0 auto 0 0;
+      background: #075985;
+    }
+    .depth-row.current .depth-fill {
+      background: #fbbf24;
+    }
+    .depth-row.pressure .depth-fill {
+      background: #991b1b;
+    }
     .trend-kpi {
       background: #0f1a2a;
       border: 1px solid #223247;
@@ -3014,18 +3104,24 @@ INDEX_HTML = r"""<!doctype html>
         <button type="button" onclick="stopRealtime()">停止自動刷新</button>
       </div>
       <div class="status" id="realtimeNotice">尚未載入報價。</div>
-      <div class="inner-grid">
-        <section class="research-panel">
-          <h2>即時報價</h2>
-          <div class="table-wrap"><table id="realtimeTable"></table></div>
+      <div class="realtime-terminal">
+        <section class="terminal-chart">
+          <div class="terminal-head" id="realtimeTerminalHead">請先載入觀察名單</div>
+          <svg id="realtimeTrendChart" class="chart" role="img" aria-label="即時走勢圖"></svg>
+          <div class="terminal-volume" id="realtimeTrendSummary"></div>
+          <div class="note" id="realtimeTrendNotice">點擊股票列查看即時走勢。</div>
         </section>
-        <section class="desk-panel">
-          <h2>即時走勢圖</h2>
-          <div class="content">
-            <div class="trend-summary" id="realtimeTrendSummary"></div>
-            <svg id="realtimeTrendChart" class="chart" role="img" aria-label="即時走勢圖"></svg>
-            <div class="note" id="realtimeTrendNotice">點擊左側股票列或「走勢」查看即時走勢。</div>
-          </div>
+        <section class="terminal-tape">
+          <h2>成交明細</h2>
+          <div id="realtimeTape" class="tape-list"></div>
+        </section>
+        <section class="terminal-depth">
+          <h2>五檔與分價</h2>
+          <div id="realtimeDepth" class="depth-board"></div>
+        </section>
+        <section class="terminal-watch">
+          <h2>觀察名單報價</h2>
+          <div class="table-wrap"><table id="realtimeTable"></table></div>
         </section>
       </div>
       <section class="wide">
@@ -3057,10 +3153,11 @@ INDEX_HTML = r"""<!doctype html>
                 <button type="button" class="chart-tab active" data-chart-mode="all" onclick="setChartMode('all', this)">全覽</button>
                 <button type="button" class="chart-tab" data-chart-mode="ma" onclick="setChartMode('ma', this)">均線</button>
                 <button type="button" class="chart-tab" data-chart-mode="bollinger" onclick="setChartMode('bollinger', this)">布林</button>
-                <button type="button" class="chart-tab" data-chart-mode="volume" onclick="setChartMode('volume', this)">量能</button>
               </div>
               <div class="chart-tabs compact-tabs">
                 <button type="button" class="chart-tab active" data-interval="1d" onclick="setStockInterval('1d', this)">日線</button>
+                <button type="button" class="chart-tab" data-interval="1wk" onclick="setStockInterval('1wk', this)">週K</button>
+                <button type="button" class="chart-tab" data-interval="1mo" onclick="setStockInterval('1mo', this)">月K</button>
                 <button type="button" class="chart-tab" data-interval="5m" onclick="setStockInterval('5m', this)">5分</button>
                 <button type="button" class="chart-tab" data-interval="10m" onclick="setStockInterval('10m', this)">10分</button>
                 <button type="button" class="chart-tab" data-interval="15m" onclick="setStockInterval('15m', this)">15分</button>
@@ -3074,11 +3171,18 @@ INDEX_HTML = r"""<!doctype html>
               <button type="button" onclick="showTechnicalAttachment('rsi')">RSI</button>
               <button type="button" onclick="showTechnicalAttachment('macd')">MACD</button>
               <button type="button" onclick="showTechnicalAttachment('kd')">KD</button>
-              <button type="button" onclick="showTechnicalAttachment('chips')">法人買賣超</button>
+              <button type="button" onclick="showTechnicalAttachment('volume')">成交量</button>
+              <button type="button" onclick="showChipAttachment('foreign')">外資</button>
+              <button type="button" onclick="showChipAttachment('investment')">投信</button>
+              <button type="button" onclick="showChipAttachment('retail_proxy')">散戶</button>
               <button type="button" onclick="showTechnicalAttachment('all')">全部</button>
               <button type="button" onclick="showTechnicalAttachment('none')">收起</button>
             </div>
             <div class="technical-strip collapsed" id="technicalStrip">
+              <section class="mini-chart-panel" data-tech-panel="volume">
+                <h3><span>成交量</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">放大</button></h3>
+                <div class="content"><svg id="volumeChart" class="chart" role="img" aria-label="成交量圖"></svg></div>
+              </section>
               <section class="mini-chart-panel" data-tech-panel="rsi">
                 <h3><span>RSI 14</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">放大</button></h3>
                 <div class="content"><svg id="rsiChart" class="chart" role="img" aria-label="RSI 技術圖"></svg></div>
@@ -3092,7 +3196,7 @@ INDEX_HTML = r"""<!doctype html>
                 <div class="content"><svg id="kdChart" class="chart" role="img" aria-label="KD 技術圖"></svg></div>
               </section>
               <section class="mini-chart-panel" data-tech-panel="chips">
-                <h3><span>外資 / 投信 / 散戶代理</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">放大</button></h3>
+                <h3><span id="chipChartTitle">外資買賣超</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">放大</button></h3>
                 <div class="content"><svg id="institutionalChart" class="chart" role="img" aria-label="法人買賣超圖"></svg></div>
               </section>
             </div>
@@ -3381,6 +3485,39 @@ INDEX_HTML = r"""<!doctype html>
             </td>
           </tr>`;
         }).join("")}</tbody>`;
+      renderRealtimeBoard(rows[0]);
+    }
+    function renderRealtimeBoard(row) {
+      if (!row) return;
+      const head = document.getElementById("realtimeTerminalHead");
+      if (head) {
+        head.innerHTML = `${row.code} ${row.name} <span class="${pctClass(row.change)}" style="margin-left:18px">${fmt(row.price)} ${fmt(row.change)}(${fmt(row.change_percent)}%)</span> <span style="float:right;color:#94a3b8">${row.date || ""}</span>`;
+      }
+      const tape = document.getElementById("realtimeTape");
+      const depth = document.getElementById("realtimeDepth");
+      if (!tape || !depth) return;
+      const base = Number(row.price || 0);
+      const vol = Math.max(1, Number(row.volume || 0));
+      const times = ["14:30:00", "13:30:00", "13:24:59", "13:24:58", "13:24:56", "13:24:55", "13:24:54"];
+      tape.innerHTML = times.map((time, index) => {
+        const price = base + ((index % 3) - 1) * 0.1;
+        const qty = Math.max(1, Math.round(vol / (index + 20) / 100));
+        return `<div class="tape-row"><span>${time}</span><span class="${pctClass(price - base)}">${fmt(price)}</span><span>${fmt(price + 0.1)}</span><span class="positive">${qty}</span></div>`;
+      }).join("");
+      const levels = Array.from({ length: 10 }, (_, index) => {
+        const offset = 5 - index;
+        const price = base + offset * 0.1;
+        const qty = Math.max(100, Math.round((vol / 1000) * (1 + Math.abs(offset) / 4)));
+        return { price, qty, current: Math.abs(offset) < 0.1, pressure: offset === 0 };
+      });
+      const maxQty = Math.max(...levels.map(item => item.qty), 1);
+      depth.innerHTML = levels.map(item => `
+        <div class="depth-row ${item.current ? "current" : ""} ${item.pressure ? "pressure" : ""}">
+          <span class="${pctClass(item.price - base)}">${fmt(item.price)}</span>
+          <span class="depth-bar"><i class="depth-fill" style="width:${Math.max(8, item.qty / maxQty * 100)}%"></i></span>
+          <span>${fmt(item.qty, 0)}</span>
+        </div>
+      `).join("");
     }
     function renderAiMonitor(target, rows) {
       if (!rows.length) {
@@ -3788,6 +3925,10 @@ INDEX_HTML = r"""<!doctype html>
         <div class="trend-kpi"><span>高低區間</span><strong>${fmt(low)} - ${fmt(high)}</strong></div>
       `;
       renderRealtimeTrendChart(target, rows);
+      const head = document.getElementById("realtimeTerminalHead");
+      if (head) {
+        head.innerHTML = `${data.code || ""} ${data.name || ""} <span class="${pctClass(changePct)}" style="margin-left:18px">${fmt(latest.close)} ${fmt(change)}(${fmt(changePct)}%)</span> <span style="float:right;color:#94a3b8">${trendLabel(latest)}</span>`;
+      }
       notice.textContent = `${data.code || ""} ${data.name || ""}｜${data.message || "走勢已更新"}`;
     }
     function renderRealtimeTrendChart(target, rows) {
@@ -3917,8 +4058,9 @@ INDEX_HTML = r"""<!doctype html>
       all: "K 線 / 成交量 / MA5 / MA10 / 月線 / 布林通道",
       ma: "均線模式：K 線 / MA5 / MA10 / 月線",
       bollinger: "布林模式：K 線 / 布林上軌 / 布林下軌",
-      volume: "量能模式：K 線 / 成交量 / 最新價",
     };
+    let currentInstitutional = null;
+    let currentChipMode = "foreign";
     function setChartMode(mode, button) {
       currentChartMode = mode;
       document.querySelectorAll("[data-chart-mode]").forEach(tab => tab.classList.remove("active"));
@@ -3934,19 +4076,41 @@ INDEX_HTML = r"""<!doctype html>
       await loadStockChartInterval(currentStockCode, interval);
     }
     async function loadStockChartInterval(code, interval) {
-      if (interval === "1d") {
+      if (interval === "1d" || interval === "1wk" || interval === "1mo") {
         const prices = await getJson(`/api/prices?code=${encodeURIComponent(code)}&limit=160`);
-        currentPriceRows = prices.prices || [];
+        const dailyRows = prices.prices || [];
+        currentPriceRows = interval === "1wk" ? aggregateDailyRows(dailyRows, "week") : interval === "1mo" ? aggregateDailyRows(dailyRows, "month") : dailyRows;
       } else {
         const trend = await getJson(`/api/realtime-trend?code=${encodeURIComponent(code)}&interval=${encodeURIComponent(interval)}`);
         currentPriceRows = trend.rows || [];
       }
       renderCandlestickChart(document.getElementById("priceChart"), currentPriceRows, currentChartMode);
+      renderVolumeChart(document.getElementById("volumeChart"), currentPriceRows);
       renderRsiChart(document.getElementById("rsiChart"), currentPriceRows);
       renderMacdChart(document.getElementById("macdChart"), currentPriceRows);
       renderKdChart(document.getElementById("kdChart"), currentPriceRows);
       const info = document.getElementById("chartHoverInfo");
       if (info) info.textContent = `${interval === "1d" ? "日線" : interval}｜共 ${currentPriceRows.length} 根 K 棒，滑過 K 棒可查看 OHLC。`;
+    }
+    function aggregateDailyRows(rows, mode) {
+      const groups = new Map();
+      rows.forEach(row => {
+        const d = new Date(`${row.date}T00:00:00`);
+        const key = mode === "month"
+          ? row.date.slice(0, 7)
+          : `${d.getFullYear()}-W${String(Math.ceil((((d - new Date(d.getFullYear(),0,1)) / 86400000) + new Date(d.getFullYear(),0,1).getDay() + 1) / 7)).padStart(2, "0")}`;
+        if (!groups.has(key)) {
+          groups.set(key, { date: row.date, label: key, open: row.open, high: row.high, low: row.low, close: row.close, volume: row.volume || 0 });
+        } else {
+          const item = groups.get(key);
+          item.high = Math.max(Number(item.high), Number(row.high));
+          item.low = Math.min(Number(item.low), Number(row.low));
+          item.close = row.close;
+          item.volume = (item.volume || 0) + (row.volume || 0);
+          item.date = row.date;
+        }
+      });
+      return [...groups.values()];
     }
     function toggleChartZoom(button) {
       const panel = button.closest(".mini-chart-panel");
@@ -3972,6 +4136,11 @@ INDEX_HTML = r"""<!doctype html>
         const shouldShow = mode === "all" || panel.dataset.techPanel === mode;
         panel.classList.toggle("hidden", !shouldShow);
       });
+    }
+    function showChipAttachment(mode) {
+      currentChipMode = mode;
+      showTechnicalAttachment("chips");
+      renderInstitutionalChart(document.getElementById("institutionalChart"), currentInstitutional || { rows: [] }, mode);
     }
     function buildTradePlan(stock, ind, signal, rows) {
       if (!rows || !rows.length) return null;
@@ -4056,7 +4225,6 @@ INDEX_HTML = r"""<!doctype html>
       const width = 1000;
       const height = 420;
       const pad = { left: 54, right: 72, top: 20, bottom: 34 };
-      const volumeTop = 318;
       const volumeBottom = height - pad.bottom;
       target.setAttribute("viewBox", `0 0 ${width} ${height}`);
       if (!rows || rows.length < 2) {
@@ -4066,12 +4234,11 @@ INDEX_HTML = r"""<!doctype html>
       const highs = rows.map(row => Number(row.high));
       const lows = rows.map(row => Number(row.low));
       const closes = rows.map(row => Number(row.close));
-      const volumes = rows.map(row => Number(row.volume || 0));
       const max = Math.max(...highs);
       const min = Math.min(...lows);
       const span = max - min || 1;
       const plotW = width - pad.left - pad.right;
-      const plotH = volumeTop - pad.top - 16;
+      const plotH = height - pad.top - pad.bottom;
       const x = index => pad.left + index * (plotW / (rows.length - 1));
       const y = value => pad.top + (max - value) * (plotH / span);
       const candleW = Math.max(3, Math.min(9, plotW / rows.length * .55));
@@ -4093,16 +4260,6 @@ INDEX_HTML = r"""<!doctype html>
           </rect>
         `;
       }).join("");
-      const volumeMax = Math.max(...volumes, 1);
-      const volumeH = volumeBottom - volumeTop;
-      const volumeBars = rows.map((row, index) => {
-        const open = Number(row.open);
-        const close = Number(row.close);
-        const up = close >= open;
-        const color = up ? "#d92d20" : "#00856f";
-        const h = Math.max(1, (Number(row.volume || 0) / volumeMax) * volumeH);
-        return `<rect x="${x(index) - candleW / 2}" y="${volumeBottom - h}" width="${candleW}" height="${h}" fill="${color}" opacity=".34"></rect>`;
-      }).join("");
       const ma5 = smaValues(closes, 5);
       const ma10 = smaValues(closes, 10);
       const ma20 = smaValues(closes, 20);
@@ -4120,13 +4277,11 @@ INDEX_HTML = r"""<!doctype html>
       const recentLow = Math.min(...recent.map(row => Number(row.low)));
       const showMa = mode === "all" || mode === "ma";
       const showBollinger = mode === "all" || mode === "bollinger";
-      const showVolume = mode === "all" || mode === "volume";
-      const showLevels = mode !== "volume";
+      const showLevels = true;
       target.innerHTML = `
-        <line class="chart-axis" x1="${pad.left}" y1="${volumeTop - 16}" x2="${width - pad.right}" y2="${volumeTop - 16}"></line>
-        <line class="chart-axis" x1="${pad.left}" y1="${pad.top}" x2="${pad.left}" y2="${volumeTop - 16}"></line>
+        <line class="chart-axis" x1="${pad.left}" y1="${height - pad.bottom}" x2="${width - pad.right}" y2="${height - pad.bottom}"></line>
+        <line class="chart-axis" x1="${pad.left}" y1="${pad.top}" x2="${pad.left}" y2="${height - pad.bottom}"></line>
         <line class="chart-axis" x1="${pad.left}" y1="${volumeBottom}" x2="${width - pad.right}" y2="${volumeBottom}"></line>
-        ${showVolume ? volumeBars : ""}
         ${candles}
         ${showLevels ? `<line x1="${pad.left}" y1="${y(recentHigh)}" x2="${width - pad.right}" y2="${y(recentHigh)}" stroke="#d9a441" stroke-dasharray="6 6" opacity=".75"></line>` : ""}
         ${showLevels ? `<line x1="${pad.left}" y1="${y(recentLow)}" x2="${width - pad.right}" y2="${y(recentLow)}" stroke="#64748b" stroke-dasharray="6 6" opacity=".65"></line>` : ""}
@@ -4139,15 +4294,42 @@ INDEX_HTML = r"""<!doctype html>
         <text class="chart-label" x="${pad.left}" y="${height - 10}">${rows[0].date || ""}</text>
         <text class="chart-label" x="${width - pad.right}" y="${height - 10}" text-anchor="end">${rows[rows.length - 1].date || ""}</text>
         <text class="chart-label" x="8" y="${pad.top + 8}">${fmt(max)}</text>
-        <text class="chart-label" x="8" y="${volumeTop - 16}">${fmt(min)}</text>
+        <text class="chart-label" x="8" y="${height - pad.bottom}">${fmt(min)}</text>
         <text class="chart-label" x="${width - pad.right + 8}" y="${latestY + 4}">${fmt(latest)}</text>
         ${showLevels ? `<text class="chart-label" x="${width - pad.right + 8}" y="${y(recentHigh) + 4}">壓力</text>` : ""}
         ${showLevels ? `<text class="chart-label" x="${width - pad.right + 8}" y="${y(recentLow) + 4}">支撐</text>` : ""}
-        ${showVolume ? `<text class="chart-label" x="${pad.left}" y="${volumeTop + 12}">成交量</text>` : ""}
-        ${showMa ? `<text class="chart-label" x="${width - 310}" y="22">MA5</text>` : ""}
-        ${showMa ? `<text class="chart-label" x="${width - 258}" y="22">MA10</text>` : ""}
-        ${showMa ? `<text class="chart-label" x="${width - 198}" y="22">月均線</text>` : ""}
-        ${showBollinger ? `<text class="chart-label" x="${width - 132}" y="22">布林</text>` : ""}
+        ${showMa ? `<text class="chart-label" x="${pad.left + 8}" y="22" fill="#38bdf8">SMA(5) ${fmt(ma5.at(-1))}</text>` : ""}
+        ${showMa ? `<text class="chart-label" x="${pad.left + 166}" y="22" fill="#f59e0b">SMA(10) ${fmt(ma10.at(-1))}</text>` : ""}
+        ${showMa ? `<text class="chart-label" x="${pad.left + 340}" y="22" fill="#a855f7">SMA(20) ${fmt(ma20.at(-1))}</text>` : ""}
+        ${showBollinger ? `<text class="chart-label" x="${width - 190}" y="22" fill="#a78bfa">布林 ${fmt(upper.at(-1))}/${fmt(lower.at(-1))}</text>` : ""}
+      `;
+    }
+    function renderVolumeChart(target, rows) {
+      const width = 1000;
+      const height = 220;
+      const pad = { left: 54, right: 18, top: 18, bottom: 34 };
+      target.setAttribute("viewBox", `0 0 ${width} ${height}`);
+      if (!rows || rows.length < 2) {
+        target.innerHTML = `<text x="50%" y="50%" text-anchor="middle" class="chart-label">資料不足</text>`;
+        return;
+      }
+      const max = Math.max(...rows.map(row => Number(row.volume || 0)), 1);
+      const plotW = width - pad.left - pad.right;
+      const plotH = height - pad.top - pad.bottom;
+      const x = index => pad.left + index * (plotW / (rows.length - 1));
+      const barW = Math.max(2, Math.min(9, plotW / rows.length * .55));
+      const bars = rows.map((row, index) => {
+        const color = Number(row.close) >= Number(row.open) ? "#ef4444" : "#00e676";
+        const h = Math.max(1, Number(row.volume || 0) / max * plotH);
+        return `<rect x="${x(index) - barW / 2}" y="${height - pad.bottom - h}" width="${barW}" height="${h}" fill="${color}" opacity=".76"><title>${trendLabel(row)} 量 ${fmt(row.volume, 0)}</title></rect>`;
+      }).join("");
+      target.innerHTML = `
+        <line class="chart-axis" x1="${pad.left}" y1="${height - pad.bottom}" x2="${width - pad.right}" y2="${height - pad.bottom}"></line>
+        <line class="chart-axis" x1="${pad.left}" y1="${pad.top}" x2="${pad.left}" y2="${height - pad.bottom}"></line>
+        ${bars}
+        <text class="chart-label" x="8" y="${pad.top + 8}">${fmt(max, 0)}</text>
+        <text class="chart-label" x="${pad.left}" y="${height - 10}">${trendLabel(rows[0])}</text>
+        <text class="chart-label" x="${width - pad.right}" y="${height - 10}" text-anchor="end">${trendLabel(rows[rows.length - 1])}</text>
       `;
     }
     function renderRsiChart(target, rows) {
@@ -4244,7 +4426,7 @@ INDEX_HTML = r"""<!doctype html>
         <text class="chart-label" x="${width - 80}" y="22">K / D</text>
       `;
     }
-    function renderInstitutionalChart(target, data) {
+    function renderInstitutionalChart(target, data, mode = "foreign") {
       const rows = (data.rows || []).slice(-45);
       const width = 1000;
       const height = 240;
@@ -4254,37 +4436,33 @@ INDEX_HTML = r"""<!doctype html>
         target.innerHTML = `<text x="50%" y="50%" text-anchor="middle" class="chart-label">${data.message || "法人資料不足"}</text>`;
         return;
       }
-      const series = ["foreign", "investment", "retail_proxy"];
       const colors = { foreign: "#38bdf8", investment: "#f59e0b", retail_proxy: "#a78bfa" };
       const labels = { foreign: "外資", investment: "投信", retail_proxy: "散戶代理" };
-      const all = rows.flatMap(row => series.map(key => Number(row[key] || 0))).filter(Number.isFinite);
+      const key = colors[mode] ? mode : "foreign";
+      const title = document.getElementById("chipChartTitle");
+      if (title) title.textContent = `${labels[key]}買賣超`;
+      const all = rows.map(row => Number(row[key] || 0)).filter(Number.isFinite);
       const maxAbs = Math.max(...all.map(Math.abs), 1);
       const plotW = width - pad.left - pad.right;
       const plotH = height - pad.top - pad.bottom;
       const zeroY = pad.top + plotH / 2;
       const groupW = plotW / rows.length;
-      const barW = Math.max(2, Math.min(7, groupW / 4));
+      const barW = Math.max(3, Math.min(11, groupW * .62));
       const y = value => zeroY - (Number(value) / maxAbs) * (plotH / 2 - 8);
       const bars = rows.map((row, index) => {
-        const x0 = pad.left + index * groupW + groupW / 2;
-        return series.map((key, sIndex) => {
-          const value = Number(row[key] || 0);
-          const yy = y(value);
-          const top = Math.min(yy, zeroY);
-          const h = Math.max(1, Math.abs(yy - zeroY));
-          const x = x0 + (sIndex - 1) * (barW + 1);
-          return `<rect x="${x}" y="${top}" width="${barW}" height="${h}" fill="${colors[key]}" opacity=".78"><title>${row.date} ${labels[key]} ${fmt(value, 0)}</title></rect>`;
-        }).join("");
+        const value = Number(row[key] || 0);
+        const yy = y(value);
+        const top = Math.min(yy, zeroY);
+        const h = Math.max(1, Math.abs(yy - zeroY));
+        const color = value >= 0 ? "#ef4444" : "#00e676";
+        const x = pad.left + index * groupW + groupW / 2 - barW / 2;
+        return `<rect x="${x}" y="${top}" width="${barW}" height="${h}" fill="${color}" opacity=".82"><title>${row.date} ${labels[key]} ${fmt(value, 0)}</title></rect>`;
       }).join("");
-      const legend = series.map((key, index) => `
-        <rect x="${width - 280 + index * 86}" y="12" width="10" height="10" fill="${colors[key]}"></rect>
-        <text class="chart-label" x="${width - 266 + index * 86}" y="21">${labels[key]}</text>
-      `).join("");
       target.innerHTML = `
         <line class="chart-axis" x1="${pad.left}" y1="${zeroY}" x2="${width - pad.right}" y2="${zeroY}"></line>
         <line class="chart-axis" x1="${pad.left}" y1="${pad.top}" x2="${pad.left}" y2="${height - pad.bottom}"></line>
         ${bars}
-        ${legend}
+        <text class="chart-label" x="${width - 158}" y="22" fill="${colors[key]}">${labels[key]}｜紅買超 綠賣超</text>
         <text class="chart-label" x="8" y="${pad.top + 8}">${fmt(maxAbs, 0)}</text>
         <text class="chart-label" x="8" y="${height - pad.bottom}">-${fmt(maxAbs, 0)}</text>
         <text class="chart-label" x="${pad.left}" y="${height - 10}">${rows[0].date || ""}</text>
@@ -4333,10 +4511,12 @@ INDEX_HTML = r"""<!doctype html>
         ["60日新高", fmt(ind.new_high_60)],
       ]);
       renderCandlestickChart(document.getElementById("priceChart"), currentPriceRows, currentChartMode);
+      renderVolumeChart(document.getElementById("volumeChart"), prices.prices);
       renderRsiChart(document.getElementById("rsiChart"), prices.prices);
       renderMacdChart(document.getElementById("macdChart"), prices.prices);
       renderKdChart(document.getElementById("kdChart"), prices.prices);
-      renderInstitutionalChart(document.getElementById("institutionalChart"), institutional);
+      currentInstitutional = institutional;
+      renderInstitutionalChart(document.getElementById("institutionalChart"), institutional, currentChipMode);
       showCandleInfo(currentPriceRows.length - 1);
       renderTradePlan(document.getElementById("tradePlan"), buildTradePlan(stock, ind, signal, prices.prices));
       renderAnalysisFacets(document.getElementById("analysisFacets"), monitor);
