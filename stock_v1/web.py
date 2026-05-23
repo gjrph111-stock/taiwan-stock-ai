@@ -1665,6 +1665,9 @@ INDEX_HTML = r"""<!doctype html>
     }
     .page { display: none; }
     .page.active { display: grid; gap: 16px; }
+    body.stock-focus #statusLine { display: none; }
+    body.stock-focus #stockPage.page.active { gap: 8px; }
+    body.stock-focus #stockPage .grid { gap: 8px; }
     .overview-only.hidden { display: none; }
     .toolbar, .metrics, .grid {
       display: grid;
@@ -1971,8 +1974,8 @@ INDEX_HTML = r"""<!doctype html>
       border: 1px solid var(--line);
       border-radius: 8px;
     }
-    #priceChart { height: 430px; }
-    #rsiChart, #macdChart, #kdChart { height: 280px; }
+    #priceChart { height: clamp(310px, 44vh, 410px); }
+    #rsiChart, #macdChart, #kdChart, #volumeChart, #institutionalChart { height: clamp(170px, 24vh, 230px); }
     #realtimeTrendChart { height: 320px; }
     .chart-line {
       fill: none;
@@ -2238,10 +2241,10 @@ INDEX_HTML = r"""<!doctype html>
         linear-gradient(135deg, #10251f, #1e3a34);
       color: white;
       border-radius: 12px;
-      padding: 18px;
+      padding: 10px 14px;
       display: grid;
       grid-template-columns: 1fr auto;
-      gap: 14px;
+      gap: 10px;
       align-items: center;
     }
     .stock-hero h2 {
@@ -2249,21 +2252,22 @@ INDEX_HTML = r"""<!doctype html>
       border: 0;
       color: white;
       padding: 0;
-      font-size: 24px;
+      font-size: 20px;
     }
     .stock-hero h2::after { display: none; }
     .stock-hero .sub {
       color: #a7f3d0;
       font-weight: 700;
-      margin-top: 4px;
+      margin-top: 2px;
+      font-size: 13px;
     }
     .score-badge {
-      min-width: 116px;
+      min-width: 92px;
       text-align: center;
       background: rgba(255,255,255,.12);
       border: 1px solid rgba(255,255,255,.22);
       border-radius: 12px;
-      padding: 12px;
+      padding: 8px 10px;
     }
     .score-badge span {
       color: #cbd5e1;
@@ -2272,7 +2276,7 @@ INDEX_HTML = r"""<!doctype html>
       font-weight: 800;
     }
     .score-badge strong {
-      font-size: 30px;
+      font-size: 24px;
       color: white;
     }
     .trading-desk {
@@ -2375,8 +2379,8 @@ INDEX_HTML = r"""<!doctype html>
       font-weight: 800;
     }
     .chart-hover-info {
-      min-height: 24px;
-      padding: 4px 10px;
+      min-height: 20px;
+      padding: 3px 10px;
       color: #dbeafe;
       font-size: 13px;
       font-weight: 800;
@@ -2388,8 +2392,41 @@ INDEX_HTML = r"""<!doctype html>
       padding: 8px 8px 4px;
       background: #070d16;
     }
+    .chart-comparison {
+      display: grid;
+      grid-template-columns: 72px minmax(0, 1fr);
+      background: #070d16;
+      min-height: 0;
+    }
+    .attachment-rail {
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+      padding: 8px 7px;
+      background: linear-gradient(180deg, #08111f, #0b1626);
+      border-right: 1px solid rgba(56,189,248,.18);
+    }
+    .attachment-rail button {
+      width: 100%;
+      height: 34px;
+      padding: 0;
+      border-radius: 7px;
+      background: rgba(14,165,233,.12);
+      border-color: rgba(125,211,252,.28);
+      color: #dbeafe;
+      font-size: 12px;
+      font-weight: 900;
+    }
+    .attachment-rail button:hover {
+      background: rgba(14,165,233,.24);
+      border-color: #38bdf8;
+    }
+    .chart-stack {
+      min-width: 0;
+      display: grid;
+      grid-template-rows: auto auto auto;
+    }
     .trading-desk .chart {
-      height: 560px;
       background:
         linear-gradient(rgba(255,255,255,.025) 1px, transparent 1px),
         linear-gradient(90deg, rgba(255,255,255,.025) 1px, transparent 1px),
@@ -2401,22 +2438,16 @@ INDEX_HTML = r"""<!doctype html>
     .trading-desk .chart-label { fill: #94a3b8; }
     .technical-strip {
       display: grid;
-      grid-template-columns: repeat(4, minmax(230px, 1fr));
-      gap: 6px;
-      padding: 6px 8px 8px;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 0;
+      padding: 0 8px 6px;
       background: #070d16;
     }
     .technical-strip.collapsed {
       display: none;
     }
     .technical-attachment-bar {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-      padding: 6px 8px;
-      background: linear-gradient(90deg, #08111f, #111d2f);
-      border: 1px solid rgba(56,189,248,.18);
-      border-radius: 8px;
+      display: none;
     }
     .technical-attachment-bar button {
       height: 28px;
@@ -2431,20 +2462,12 @@ INDEX_HTML = r"""<!doctype html>
     .mini-chart-panel {
       background: linear-gradient(180deg, #101827, #0b1320);
       border: 1px solid #223247;
-      border-radius: 10px;
+      border-radius: 8px;
       overflow: hidden;
       box-shadow: 0 14px 32px rgba(15, 23, 42, .14);
     }
     .mini-chart-panel h3 {
-      margin: 0;
-      padding: 10px 12px;
-      color: #e5edf6;
-      font-size: 13px;
-      border-bottom: 1px solid #223247;
-      background: #0f1a2a;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
+      display: none;
     }
     .mini-chart-panel h3 span {
       color: #7dd3fc;
@@ -2452,14 +2475,14 @@ INDEX_HTML = r"""<!doctype html>
       font-weight: 900;
     }
     .mini-chart-panel .content {
-      padding: 4px 6px;
+      padding: 0;
       background: #070d16;
     }
     .mini-chart-panel.expanded {
       grid-column: 1 / -1;
     }
     .mini-chart-panel.expanded .chart {
-      height: 280px !important;
+      height: clamp(170px, 24vh, 230px) !important;
     }
     .sync-cursor {
       pointer-events: none;
@@ -2979,8 +3002,16 @@ INDEX_HTML = r"""<!doctype html>
       .terminal-chart, .terminal-watch { grid-column: auto; grid-row: auto; }
       .desk-side dl { grid-template-columns: 1fr; }
       .desk-side .diagnosis { grid-template-columns: 1fr; }
-      .trading-desk .chart { height: 360px; }
-      .mini-chart-panel .chart { height: 220px; }
+      .chart-comparison { grid-template-columns: 1fr; }
+      .attachment-rail {
+        flex-direction: row;
+        overflow-x: auto;
+        border-right: 0;
+        border-bottom: 1px solid rgba(56,189,248,.18);
+      }
+      .attachment-rail button { min-width: 72px; }
+      #priceChart { height: 330px; }
+      #rsiChart, #macdChart, #kdChart, #volumeChart, #institutionalChart { height: 190px; }
       .terminal-chart .chart { height: 300px; }
       .radar-stage { grid-template-columns: 1fr; }
       .toolbar, .watch-tools, .grid, .explore-actions { grid-template-columns: 1fr; }
@@ -3235,40 +3266,42 @@ INDEX_HTML = r"""<!doctype html>
               </div>
               <div class="chart-caption" id="chartCaption">K 線 / 成交量 / MA5 / MA10 / 月線 / 布林通道</div>
             </div>
-            <div class="chart-shell"><svg id="priceChart" class="chart" role="img" aria-label="K 線圖"></svg></div>
-            <div class="chart-hover-info" id="chartHoverInfo">滑過 K 棒可查看開高低收、成交量與時間。</div>
-            <div class="technical-attachment-bar">
-              <button type="button" onclick="showTechnicalAttachment('rsi')">RSI</button>
-              <button type="button" onclick="showTechnicalAttachment('macd')">MACD</button>
-              <button type="button" onclick="showTechnicalAttachment('kd')">KD</button>
-              <button type="button" onclick="showTechnicalAttachment('volume')">成交量</button>
-              <button type="button" onclick="showChipAttachment('foreign')">外資</button>
-              <button type="button" onclick="showChipAttachment('investment')">投信</button>
-              <button type="button" onclick="showChipAttachment('retail_proxy')">散戶</button>
-              <button type="button" onclick="showTechnicalAttachment('all')">全部</button>
-              <button type="button" onclick="showTechnicalAttachment('none')">收起</button>
-            </div>
-            <div class="technical-strip collapsed" id="technicalStrip">
-              <section class="mini-chart-panel" data-tech-panel="volume">
-                <h3><span>成交量</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">放大</button></h3>
-                <div class="content"><svg id="volumeChart" class="chart" role="img" aria-label="成交量圖"></svg></div>
-              </section>
-              <section class="mini-chart-panel" data-tech-panel="rsi">
-                <h3><span>RSI 14</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">放大</button></h3>
-                <div class="content"><svg id="rsiChart" class="chart" role="img" aria-label="RSI 技術圖"></svg></div>
-              </section>
-              <section class="mini-chart-panel" data-tech-panel="macd">
-                <h3><span>MACD 12 / 26 / 9</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">放大</button></h3>
-                <div class="content"><svg id="macdChart" class="chart" role="img" aria-label="MACD 技術圖"></svg></div>
-              </section>
-              <section class="mini-chart-panel" data-tech-panel="kd">
-                <h3><span>KD 9</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">放大</button></h3>
-                <div class="content"><svg id="kdChart" class="chart" role="img" aria-label="KD 技術圖"></svg></div>
-              </section>
-              <section class="mini-chart-panel" data-tech-panel="chips">
-                <h3><span id="chipChartTitle">外資買賣超</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">放大</button></h3>
-                <div class="content"><svg id="institutionalChart" class="chart" role="img" aria-label="法人買賣超圖"></svg></div>
-              </section>
+            <div class="chart-comparison">
+              <div class="attachment-rail" aria-label="附圖切換">
+                <button type="button" onclick="showTechnicalAttachment('macd')">MACD</button>
+                <button type="button" onclick="showTechnicalAttachment('kd')">KD</button>
+                <button type="button" onclick="showTechnicalAttachment('rsi')">RSI</button>
+                <button type="button" onclick="showTechnicalAttachment('volume')">成交量</button>
+                <button type="button" onclick="showChipAttachment('foreign')">外資</button>
+                <button type="button" onclick="showChipAttachment('investment')">投信</button>
+                <button type="button" onclick="showChipAttachment('retail_proxy')">散戶</button>
+              </div>
+              <div class="chart-stack">
+                <div class="chart-shell"><svg id="priceChart" class="chart" role="img" aria-label="K 線圖"></svg></div>
+                <div class="chart-hover-info" id="chartHoverInfo">滑過 K 棒可查看開高低收、成交量與時間。</div>
+                <div class="technical-strip" id="technicalStrip">
+                  <section class="mini-chart-panel hidden" data-tech-panel="volume">
+                    <h3><span>成交量</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">放大</button></h3>
+                    <div class="content"><svg id="volumeChart" class="chart" role="img" aria-label="成交量圖"></svg></div>
+                  </section>
+                  <section class="mini-chart-panel hidden" data-tech-panel="rsi">
+                    <h3><span>RSI 14</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">放大</button></h3>
+                    <div class="content"><svg id="rsiChart" class="chart" role="img" aria-label="RSI 技術圖"></svg></div>
+                  </section>
+                  <section class="mini-chart-panel expanded" data-tech-panel="macd">
+                    <h3><span>MACD 12 / 26 / 9</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">縮小</button></h3>
+                    <div class="content"><svg id="macdChart" class="chart" role="img" aria-label="MACD 技術圖"></svg></div>
+                  </section>
+                  <section class="mini-chart-panel hidden" data-tech-panel="kd">
+                    <h3><span>KD 9</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">放大</button></h3>
+                    <div class="content"><svg id="kdChart" class="chart" role="img" aria-label="KD 技術圖"></svg></div>
+                  </section>
+                  <section class="mini-chart-panel hidden" data-tech-panel="chips">
+                    <h3><span id="chipChartTitle">外資買賣超</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">放大</button></h3>
+                    <div class="content"><svg id="institutionalChart" class="chart" role="img" aria-label="法人買賣超圖"></svg></div>
+                  </section>
+                </div>
+              </div>
             </div>
           </section>
         </div>
@@ -3961,7 +3994,7 @@ INDEX_HTML = r"""<!doctype html>
     function renderLineChart(target, rows, valueKey) {
       const width = 1000;
       const height = 260;
-      const pad = { left: 54, right: 18, top: 18, bottom: 34 };
+      const pad = { left: 54, right: 72, top: 18, bottom: 34 };
       target.setAttribute("viewBox", `0 0 ${width} ${height}`);
       if (!rows || rows.length < 2) {
         target.innerHTML = `<text x="50%" y="50%" text-anchor="middle" class="chart-label">資料不足</text>`;
@@ -4424,7 +4457,7 @@ INDEX_HTML = r"""<!doctype html>
     function renderVolumeChart(target, rows) {
       const width = 1000;
       const height = 220;
-      const pad = { left: 54, right: 18, top: 18, bottom: 34 };
+      const pad = { left: 54, right: 72, top: 18, bottom: 34 };
       target.setAttribute("viewBox", `0 0 ${width} ${height}`);
       if (!rows || rows.length < 2) {
         target.innerHTML = `<text x="50%" y="50%" text-anchor="middle" class="chart-label">資料不足</text>`;
@@ -4455,7 +4488,7 @@ INDEX_HTML = r"""<!doctype html>
       const rsi = rsiValues(values, 14).map((value, index) => ({ date: rows[index].date, value }));
       const width = 1000;
       const height = 220;
-      const pad = { left: 54, right: 18, top: 18, bottom: 34 };
+      const pad = { left: 54, right: 72, top: 18, bottom: 34 };
       target.setAttribute("viewBox", `0 0 ${width} ${height}`);
       const valid = rsi.filter(row => row.value !== null);
       if (valid.length < 2) {
@@ -4483,7 +4516,7 @@ INDEX_HTML = r"""<!doctype html>
       const data = macdValues(values);
       const width = 1000;
       const height = 240;
-      const pad = { left: 54, right: 18, top: 18, bottom: 34 };
+      const pad = { left: 54, right: 72, top: 18, bottom: 34 };
       target.setAttribute("viewBox", `0 0 ${width} ${height}`);
       if (values.length < 35) {
         target.innerHTML = `<text x="50%" y="50%" text-anchor="middle" class="chart-label">資料不足</text>`;
@@ -4551,7 +4584,7 @@ INDEX_HTML = r"""<!doctype html>
       const rows = (data.rows || []).slice(-45);
       const width = 1000;
       const height = 240;
-      const pad = { left: 64, right: 22, top: 18, bottom: 36 };
+      const pad = { left: 54, right: 72, top: 18, bottom: 36 };
       target.setAttribute("viewBox", `0 0 ${width} ${height}`);
       if (!rows.length) {
         target.innerHTML = `<text x="50%" y="50%" text-anchor="middle" class="chart-label">${data.message || "法人資料不足"}</text>`;
@@ -4663,6 +4696,7 @@ INDEX_HTML = r"""<!doctype html>
     function activatePage(pageId) {
       document.querySelectorAll(".page").forEach(page => page.classList.remove("active"));
       document.getElementById(pageId).classList.add("active");
+      document.body.classList.toggle("stock-focus", pageId === "stockPage");
       document.querySelectorAll(".overview-only").forEach(item => item.classList.toggle("hidden", pageId !== "overview"));
       document.querySelectorAll(".nav-item").forEach(item => item.classList.remove("active"));
       const nav = document.querySelector(`[data-page="${pageId}"]`);
