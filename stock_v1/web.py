@@ -2425,17 +2425,15 @@ INDEX_HTML = r"""<!doctype html>
       min-width: 0;
       display: grid;
       grid-template-rows: auto auto auto;
-      overflow-x: auto;
+      overflow: hidden;
       cursor: grab;
-      scrollbar-color: #38bdf8 #0b1626;
-      scrollbar-width: thin;
     }
     .chart-stack.dragging {
       cursor: grabbing;
       user-select: none;
     }
     .chart-canvas {
-      min-width: 1480px;
+      min-width: 0;
     }
     .trading-desk .chart {
       background:
@@ -3023,7 +3021,7 @@ INDEX_HTML = r"""<!doctype html>
       .attachment-rail button { min-width: 72px; }
       #priceChart { height: 330px; }
       #rsiChart, #macdChart, #kdChart, #volumeChart, #institutionalChart { height: 190px; }
-      .chart-canvas { min-width: 1180px; }
+      .chart-canvas { min-width: 0; }
       .terminal-chart .chart { height: 300px; }
       .radar-stage { grid-template-columns: 1fr; }
       .toolbar, .watch-tools, .grid, .explore-actions { grid-template-columns: 1fr; }
@@ -4183,6 +4181,8 @@ INDEX_HTML = r"""<!doctype html>
       });
     }
     let currentPriceRows = [];
+    let chartWindowStart = 0;
+    let chartWindowSize = 80;
     let currentChartMode = "all";
     let currentStockCode = "2330";
     let currentStockInterval = "1d";
@@ -4193,14 +4193,34 @@ INDEX_HTML = r"""<!doctype html>
     };
     let currentInstitutional = null;
     let currentChipMode = "foreign";
+    function visibleChartRows() {
+      if (!currentPriceRows.length) return [];
+      const size = Math.min(chartWindowSize, currentPriceRows.length);
+      const maxStart = Math.max(0, currentPriceRows.length - size);
+      chartWindowStart = Math.max(0, Math.min(chartWindowStart, maxStart));
+      return currentPriceRows.slice(chartWindowStart, chartWindowStart + size);
+    }
+    function resetChartWindow() {
+      const size = Math.min(chartWindowSize, currentPriceRows.length);
+      chartWindowStart = Math.max(0, currentPriceRows.length - size);
+    }
+    function renderChartSuite() {
+      const rows = visibleChartRows();
+      renderCandlestickChart(document.getElementById("priceChart"), rows, currentChartMode);
+      renderVolumeChart(document.getElementById("volumeChart"), rows);
+      renderRsiChart(document.getElementById("rsiChart"), rows);
+      renderMacdChart(document.getElementById("macdChart"), rows);
+      renderKdChart(document.getElementById("kdChart"), rows);
+      renderInstitutionalChart(document.getElementById("institutionalChart"), currentInstitutional || { rows: [] }, currentChipMode);
+      setSyncedCursor(rows.length - 1, rows.length);
+    }
     function setChartMode(mode, button) {
       currentChartMode = mode;
       document.querySelectorAll("[data-chart-mode]").forEach(tab => tab.classList.remove("active"));
       if (button) button.classList.add("active");
       const caption = document.getElementById("chartCaption");
       if (caption) caption.textContent = chartModeCaptions[mode] || chartModeCaptions.all;
-      renderCandlestickChart(document.getElementById("priceChart"), currentPriceRows, mode);
-      setSyncedCursor(currentPriceRows.length - 1);
+      renderChartSuite();
     }
     async function setStockInterval(interval, button) {
       currentStockInterval = interval;
@@ -4217,15 +4237,10 @@ INDEX_HTML = r"""<!doctype html>
         const trend = await getJson(`/api/realtime-trend?code=${encodeURIComponent(code)}&interval=${encodeURIComponent(interval)}`);
         currentPriceRows = trend.rows || [];
       }
-      renderCandlestickChart(document.getElementById("priceChart"), currentPriceRows, currentChartMode);
-      renderVolumeChart(document.getElementById("volumeChart"), currentPriceRows);
-      renderRsiChart(document.getElementById("rsiChart"), currentPriceRows);
-      renderMacdChart(document.getElementById("macdChart"), currentPriceRows);
-      renderKdChart(document.getElementById("kdChart"), currentPriceRows);
-      renderInstitutionalChart(document.getElementById("institutionalChart"), currentInstitutional || { rows: [] }, currentChipMode);
+      resetChartWindow();
+      renderChartSuite();
       const info = document.getElementById("chartHoverInfo");
-      if (info) info.textContent = `${interval === "1d" ? "日線" : interval}｜共 ${currentPriceRows.length} 根 K 棒，滑過 K 棒可查看 OHLC。`;
-      setSyncedCursor(currentPriceRows.length - 1);
+      if (info) info.textContent = `${interval === "1d" ? "日線" : interval}｜共 ${currentPriceRows.length} 根 K 棒，目前顯示 ${visibleChartRows().length} 根。`;
     }
     function aggregateDailyRows(rows, mode) {
       const groups = new Map();
@@ -4304,18 +4319,35 @@ INDEX_HTML = r"""<!doctype html>
       stack.dataset.dragReady = "1";
       let dragging = false;
       let startX = 0;
-      let startScroll = 0;
+      let startWindow = 0;
+      let lastStep = 0;
       stack.addEventListener("pointerdown", event => {
         dragging = true;
         startX = event.clientX;
-        startScroll = stack.scrollLeft;
+        startWindow = chartWindowStart;
+        lastStep = 0;
         stack.classList.add("dragging");
         stack.setPointerCapture(event.pointerId);
       });
       stack.addEventListener("pointermove", event => {
         if (!dragging) return;
-        stack.scrollLeft = startScroll - (event.clientX - startX);
+        const step = Math.round((startX - event.clientX) / 12);
+        if (step === lastStep) return;
+        lastStep = step;
+        const size = Math.min(chartWindowSize, currentPriceRows.length);
+        const maxStart = Math.max(0, currentPriceRows.length - size);
+        chartWindowStart = Math.max(0, Math.min(startWindow + step, maxStart));
+        renderChartSuite();
       });
+      stack.addEventListener("wheel", event => {
+        if (!currentPriceRows.length) return;
+        event.preventDefault();
+        const size = Math.min(chartWindowSize, currentPriceRows.length);
+        const maxStart = Math.max(0, currentPriceRows.length - size);
+        const delta = event.deltaY || event.deltaX;
+        chartWindowStart = Math.max(0, Math.min(chartWindowStart + Math.sign(delta) * 4, maxStart));
+        renderChartSuite();
+      }, { passive: false });
       const stop = event => {
         dragging = false;
         stack.classList.remove("dragging");
@@ -4397,7 +4429,7 @@ INDEX_HTML = r"""<!doctype html>
       `;
     }
     function showCandleInfo(index) {
-      const row = currentPriceRows[index];
+      const row = visibleChartRows()[index];
       const target = document.getElementById("chartHoverInfo");
       if (!row || !target) return;
       const change = Number(row.close) - Number(row.open);
@@ -4406,7 +4438,8 @@ INDEX_HTML = r"""<!doctype html>
     }
     function setSyncedCursor(index, rowCount = currentPriceRows.length) {
       const ratio = rowCount > 1 ? index / (rowCount - 1) : 1;
-      const infoIndex = currentPriceRows.length > 1 ? Math.round(ratio * (currentPriceRows.length - 1)) : index;
+      const visibleRows = visibleChartRows();
+      const infoIndex = visibleRows.length > 1 ? Math.round(ratio * (visibleRows.length - 1)) : index;
       showCandleInfo(infoIndex);
       document.querySelectorAll(".sync-cursor").forEach(line => {
         const width = Number(line.dataset.width || 1000);
@@ -4640,7 +4673,7 @@ INDEX_HTML = r"""<!doctype html>
       `;
     }
     function renderInstitutionalChart(target, data, mode = "foreign") {
-      const rows = alignInstitutionalRows(data, currentPriceRows);
+      const rows = alignInstitutionalRows(data, visibleChartRows());
       const width = 1000;
       const height = 240;
       const pad = { left: 54, right: 72, top: 18, bottom: 36 };
@@ -4703,6 +4736,7 @@ INDEX_HTML = r"""<!doctype html>
         getJson(`/api/institutional?code=${encoded}`),
       ]);
       currentPriceRows = prices.prices || [];
+      resetChartWindow();
       renderDl(document.getElementById("stockSummary"), [
         ["代號", `${stock.code} ${stock.short_name || stock.name}`],
         ["市場", stock.market],
@@ -4724,14 +4758,8 @@ INDEX_HTML = r"""<!doctype html>
         ["5日/20日量比", fmt(ind.volume_ratio)],
         ["60日新高", fmt(ind.new_high_60)],
       ]);
-      renderCandlestickChart(document.getElementById("priceChart"), currentPriceRows, currentChartMode);
-      renderVolumeChart(document.getElementById("volumeChart"), prices.prices);
-      renderRsiChart(document.getElementById("rsiChart"), prices.prices);
-      renderMacdChart(document.getElementById("macdChart"), prices.prices);
-      renderKdChart(document.getElementById("kdChart"), prices.prices);
       currentInstitutional = institutional;
-      renderInstitutionalChart(document.getElementById("institutionalChart"), institutional, currentChipMode);
-      setSyncedCursor(currentPriceRows.length - 1);
+      renderChartSuite();
       installChartDrag();
       renderTradePlan(document.getElementById("tradePlan"), buildTradePlan(stock, ind, signal, prices.prices));
       renderAnalysisFacets(document.getElementById("analysisFacets"), monitor);
