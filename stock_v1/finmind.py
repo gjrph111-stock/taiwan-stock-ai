@@ -71,6 +71,41 @@ def fetch_finmind_kbar(stock_code: str, target_date: date) -> list[dict]:
     return rows
 
 
+def fetch_finmind_institutional(stock_code: str, start_date: date, end_date: date) -> list[dict]:
+    params = {
+        "dataset": "TaiwanStockInstitutionalInvestorsBuySell",
+        "data_id": stock_code,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+    }
+    payload = _download_json(params)
+    if payload.get("status") != 200:
+        raise RuntimeError(f"FinMind institutional {stock_code} failed: {payload.get('msg')}")
+    rows = []
+    for item in payload.get("data") or []:
+        buy = _num(item.get("buy") or item.get("Buy") or item.get("buy_volume"))
+        sell = _num(item.get("sell") or item.get("Sell") or item.get("sell_volume"))
+        rows.append(
+            {
+                "date": item.get("date"),
+                "name": item.get("name") or item.get("investor") or item.get("institutional_investors") or "法人",
+                "buy": buy,
+                "sell": sell,
+                "net": buy - sell,
+            }
+        )
+    return rows
+
+
+def _num(value) -> float:
+    if value in (None, ""):
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _download_json(params: dict) -> dict:
     headers = dict(REQUEST_HEADERS)
     token = os.environ.get("FINMIND_TOKEN", "").strip()

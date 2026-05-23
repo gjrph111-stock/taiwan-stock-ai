@@ -2,7 +2,7 @@ import json
 import os
 import secrets
 import sqlite3
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -14,7 +14,7 @@ from .ai_monitor import analyze_stock, build_ai_monitor
 from .backtest import high_win_strategy_backtest, realistic_strategy_backtest
 from . import db
 from .config import DEFAULT_DB_PATH
-from .finmind import fetch_finmind_kbar, fetch_recent_finmind_prices
+from .finmind import fetch_finmind_institutional, fetch_finmind_kbar, fetch_recent_finmind_prices
 from .fundamental import build_fundamental_analysis
 from .indicators import is_new_high, macd, pct_change, rsi, sma, volume_ratio
 from .industry import industry_profile
@@ -105,7 +105,9 @@ def _make_handler(db_path: Path):
                     codes = _param(params, "codes", "2330,2317,2454,2308,2412,2882")
                     self._send_json(api_realtime(db_path, codes))
                 elif parsed.path == "/api/realtime-trend":
-                    self._send_json(api_realtime_trend(db_path, _param(params, "code", "2330")))
+                    self._send_json(api_realtime_trend(db_path, _param(params, "code", "2330"), _param(params, "interval", "1d")))
+                elif parsed.path == "/api/institutional":
+                    self._send_json(api_institutional(db_path, _param(params, "code", "2330")))
                 else:
                     self._send_json({"error": "not found"}, status=404)
             except Exception as exc:
@@ -897,8 +899,9 @@ def api_realtime(db_path: Path, raw_codes: str) -> dict:
     return {"quotes": quotes, "message": message, "source": "FinMind"}
 
 
-def api_realtime_trend(db_path: Path, code: str) -> dict:
+def api_realtime_trend(db_path: Path, code: str, interval: str = "1d") -> dict:
     code = code.strip()
+    interval = interval.strip().lower()
     if not code:
         return {"error": "請輸入股票代號。"}
     stock = api_stock(db_path, code)
@@ -906,7 +909,32 @@ def api_realtime_trend(db_path: Path, code: str) -> dict:
         return stock
 
     today = date.today()
+    if interval in {"5", "10", "15", "30", "5m", "10m", "15m", "30m"}:
+        minutes = int(interval.replace("m", ""))
+        try:
+            rows = fetch_finmind_kbar(code, today)
+            rows = [row for row in rows if row.get("close") is not None]
+            rows = _aggregate_intraday_rows(rows, minutes)
+            if rows:
+                return {
+                    "code": code,
+                    "name": stock.get("short_name") or stock.get("name"),
+                    "mode": "intraday",
+                    "interval": f"{minutes}m",
+                    "source": "FinMind TaiwanStockKBar",
+                    "message": f"已使用 FinMind 分 K 資料並聚合為 {minutes} 分鐘。",
+                    "rows": rows,
+                }
+        except Exception as exc:
+            kbar_error = str(exc)
+        else:
+            kbar_error = "FinMind KBar 無資料"
+    else:
+        kbar_error = "使用日線走勢"
+
     try:
+        if interval in {"1d", "day", "daily"}:
+            raise RuntimeError("日線模式")
         rows = fetch_finmind_kbar(code, today)
         rows = [row for row in rows if row.get("close") is not None]
         if rows:
@@ -919,7 +947,8 @@ def api_realtime_trend(db_path: Path, code: str) -> dict:
                 "rows": rows,
             }
     except Exception as exc:
-        kbar_error = str(exc)
+        if kbar_error == "使用日線走勢":
+            kbar_error = str(exc)
     else:
         kbar_error = "FinMind KBar 無資料"
 
@@ -980,6 +1009,79 @@ def api_realtime_trend(db_path: Path, code: str) -> dict:
             "message": f"FinMind 走勢不可用，已使用本機資料。原因：{exc}",
             "rows": [dict(row) | {"label": dict(row)["date"][5:], "time": None} for row in reversed(rows)],
         }
+
+
+def api_institutional(db_path: Path, code: str) -> dict:
+    code = code.strip()
+    stock = api_stock(db_path, code)
+    if "error" in stock:
+        return stock
+    end = date.today()
+    start = end - timedelta(days=90)
+    try:
+        raw = fetch_finmind_institutional(code, start, end)
+        grouped: dict[str, dict] = {}
+        for row in raw:
+            day = row.get("date")
+            if not day:
+                continue
+            item = grouped.setdefault(day, {"date": day, "foreign": 0, "investment": 0, "dealer": 0})
+            name = str(row.get("name") or "")
+            net = float(row.get("net") or 0)
+            if "外資" in name or "Foreign" in name:
+                item["foreign"] += net
+            elif "投信" in name or "Investment" in name:
+                item["investment"] += net
+            elif "自營" in name or "Dealer" in name:
+                item["dealer"] += net
+        rows = []
+        for day in sorted(grouped)[-45:]:
+            item = grouped[day]
+            institutional_net = item["foreign"] + item["investment"] + item["dealer"]
+            item["retail_proxy"] = -institutional_net
+            rows.append(item)
+        return {
+            "code": code,
+            "name": stock.get("short_name") or stock.get("name"),
+            "source": "FinMind TaiwanStockInstitutionalInvestorsBuySell",
+            "message": "外資、投信、自營商為公開法人買賣超；散戶為法人反向代理值。",
+            "rows": rows,
+        }
+    except Exception as exc:
+        return {"code": code, "name": stock.get("short_name") or stock.get("name"), "rows": [], "message": f"法人資料暫不可用：{exc}"}
+
+
+def _aggregate_intraday_rows(rows: list[dict], minutes: int) -> list[dict]:
+    if minutes <= 1:
+        return rows
+    grouped = []
+    current = None
+    for row in rows:
+        label = str(row.get("time") or row.get("label") or "")
+        try:
+            hour, minute = [int(part) for part in label[:5].split(":")]
+            bucket_minute = (minute // minutes) * minutes
+            bucket = f"{hour:02d}:{bucket_minute:02d}"
+        except Exception:
+            bucket = label
+        if current is None or current["label"] != bucket:
+            current = {
+                "date": row.get("date"),
+                "time": bucket,
+                "label": bucket,
+                "open": row.get("open"),
+                "high": row.get("high"),
+                "low": row.get("low"),
+                "close": row.get("close"),
+                "volume": row.get("volume") or 0,
+            }
+            grouped.append(current)
+            continue
+        current["high"] = max(value for value in [current.get("high"), row.get("high")] if value is not None)
+        current["low"] = min(value for value in [current.get("low"), row.get("low")] if value is not None)
+        current["close"] = row.get("close")
+        current["volume"] = (current.get("volume") or 0) + (row.get("volume") or 0)
+    return grouped
 
 
 def _local_realtime_quotes(db_path: Path, stocks: list[sqlite3.Row], message: str) -> dict:
@@ -2184,7 +2286,7 @@ INDEX_HTML = r"""<!doctype html>
       min-width: 0;
     }
     .desk-side {
-      grid-template-columns: repeat(4, minmax(220px, 1fr));
+      grid-template-columns: .85fr 1.15fr 1.2fr 1fr 1fr;
       align-items: stretch;
     }
     .desk-side .desk-panel {
@@ -2192,6 +2294,21 @@ INDEX_HTML = r"""<!doctype html>
     }
     .desk-side .diagnosis {
       grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+    .desk-side .content { padding: 10px; }
+    .desk-side dl {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 6px 10px;
+      font-size: 12px;
+    }
+    .desk-side .trade-plan { padding: 10px; }
+    .desk-side .trade-callout { padding: 9px; }
+    .desk-side .trade-callout strong { font-size: 14px; }
+    .desk-side .trade-callout p,
+    .desk-side .trade-list {
+      font-size: 12px;
+      line-height: 1.42;
     }
     .desk-panel {
       background:
@@ -2229,6 +2346,10 @@ INDEX_HTML = r"""<!doctype html>
       gap: 6px;
       flex-wrap: wrap;
     }
+    .compact-tabs .chart-tab {
+      min-width: 48px;
+      padding: 0 9px;
+    }
     .chart-tab {
       height: 30px;
       padding: 0 10px;
@@ -2252,11 +2373,22 @@ INDEX_HTML = r"""<!doctype html>
       font-size: 12px;
       font-weight: 800;
     }
+    .chart-hover-info {
+      min-height: 34px;
+      padding: 8px 12px;
+      color: #dbeafe;
+      font-size: 13px;
+      font-weight: 800;
+      background: linear-gradient(90deg, rgba(14,165,233,.12), rgba(34,197,94,.08));
+      border-top: 1px solid rgba(56,189,248,.16);
+      border-bottom: 1px solid rgba(56,189,248,.12);
+    }
     .chart-shell {
       padding: 12px;
       background: #070d16;
     }
     .trading-desk .chart {
+      height: 560px;
       background:
         linear-gradient(rgba(255,255,255,.025) 1px, transparent 1px),
         linear-gradient(90deg, rgba(255,255,255,.025) 1px, transparent 1px),
@@ -2268,8 +2400,10 @@ INDEX_HTML = r"""<!doctype html>
     .trading-desk .chart-label { fill: #94a3b8; }
     .technical-strip {
       display: grid;
-      grid-template-columns: repeat(3, minmax(260px, 1fr));
+      grid-template-columns: repeat(4, minmax(230px, 1fr));
       gap: 10px;
+      padding: 10px;
+      background: #070d16;
     }
     .technical-strip.collapsed {
       display: none;
@@ -2925,31 +3059,44 @@ INDEX_HTML = r"""<!doctype html>
                 <button type="button" class="chart-tab" data-chart-mode="bollinger" onclick="setChartMode('bollinger', this)">布林</button>
                 <button type="button" class="chart-tab" data-chart-mode="volume" onclick="setChartMode('volume', this)">量能</button>
               </div>
+              <div class="chart-tabs compact-tabs">
+                <button type="button" class="chart-tab active" data-interval="1d" onclick="setStockInterval('1d', this)">日線</button>
+                <button type="button" class="chart-tab" data-interval="5m" onclick="setStockInterval('5m', this)">5分</button>
+                <button type="button" class="chart-tab" data-interval="10m" onclick="setStockInterval('10m', this)">10分</button>
+                <button type="button" class="chart-tab" data-interval="15m" onclick="setStockInterval('15m', this)">15分</button>
+                <button type="button" class="chart-tab" data-interval="30m" onclick="setStockInterval('30m', this)">30分</button>
+              </div>
               <div class="chart-caption" id="chartCaption">K 線 / 成交量 / MA5 / MA10 / 月線 / 布林通道</div>
             </div>
             <div class="chart-shell"><svg id="priceChart" class="chart" role="img" aria-label="K 線圖"></svg></div>
+            <div class="chart-hover-info" id="chartHoverInfo">滑過 K 棒可查看開高低收、成交量與時間。</div>
+            <div class="technical-attachment-bar">
+              <button type="button" onclick="showTechnicalAttachment('rsi')">RSI</button>
+              <button type="button" onclick="showTechnicalAttachment('macd')">MACD</button>
+              <button type="button" onclick="showTechnicalAttachment('kd')">KD</button>
+              <button type="button" onclick="showTechnicalAttachment('chips')">法人買賣超</button>
+              <button type="button" onclick="showTechnicalAttachment('all')">全部</button>
+              <button type="button" onclick="showTechnicalAttachment('none')">收起</button>
+            </div>
+            <div class="technical-strip collapsed" id="technicalStrip">
+              <section class="mini-chart-panel" data-tech-panel="rsi">
+                <h3><span>RSI 14</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">放大</button></h3>
+                <div class="content"><svg id="rsiChart" class="chart" role="img" aria-label="RSI 技術圖"></svg></div>
+              </section>
+              <section class="mini-chart-panel" data-tech-panel="macd">
+                <h3><span>MACD 12 / 26 / 9</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">放大</button></h3>
+                <div class="content"><svg id="macdChart" class="chart" role="img" aria-label="MACD 技術圖"></svg></div>
+              </section>
+              <section class="mini-chart-panel" data-tech-panel="kd">
+                <h3><span>KD 9</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">放大</button></h3>
+                <div class="content"><svg id="kdChart" class="chart" role="img" aria-label="KD 技術圖"></svg></div>
+              </section>
+              <section class="mini-chart-panel" data-tech-panel="chips">
+                <h3><span>外資 / 投信 / 散戶代理</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">放大</button></h3>
+                <div class="content"><svg id="institutionalChart" class="chart" role="img" aria-label="法人買賣超圖"></svg></div>
+              </section>
+            </div>
           </section>
-          <div class="technical-attachment-bar">
-            <button type="button" onclick="showTechnicalAttachment('rsi')">RSI 附圖</button>
-            <button type="button" onclick="showTechnicalAttachment('macd')">MACD 附圖</button>
-            <button type="button" onclick="showTechnicalAttachment('kd')">KD 附圖</button>
-            <button type="button" onclick="showTechnicalAttachment('all')">全部附圖</button>
-            <button type="button" onclick="showTechnicalAttachment('none')">收起附圖</button>
-          </div>
-          <div class="technical-strip collapsed" id="technicalStrip">
-            <section class="mini-chart-panel" data-tech-panel="rsi">
-              <h3><span>RSI 14</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">放大</button></h3>
-              <div class="content"><svg id="rsiChart" class="chart" role="img" aria-label="RSI 技術圖"></svg></div>
-            </section>
-            <section class="mini-chart-panel" data-tech-panel="macd">
-              <h3><span>MACD 12 / 26 / 9</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">放大</button></h3>
-              <div class="content"><svg id="macdChart" class="chart" role="img" aria-label="MACD 技術圖"></svg></div>
-            </section>
-            <section class="mini-chart-panel" data-tech-panel="kd">
-              <h3><span>KD 9</span><button type="button" class="zoom-btn" onclick="toggleChartZoom(this)">放大</button></h3>
-              <div class="content"><svg id="kdChart" class="chart" role="img" aria-label="KD 技術圖"></svg></div>
-            </section>
-          </div>
         </div>
         <div class="desk-side">
           <section class="desk-panel">
@@ -3764,6 +3911,8 @@ INDEX_HTML = r"""<!doctype html>
     }
     let currentPriceRows = [];
     let currentChartMode = "all";
+    let currentStockCode = "2330";
+    let currentStockInterval = "1d";
     const chartModeCaptions = {
       all: "K 線 / 成交量 / MA5 / MA10 / 月線 / 布林通道",
       ma: "均線模式：K 線 / MA5 / MA10 / 月線",
@@ -3772,11 +3921,32 @@ INDEX_HTML = r"""<!doctype html>
     };
     function setChartMode(mode, button) {
       currentChartMode = mode;
-      document.querySelectorAll(".chart-tab").forEach(tab => tab.classList.remove("active"));
+      document.querySelectorAll("[data-chart-mode]").forEach(tab => tab.classList.remove("active"));
       if (button) button.classList.add("active");
       const caption = document.getElementById("chartCaption");
       if (caption) caption.textContent = chartModeCaptions[mode] || chartModeCaptions.all;
       renderCandlestickChart(document.getElementById("priceChart"), currentPriceRows, mode);
+    }
+    async function setStockInterval(interval, button) {
+      currentStockInterval = interval;
+      document.querySelectorAll("[data-interval]").forEach(tab => tab.classList.remove("active"));
+      if (button) button.classList.add("active");
+      await loadStockChartInterval(currentStockCode, interval);
+    }
+    async function loadStockChartInterval(code, interval) {
+      if (interval === "1d") {
+        const prices = await getJson(`/api/prices?code=${encodeURIComponent(code)}&limit=160`);
+        currentPriceRows = prices.prices || [];
+      } else {
+        const trend = await getJson(`/api/realtime-trend?code=${encodeURIComponent(code)}&interval=${encodeURIComponent(interval)}`);
+        currentPriceRows = trend.rows || [];
+      }
+      renderCandlestickChart(document.getElementById("priceChart"), currentPriceRows, currentChartMode);
+      renderRsiChart(document.getElementById("rsiChart"), currentPriceRows);
+      renderMacdChart(document.getElementById("macdChart"), currentPriceRows);
+      renderKdChart(document.getElementById("kdChart"), currentPriceRows);
+      const info = document.getElementById("chartHoverInfo");
+      if (info) info.textContent = `${interval === "1d" ? "日線" : interval}｜共 ${currentPriceRows.length} 根 K 棒，滑過 K 棒可查看 OHLC。`;
     }
     function toggleChartZoom(button) {
       const panel = button.closest(".mini-chart-panel");
@@ -3874,6 +4044,14 @@ INDEX_HTML = r"""<!doctype html>
         <ul class="trade-list">${plan.checks.map(item => `<li>${item}</li>`).join("")}</ul>
       `;
     }
+    function showCandleInfo(index) {
+      const row = currentPriceRows[index];
+      const target = document.getElementById("chartHoverInfo");
+      if (!row || !target) return;
+      const change = Number(row.close) - Number(row.open);
+      const changePct = Number(row.open) ? change / Number(row.open) * 100 : null;
+      target.textContent = `${trendLabel(row)}｜開 ${fmt(row.open)} 高 ${fmt(row.high)} 低 ${fmt(row.low)} 收 ${fmt(row.close)}｜量 ${fmt(row.volume, 0)}｜單棒 ${fmt(change)} / ${fmt(changePct)}%`;
+    }
     function renderCandlestickChart(target, rows, mode = "all") {
       const width = 1000;
       const height = 420;
@@ -3910,6 +4088,9 @@ INDEX_HTML = r"""<!doctype html>
         return `
           <line x1="${cx}" y1="${y(high)}" x2="${cx}" y2="${y(low)}" stroke="${color}" stroke-width="1"></line>
           <rect x="${cx - candleW / 2}" y="${bodyY}" width="${candleW}" height="${bodyH}" fill="${color}" opacity="0.86"></rect>
+          <rect x="${cx - candleW}" y="${pad.top}" width="${candleW * 2}" height="${volumeBottom - pad.top}" fill="transparent" onmousemove="showCandleInfo(${index})">
+            <title>${trendLabel(row)} O:${fmt(open)} H:${fmt(high)} L:${fmt(low)} C:${fmt(close)} V:${fmt(row.volume, 0)}</title>
+          </rect>
         `;
       }).join("");
       const volumeMax = Math.max(...volumes, 1);
@@ -4063,20 +4244,71 @@ INDEX_HTML = r"""<!doctype html>
         <text class="chart-label" x="${width - 80}" y="22">K / D</text>
       `;
     }
+    function renderInstitutionalChart(target, data) {
+      const rows = (data.rows || []).slice(-45);
+      const width = 1000;
+      const height = 240;
+      const pad = { left: 64, right: 22, top: 18, bottom: 36 };
+      target.setAttribute("viewBox", `0 0 ${width} ${height}`);
+      if (!rows.length) {
+        target.innerHTML = `<text x="50%" y="50%" text-anchor="middle" class="chart-label">${data.message || "法人資料不足"}</text>`;
+        return;
+      }
+      const series = ["foreign", "investment", "retail_proxy"];
+      const colors = { foreign: "#38bdf8", investment: "#f59e0b", retail_proxy: "#a78bfa" };
+      const labels = { foreign: "外資", investment: "投信", retail_proxy: "散戶代理" };
+      const all = rows.flatMap(row => series.map(key => Number(row[key] || 0))).filter(Number.isFinite);
+      const maxAbs = Math.max(...all.map(Math.abs), 1);
+      const plotW = width - pad.left - pad.right;
+      const plotH = height - pad.top - pad.bottom;
+      const zeroY = pad.top + plotH / 2;
+      const groupW = plotW / rows.length;
+      const barW = Math.max(2, Math.min(7, groupW / 4));
+      const y = value => zeroY - (Number(value) / maxAbs) * (plotH / 2 - 8);
+      const bars = rows.map((row, index) => {
+        const x0 = pad.left + index * groupW + groupW / 2;
+        return series.map((key, sIndex) => {
+          const value = Number(row[key] || 0);
+          const yy = y(value);
+          const top = Math.min(yy, zeroY);
+          const h = Math.max(1, Math.abs(yy - zeroY));
+          const x = x0 + (sIndex - 1) * (barW + 1);
+          return `<rect x="${x}" y="${top}" width="${barW}" height="${h}" fill="${colors[key]}" opacity=".78"><title>${row.date} ${labels[key]} ${fmt(value, 0)}</title></rect>`;
+        }).join("");
+      }).join("");
+      const legend = series.map((key, index) => `
+        <rect x="${width - 280 + index * 86}" y="12" width="10" height="10" fill="${colors[key]}"></rect>
+        <text class="chart-label" x="${width - 266 + index * 86}" y="21">${labels[key]}</text>
+      `).join("");
+      target.innerHTML = `
+        <line class="chart-axis" x1="${pad.left}" y1="${zeroY}" x2="${width - pad.right}" y2="${zeroY}"></line>
+        <line class="chart-axis" x1="${pad.left}" y1="${pad.top}" x2="${pad.left}" y2="${height - pad.bottom}"></line>
+        ${bars}
+        ${legend}
+        <text class="chart-label" x="8" y="${pad.top + 8}">${fmt(maxAbs, 0)}</text>
+        <text class="chart-label" x="8" y="${height - pad.bottom}">-${fmt(maxAbs, 0)}</text>
+        <text class="chart-label" x="${pad.left}" y="${height - 10}">${rows[0].date || ""}</text>
+        <text class="chart-label" x="${width - pad.right}" y="${height - 10}" text-anchor="end">${rows[rows.length - 1].date || ""}</text>
+      `;
+    }
     async function fetchStatus() {
       const data = await getJson("/api/status");
       document.getElementById("range").textContent = `${data.last_date} 官方 ${data.official_count || 0} 檔 / 最新 ${data.latest_count || 0} 檔`;
     }
     async function fetchStock() {
       const codeValue = document.getElementById("code").value.trim() || "2330";
+      currentStockCode = codeValue;
+      currentStockInterval = "1d";
+      document.querySelectorAll("[data-interval]").forEach(tab => tab.classList.toggle("active", tab.dataset.interval === "1d"));
       const encoded = encodeURIComponent(codeValue);
-      const [stock, ind, prices, signal, monitor, fundamental] = await Promise.all([
+      const [stock, ind, prices, signal, monitor, fundamental, institutional] = await Promise.all([
         getJson(`/api/stock?code=${encoded}`),
         getJson(`/api/indicators?code=${encoded}`),
-        getJson(`/api/prices?code=${encoded}&limit=120`),
+        getJson(`/api/prices?code=${encoded}&limit=160`),
         getJson(`/api/stock-signal?code=${encoded}`),
         getJson(`/api/ai-monitor-stock?code=${encoded}`),
         getJson(`/api/fundamental?code=${encoded}`),
+        getJson(`/api/institutional?code=${encoded}`),
       ]);
       currentPriceRows = prices.prices || [];
       renderDl(document.getElementById("stockSummary"), [
@@ -4104,6 +4336,8 @@ INDEX_HTML = r"""<!doctype html>
       renderRsiChart(document.getElementById("rsiChart"), prices.prices);
       renderMacdChart(document.getElementById("macdChart"), prices.prices);
       renderKdChart(document.getElementById("kdChart"), prices.prices);
+      renderInstitutionalChart(document.getElementById("institutionalChart"), institutional);
+      showCandleInfo(currentPriceRows.length - 1);
       renderTradePlan(document.getElementById("tradePlan"), buildTradePlan(stock, ind, signal, prices.prices));
       renderAnalysisFacets(document.getElementById("analysisFacets"), monitor);
       renderFundamentalResearch(document.getElementById("fundamentalResearch"), fundamental);
