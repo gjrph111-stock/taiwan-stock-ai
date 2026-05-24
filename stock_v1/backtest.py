@@ -380,6 +380,7 @@ def realistic_strategy_backtest(
     max_days: int | None = 260,
     initial_capital: float = 100.0,
     cost_bps: float = 20.0,
+    start_date: str | None = None,
 ) -> dict:
     histories = load_histories(conn)
     dates = sorted(
@@ -389,6 +390,8 @@ def realistic_strategy_backtest(
             for idx in range(79, len(item["rows"]) - horizon)
         }
     )
+    if start_date:
+        dates = [date_value for date_value in dates if date_value >= start_date]
     if max_days:
         dates = dates[-max_days:]
     rebalance_dates = dates[:: max(1, step)]
@@ -447,6 +450,27 @@ def realistic_strategy_backtest(
         )
         curve.append({"date": date_value, "capital": marked_value})
 
+    latest_date = max((item["rows"][-1]["date"] for item in histories.values() if item["rows"]), default=None)
+    if latest_date:
+        still_open = []
+        for position in positions:
+            if position["exit_date"] <= latest_date:
+                proceeds = position["capital"] * (1 + position["return"] / 100) * (1 - cost_rate)
+                cash += proceeds
+                closed_trades.append({**position, "proceeds": proceeds})
+            else:
+                still_open.append(position)
+        positions = still_open
+        final_marked_value = cash + sum(
+            position["capital"] * (1 + position["return"] / 100)
+            for position in positions
+        )
+        if curve:
+            if curve[-1]["date"] == latest_date:
+                curve[-1]["capital"] = final_marked_value
+            else:
+                curve.append({"date": latest_date, "capital": final_marked_value})
+
     final_capital = curve[-1]["capital"] if curve else initial_capital
     trade_returns = [trade["return"] for trade in closed_trades]
     return {
@@ -454,6 +478,7 @@ def realistic_strategy_backtest(
         "horizon": horizon,
         "step": step,
         "cost_bps": cost_bps,
+        "start_date": start_date,
         "tested_dates": len(rebalance_dates),
         "trades": len(closed_trades),
         "initial_capital": initial_capital,

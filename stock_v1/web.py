@@ -364,13 +364,25 @@ def api_signals(db_path: Path, limit: int = 20) -> dict:
 
 
 def api_strategy(db_path: Path) -> dict:
+    strategy_start = "2026-05-01"
+    strategy_capital = 200000.0
     with _connect(db_path) as conn:
         row = conn.execute("SELECT MAX(date) AS latest FROM prices").fetchone()
         latest = row["latest"] if row else None
-    if latest in _STRATEGY_CACHE:
-        return _STRATEGY_CACHE[latest]
+    cache_key = f"{latest}|ai-ops-202605|200000"
+    if cache_key in _STRATEGY_CACHE:
+        return _STRATEGY_CACHE[cache_key]
     with _connect(db_path) as conn:
-        result = realistic_strategy_backtest(conn, max_positions=5, horizon=20, step=5, max_days=60, cost_bps=20)
+        result = realistic_strategy_backtest(
+            conn,
+            max_positions=5,
+            horizon=5,
+            step=5,
+            max_days=None,
+            initial_capital=strategy_capital,
+            cost_bps=20,
+            start_date=strategy_start,
+        )
         high_win = high_win_strategy_backtest(conn, max_days=45)
         context = _strategy_market_context(conn, result)
     payload = {
@@ -379,8 +391,10 @@ def api_strategy(db_path: Path) -> dict:
             "horizon": result["horizon"],
             "step": result["step"],
             "cost_bps": result["cost_bps"],
+            "start_date": result.get("start_date") or strategy_start,
             "trades": result["trades"],
             "open_positions": result["open_positions"],
+            "initial_capital": result["initial_capital"],
             "final_capital": result["final_capital"],
             "total_return": result["total_return"],
             "win_rate": result["win_rate"],
@@ -397,7 +411,7 @@ def api_strategy(db_path: Path) -> dict:
     }
     if len(_STRATEGY_CACHE) > 8:
         _STRATEGY_CACHE.clear()
-    _STRATEGY_CACHE[latest] = payload
+    _STRATEGY_CACHE[cache_key] = payload
     return payload
 
 
@@ -2404,7 +2418,7 @@ INDEX_HTML = r"""<!doctype html>
       border-bottom: 1px solid rgba(56,189,248,.12);
     }
     .chart-shell {
-      padding: 8px 8px 4px;
+      padding: 0;
       background: #070d16;
     }
     .chart-comparison {
@@ -2457,6 +2471,7 @@ INDEX_HTML = r"""<!doctype html>
         linear-gradient(180deg, #07101d, #0d1726);
       background-size: 44px 44px, 44px 44px, auto;
       border-color: #213247;
+      border-radius: 0;
     }
     .trading-desk .chart-axis { stroke: #334155; }
     .trading-desk .chart-label { fill: #94a3b8; }
@@ -2464,7 +2479,7 @@ INDEX_HTML = r"""<!doctype html>
       display: grid;
       grid-template-columns: minmax(0, 1fr);
       gap: 0;
-      padding: 0 8px 6px;
+      padding: 0;
       background: #070d16;
     }
     .technical-strip.collapsed {
@@ -2484,11 +2499,11 @@ INDEX_HTML = r"""<!doctype html>
       display: none;
     }
     .mini-chart-panel {
-      background: linear-gradient(180deg, #101827, #0b1320);
-      border: 1px solid #223247;
-      border-radius: 8px;
+      background: #070d16;
+      border: 0;
+      border-radius: 0;
       overflow: hidden;
-      box-shadow: 0 14px 32px rgba(15, 23, 42, .14);
+      box-shadow: none;
     }
     .mini-chart-panel h3 {
       display: none;
@@ -3301,12 +3316,9 @@ INDEX_HTML = r"""<!doctype html>
                 <button type="button" class="chart-tab" data-chart-mode="bollinger" onclick="setChartMode('bollinger', this)">布林</button>
               </div>
               <div class="chart-tabs compact-tabs">
-                <button type="button" class="chart-tab active" data-interval="1d" onclick="setStockInterval('1d', this)">日線</button>
+                <button type="button" class="chart-tab active" data-interval="1d" onclick="setStockInterval('1d', this)">日K</button>
                 <button type="button" class="chart-tab" data-interval="1wk" onclick="setStockInterval('1wk', this)">週K</button>
                 <button type="button" class="chart-tab" data-interval="1mo" onclick="setStockInterval('1mo', this)">月K</button>
-                <button type="button" class="chart-tab" data-interval="5m" onclick="setStockInterval('5m', this)">5分</button>
-                <button type="button" class="chart-tab" data-interval="10m" onclick="setStockInterval('10m', this)">10分</button>
-                <button type="button" class="chart-tab" data-interval="15m" onclick="setStockInterval('15m', this)">15分</button>
                 <button type="button" class="chart-tab" data-interval="30m" onclick="setStockInterval('30m', this)">30分</button>
               </div>
               <div class="chart-caption" id="chartCaption">K 線 / 成交量 / MA5 / MA10 / 月線 / 布林通道</div>
@@ -4261,6 +4273,9 @@ INDEX_HTML = r"""<!doctype html>
       if (button) button.classList.add("active");
       await loadStockChartInterval(currentStockCode, interval);
     }
+    function intervalLabel(interval) {
+      return { "1d": "日K", "1wk": "週K", "1mo": "月K", "30m": "30分" }[interval] || interval;
+    }
     async function loadStockChartInterval(code, interval) {
       if (interval === "1d" || interval === "1wk" || interval === "1mo") {
         const prices = await getJson(`/api/prices?code=${encodeURIComponent(code)}&limit=160`);
@@ -4273,7 +4288,7 @@ INDEX_HTML = r"""<!doctype html>
       resetChartWindow();
       renderChartSuite();
       const info = document.getElementById("chartHoverInfo");
-      if (info) info.textContent = `${interval === "1d" ? "日線" : interval}｜共 ${currentPriceRows.length} 根 K 棒，目前顯示 ${visibleChartRows().length} 根。`;
+      if (info) info.textContent = `${intervalLabel(interval)}｜共 ${currentPriceRows.length} 根 K 棒，目前顯示 ${visibleChartRows().length} 根。`;
     }
     function aggregateDailyRows(rows, mode) {
       const groups = new Map();
@@ -4516,9 +4531,10 @@ INDEX_HTML = r"""<!doctype html>
       const span = max - min || 1;
       const plotW = width - pad.left - pad.right;
       const plotH = height - pad.top - pad.bottom;
-      const x = index => pad.left + index * (plotW / (rows.length - 1));
+      const step = plotW / (rows.length - 1);
+      const x = index => pad.left + index * step;
       const y = value => pad.top + (max - value) * (plotH / span);
-      const candleW = Math.max(3, Math.min(9, plotW / rows.length * .55));
+      const candleW = Math.max(3, Math.min(9, step * .55));
       const candles = rows.map((row, index) => {
         const open = Number(row.open);
         const close = Number(row.close);
@@ -4591,8 +4607,9 @@ INDEX_HTML = r"""<!doctype html>
       const max = Math.max(...rows.map(row => Number(row.volume || 0)), 1);
       const plotW = width - pad.left - pad.right;
       const plotH = height - pad.top - pad.bottom;
-      const x = index => pad.left + index * (plotW / (rows.length - 1));
-      const barW = Math.max(2, Math.min(9, plotW / rows.length * .55));
+      const step = plotW / (rows.length - 1);
+      const x = index => pad.left + index * step;
+      const barW = Math.max(2, Math.min(9, step * .55));
       const bars = rows.map((row, index) => {
         const color = Number(row.close) >= Number(row.open) ? "#ff2d2d" : "#00ff5a";
         const h = Math.max(1, Number(row.volume || 0) / max * plotH);
@@ -4657,10 +4674,11 @@ INDEX_HTML = r"""<!doctype html>
       const max = Math.max(...all);
       const min = Math.min(...all);
       const span = max - min || 1;
-      const x = index => pad.left + index * ((width - pad.left - pad.right) / (rows.length - 1));
+      const step = (width - pad.left - pad.right) / (rows.length - 1);
+      const x = index => pad.left + index * step;
       const y = value => pad.top + (max - value) * ((height - pad.top - pad.bottom) / span);
       const zeroY = y(0);
-      const barW = Math.max(2, Math.min(7, (width - pad.left - pad.right) / rows.length * .55));
+      const barW = Math.max(2, Math.min(7, step * .55));
       const bars = data.hist.map((value, index) => {
         const up = value >= 0;
         const color = up ? "#ff2d2d" : "#00ff5a";
@@ -4731,8 +4749,8 @@ INDEX_HTML = r"""<!doctype html>
       const plotW = width - pad.left - pad.right;
       const plotH = height - pad.top - pad.bottom;
       const zeroY = pad.top + plotH / 2;
-      const groupW = plotW / rows.length;
-      const barW = Math.max(3, Math.min(11, groupW * .62));
+      const step = rows.length > 1 ? plotW / (rows.length - 1) : plotW;
+      const barW = Math.max(3, Math.min(11, step * .48));
       const y = value => zeroY - (Number(value) / maxAbs) * (plotH / 2 - 8);
       const bars = rows.map((row, index) => {
         if (!row.hasInstitutional) return "";
@@ -4741,7 +4759,7 @@ INDEX_HTML = r"""<!doctype html>
         const top = Math.min(yy, zeroY);
         const h = Math.max(1, Math.abs(yy - zeroY));
         const color = value >= 0 ? "#ef4444" : "#00e676";
-        const x = pad.left + index * groupW + groupW / 2 - barW / 2;
+        const x = pad.left + index * step - barW / 2;
         return `<rect x="${x}" y="${top}" width="${barW}" height="${h}" fill="${color}" opacity=".82"><title>${row.date} ${labels[key]} ${fmt(value, 0)}</title></rect>`;
       }).join("");
       target.innerHTML = `
@@ -4859,6 +4877,8 @@ INDEX_HTML = r"""<!doctype html>
       const data = await getJson("/api/strategy");
       const s = data.summary;
       const summaryRows = [
+        ["開始操盤", s.start_date || "2026-05-01"],
+        ["起始資金", fmt(s.initial_capital)],
         ["最大持股數", fmt(s.max_positions, 0)],
         ["持有期間", `${fmt(s.horizon, 0)} 個交易日`],
         ["交易筆數", fmt(s.trades, 0)],
