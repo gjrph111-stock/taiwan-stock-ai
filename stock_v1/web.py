@@ -118,6 +118,8 @@ def _make_handler(db_path: Path):
                     self._send_json(api_job_notify_users_intraday(db_path, _param(params, "token", ""), int(_param(params, "limit", "5"))))
                 elif parsed.path == "/api/admin/users":
                     self._send_json(api_admin_users(db_path, _param(params, "token", "")))
+                elif parsed.path == "/api/admin/telegram-webhook":
+                    self._send_json(api_admin_telegram_webhook(_param(params, "token", ""), _param(params, "url", "")))
                 else:
                     self._send_json({"error": "not found"}, status=404)
             except Exception as exc:
@@ -870,6 +872,18 @@ def api_admin_users(db_path: Path, token: str) -> dict:
             "with_watchlist": sum(1 for row in rows if row["watchlist_count"] > 0),
         },
     }
+
+
+def api_admin_telegram_webhook(token: str, url: str) -> dict:
+    ok, error = _admin_authorized(token)
+    if not ok:
+        return {"error": error}
+    webhook_url = url.strip() or os.environ.get("STOCK_V1_TELEGRAM_WEBHOOK_URL", "").strip()
+    if not webhook_url:
+        return {"error": "請輸入 webhook URL。"}
+    result = set_telegram_webhook(webhook_url)
+    info = _telegram_api("getWebhookInfo", {})
+    return {"set_webhook": result, "webhook_info": info}
 
 
 def send_enabled_user_telegrams(db_path: Path, limit: int = 5) -> dict:
@@ -3812,6 +3826,10 @@ INDEX_HTML = r"""<!doctype html>
             <input id="adminToken" type="password" placeholder="管理員 token" aria-label="管理員 token">
             <button type="button" onclick="runAction(fetchAdminUsers, '正在查詢朋友推播名單...')">查詢朋友名單</button>
           </div>
+          <div class="toolbar">
+            <input id="telegramWebhookUrl" value="https://taiwan-stock-ai-g6cf.onrender.com/api/telegram/webhook" aria-label="Telegram webhook URL">
+            <button type="button" onclick="runAction(setAdminTelegramWebhook, '正在設定 Telegram webhook...')">設定 Telegram webhook</button>
+          </div>
           <div class="hint">只供主機管理者使用。可查看朋友帳號、Telegram 綁定狀態、觀察名單數量與股票代號。</div>
           <div class="content"><dl id="adminUserSummary"></dl></div>
           <div class="table-wrap"><table id="adminUsersTable"></table></div>
@@ -5439,6 +5457,22 @@ INDEX_HTML = r"""<!doctype html>
           </tr>
         `).join("") || "<tr><td colspan='6'>目前沒有朋友帳號。</td></tr>"}</tbody>
       `;
+    }
+    async function setAdminTelegramWebhook() {
+      const token = document.getElementById("adminToken").value.trim();
+      const url = document.getElementById("telegramWebhookUrl").value.trim();
+      if (!token) throw new Error("請輸入管理員 token。");
+      if (!url) throw new Error("請輸入 Telegram webhook URL。");
+      const data = await getJson(`/api/admin/telegram-webhook?token=${encodeURIComponent(token)}&url=${encodeURIComponent(url)}`);
+      if (data.error) throw new Error(data.error);
+      const info = data.webhook_info || {};
+      renderDl(document.getElementById("adminUserSummary"), [
+        ["Webhook", info.ok ? "已設定" : "設定失敗"],
+        ["URL", (info.result && info.result.url) || url],
+        ["待處理訊息", `${fmt(info.result && info.result.pending_update_count, 0)} 則`],
+        ["最後錯誤", (info.result && info.result.last_error_message) || "無"],
+      ]);
+      document.getElementById("notifyHint").textContent = "Telegram webhook 已更新。請到新 bot 輸入 /start 測試。";
     }
     let realtimeTimer = null;
     let selectedRealtimeCode = "";
