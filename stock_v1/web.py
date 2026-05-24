@@ -116,6 +116,8 @@ def _make_handler(db_path: Path):
                     self._send_json(api_job_notify_users(db_path, _param(params, "token", ""), int(_param(params, "limit", "5"))))
                 elif parsed.path == "/api/jobs/notify-users-intraday":
                     self._send_json(api_job_notify_users_intraday(db_path, _param(params, "token", ""), int(_param(params, "limit", "5"))))
+                elif parsed.path == "/api/admin/users":
+                    self._send_json(api_admin_users(db_path, _param(params, "token", "")))
                 else:
                     self._send_json({"error": "not found"}, status=404)
             except Exception as exc:
@@ -819,6 +821,55 @@ def api_job_notify_users_intraday(db_path: Path, token: str, limit: int = 5) -> 
     if not allowed:
         return {"skipped": True, "message": f"Not market time. Now={now:%Y-%m-%d %H:%M:%S} Asia/Taipei"}
     return send_enabled_user_intraday_telegrams(db_path, limit=limit)
+
+
+def api_admin_users(db_path: Path, token: str) -> dict:
+    ok, error = _admin_authorized(token)
+    if not ok:
+        return {"error": error}
+    with _connect(db_path) as conn:
+        _ensure_user_tables(conn)
+        users = conn.execute(
+            """
+            SELECT user_key, display_name, telegram_chat_id, telegram_enabled, created_at, updated_at
+            FROM app_users
+            ORDER BY created_at DESC
+            """
+        ).fetchall()
+        rows = []
+        for user in users:
+            codes = [
+                row["code"]
+                for row in conn.execute(
+                    """
+                    SELECT code
+                    FROM user_watchlist
+                    WHERE user_key = ?
+                    ORDER BY COALESCE(sort_order, 999999), created_at, code
+                    """,
+                    (user["user_key"],),
+                ).fetchall()
+            ]
+            rows.append(
+                {
+                    "user_key": user["user_key"],
+                    "display_name": user["display_name"],
+                    "telegram_enabled": bool(user["telegram_enabled"]),
+                    "telegram_chat_id": _mask_secret(user["telegram_chat_id"] or ""),
+                    "watchlist_count": len(codes),
+                    "watchlist_codes": codes,
+                    "created_at": user["created_at"],
+                    "updated_at": user["updated_at"],
+                }
+            )
+    return {
+        "users": rows,
+        "summary": {
+            "total": len(rows),
+            "telegram_enabled": sum(1 for row in rows if row["telegram_enabled"]),
+            "with_watchlist": sum(1 for row in rows if row["watchlist_count"] > 0),
+        },
+    }
 
 
 def send_enabled_user_telegrams(db_path: Path, limit: int = 5) -> dict:
@@ -1602,6 +1653,22 @@ def _job_authorized(token: str) -> tuple[bool, str]:
     if not secrets.compare_digest(str(token or ""), expected):
         return False, "排程 token 錯誤。"
     return True, ""
+
+
+def _admin_authorized(token: str) -> tuple[bool, str]:
+    expected = os.environ.get("STOCK_V1_ADMIN_TOKEN", "").strip() or os.environ.get("STOCK_V1_JOB_TOKEN", "").strip()
+    if not expected:
+        return False, "STOCK_V1_ADMIN_TOKEN 尚未設定，後台查詢未啟用。"
+    if not secrets.compare_digest(str(token or ""), expected):
+        return False, "管理員 token 錯誤。"
+    return True, ""
+
+
+def _mask_secret(value: str) -> str:
+    text = str(value or "")
+    if len(text) <= 4:
+        return "***" if text else ""
+    return f"{text[:3]}***{text[-3:]}"
 
 
 def fmt_value(value, digits: int = 2) -> str:
@@ -3739,6 +3806,16 @@ INDEX_HTML = r"""<!doctype html>
             <dt>安全提醒</dt><dd>個人代碼只用來綁定自己的觀察名單，請不要公開貼到群組。若綁錯，可重新建立個人設定或重新綁定。</dd>
           </dl></div>
         </section>
+        <section class="wide">
+          <h2>管理員後台查詢</h2>
+          <div class="toolbar">
+            <input id="adminToken" type="password" placeholder="管理員 token" aria-label="管理員 token">
+            <button type="button" onclick="runAction(fetchAdminUsers, '正在查詢朋友推播名單...')">查詢朋友名單</button>
+          </div>
+          <div class="hint">只供主機管理者使用。可查看朋友帳號、Telegram 綁定狀態、觀察名單數量與股票代號。</div>
+          <div class="content"><dl id="adminUserSummary"></dl></div>
+          <div class="table-wrap"><table id="adminUsersTable"></table></div>
+        </section>
       </div>
     </div>
 
@@ -5336,6 +5413,32 @@ INDEX_HTML = r"""<!doctype html>
       if (!currentUserKey) throw new Error("請先建立個人設定。");
       const data = await getJson(`/api/user/telegram/test?user_key=${encodeURIComponent(currentUserKey)}`);
       document.getElementById("notifyHint").textContent = data.message || "測試推播已送出。";
+    }
+    async function fetchAdminUsers() {
+      const token = document.getElementById("adminToken").value.trim();
+      if (!token) throw new Error("請輸入管理員 token。");
+      const data = await getJson(`/api/admin/users?token=${encodeURIComponent(token)}`);
+      if (data.error) throw new Error(data.error);
+      const s = data.summary || {};
+      renderDl(document.getElementById("adminUserSummary"), [
+        ["朋友帳號", `${fmt(s.total, 0)} 位`],
+        ["已啟用 Telegram", `${fmt(s.telegram_enabled, 0)} 位`],
+        ["已有觀察名單", `${fmt(s.with_watchlist, 0)} 位`],
+      ]);
+      const rows = data.users || [];
+      document.getElementById("adminUsersTable").innerHTML = `
+        <thead><tr><th>名稱</th><th>Telegram</th><th>觀察檔數</th><th>觀察名單</th><th>建立時間</th><th>更新時間</th></tr></thead>
+        <tbody>${rows.map(row => `
+          <tr>
+            <td title="${row.user_key}">${row.display_name}</td>
+            <td>${row.telegram_enabled ? "已啟用" : "未啟用"} ${row.telegram_chat_id || ""}</td>
+            <td>${fmt(row.watchlist_count, 0)}</td>
+            <td>${(row.watchlist_codes || []).join(", ") || "-"}</td>
+            <td>${row.created_at || "-"}</td>
+            <td>${row.updated_at || "-"}</td>
+          </tr>
+        `).join("") || "<tr><td colspan='6'>目前沒有朋友帳號。</td></tr>"}</tbody>
+      `;
     }
     let realtimeTimer = null;
     let selectedRealtimeCode = "";

@@ -21,3 +21,5 @@ services:
         sync: false
       - key: STOCK_V1_JOB_TOKEN
         sync: false
+      - key: STOCK_V1_ADMIN_TOKEN
+        sync: false
