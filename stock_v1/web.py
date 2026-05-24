@@ -3407,33 +3407,33 @@ INDEX_HTML = r"""<!doctype html>
     <div class="page" id="strategyPage">
       <div class="grid">
       <section class="wide">
-        <h2>AI 實操盤面建議</h2>
+        <h2>AI 實操策略與績效</h2>
         <div class="content" id="strategyAdvice"></div>
       </section>
       <section class="wide">
-        <h2>AI 實操怎麼看</h2>
+        <h2>AI 實操說明</h2>
         <div class="content strategy-guide">
           <div><strong>勝率</strong><span>代表過去交易有多少比例賺錢，但不是越高越好，還要看賺賠幅度。</span></div>
           <div><strong>最大回撤</strong><span>代表 AI 實操過程中曾經從高點跌下來多少，是新人最需要先看的風險指標。</span></div>
           <div><strong>總報酬</strong><span>代表回測期間 AI 實操累積成果，需搭配最大回撤一起看。</span></div>
           <div><strong>未平倉部位</strong><span>代表目前 AI 實操仍持有、尚未出場的標的，不等於立刻買進建議。</span></div>
+          <div><strong>候選觀察</strong><span>代表 AI 認為值得研究的標的，還不是正式建倉；實際建倉請看建倉紀錄。</span></div>
         </div>
       </section>
       <section class="wide">
-        <h2>高勝率保守模式</h2>
-        <div class="content" id="highWinStrategy"></div>
-        <div class="table-wrap"><table id="highWinTradesTable"></table></div>
-      </section>
-      <section class="wide">
-        <h2>AI 實操個股狀況</h2>
-        <div class="content" id="strategyStockCards"></div>
+        <h2>AI 候選觀察名單</h2>
+        <div class="content">
+          <p class="note">這些是 AI 依盤勢、分數、量價與風控條件挑出的研究候選，不代表已經建倉；若符合策略節奏，才會出現在建倉紀錄。</p>
+          <div id="strategyStockCards"></div>
+        </div>
       </section>
       <section class="wide">
         <h2>AI 實操摘要</h2>
         <div class="content"><dl id="strategySummary"></dl></div>
       </section>
       <section class="wide">
-        <h2>目前可研究標的</h2>
+        <h2>AI 候選明細</h2>
+        <div class="content"><p class="note">用途是讓使用者知道 AI 正在觀察哪些股票，以及每檔的建倉區、出倉區、停損與風險，不是下單清單。</p></div>
         <div class="table-wrap"><table id="strategyLeadersTable"></table></div>
       </section>
       <section class="wide">
@@ -3853,6 +3853,10 @@ INDEX_HTML = r"""<!doctype html>
       });
       return buckets.filter(item => item.points.length);
     }
+    function setChartBox(target, width, height) {
+      target.setAttribute("viewBox", `0 0 ${width} ${height}`);
+      target.setAttribute("preserveAspectRatio", "none");
+    }
     function renderRadarChart(target, rows) {
       const width = 620;
       const height = 460;
@@ -3963,30 +3967,6 @@ INDEX_HTML = r"""<!doctype html>
             <td>${fmt(row.entry_price)}</td><td>${fmt(row.exit_price)}</td><td class="${pctClass(row.return)}">${fmt(row.return)}</td><td>${fmt(row.capital)}</td>
           </tr>`).join("") || "<tr><td colspan='8'>目前沒有未平倉部位。</td></tr>"}</tbody>`;
     }
-    function renderHighWinStrategy(panel, table, data) {
-      const win = Number(data.win_rate || 0);
-      const verdict = win >= 80 ? "已達 80% 勝率門檻" : "尚未達 80%，不硬做漂亮數字";
-      const next = win >= 80
-        ? "目前條件可列為高勝率候選，但仍需看最大虧損與交易次數。"
-        : "要接近 80%，下一步需要加入大盤濾網、產業強弱、三大法人與新聞事件，並接受交易次數下降。";
-      panel.innerHTML = `
-        <div class="strategy-advice">
-          <div class="advice-main">
-            <strong>${data.name || "高勝率保守模式"}</strong>
-            <p>${verdict}</p>
-            <p>${next}</p>
-            <p><b>交易次數：</b>${fmt(data.trades, 0)} 筆｜<b>勝率：</b>${fmt(data.win_rate)}%｜<b>平均報酬：</b>${fmt(data.avg_return)}%</p>
-            <ul class="advice-list">${(data.rules || []).map(item => `<li>${item}</li>`).join("")}</ul>
-          </div>
-          <div class="strategy-kpis">
-            <div class="strategy-kpi"><span>勝率</span><strong>${fmt(data.win_rate)}%</strong></div>
-            <div class="strategy-kpi"><span>平均報酬</span><strong>${fmt(data.avg_return)}%</strong></div>
-            <div class="strategy-kpi"><span>中位數</span><strong>${fmt(data.median_return)}%</strong></div>
-            <div class="strategy-kpi"><span>最差單筆</span><strong>${fmt(data.worst_return)}%</strong></div>
-          </div>
-        </div>`;
-      renderStrategyTrades(table, data.recent_trades || []);
-    }
     function renderStrategyLeaders(target, rows) {
       target.innerHTML = `
         <thead><tr><th>代號</th><th>名稱</th><th>分數</th><th>訊號</th><th>收盤</th><th>20日%</th><th>回撤</th><th>建倉位</th><th>出倉位</th><th>停損</th><th>操作</th></tr></thead>
@@ -4017,23 +3997,30 @@ INDEX_HTML = r"""<!doctype html>
       }).join("");
       target.innerHTML = `<div class="strategy-stock-grid">${cards || "<div class='note'>目前沒有可顯示的 AI 實操個股。</div>"}</div>`;
     }
-    function renderStrategyAdvice(target, context) {
+    function renderStrategyAdvice(target, context, summary = {}, auxiliary = {}) {
       const m = context.metrics || {};
+      const tradeCount = Number(summary.trades || 0);
+      const winText = tradeCount ? `${fmt(summary.win_rate)}%` : "尚無";
+      const auxText = auxiliary && Number(auxiliary.trades || 0)
+        ? `輔助樣本：${fmt(auxiliary.trades, 0)} 筆，勝率 ${fmt(auxiliary.win_rate)}%，平均報酬 ${fmt(auxiliary.avg_return)}%。`
+        : "輔助樣本仍在累積，先以 AI 實操主策略為準。";
       target.innerHTML = `
         <div class="strategy-advice">
           <div class="advice-main">
             <strong>${context.stance || "資料不足"}</strong>
             <p>${context.headline || ""}</p>
             <p><b>部位建議：</b>${context.position_suggestion || "等待資料更新"}</p>
+            <p><b>操作邏輯：</b>AI 會先看盤面廣度，再從訊號分數、趨勢、量能與風控條件挑出候選；候選股不是直接下單，只有進入建倉紀錄才視為 AI 實操已開始持有。</p>
+            <p><b>輔助策略：</b>${auxText}</p>
             <ul class="advice-list">${(context.actions || []).map(item => `<li>${item}</li>`).join("")}</ul>
           </div>
           <div class="strategy-kpis">
-            <div class="strategy-kpi"><span>站上月線</span><strong>${fmt(m.above_sma20_pct)}%</strong></div>
-            <div class="strategy-kpi"><span>站上季線</span><strong>${fmt(m.above_sma60_pct)}%</strong></div>
-            <div class="strategy-kpi"><span>60日新高</span><strong>${fmt(m.new_high_60, 0)} 檔</strong></div>
+            <div class="strategy-kpi"><span>AI 勝率</span><strong>${winText}</strong></div>
+            <div class="strategy-kpi"><span>總報酬</span><strong>${fmt(summary.total_return)}%</strong></div>
+            <div class="strategy-kpi"><span>最大回撤</span><strong>${fmt(summary.max_drawdown)}%</strong></div>
+            <div class="strategy-kpi"><span>交易筆數</span><strong>${fmt(summary.trades, 0)} 筆</strong></div>
+            <div class="strategy-kpi"><span>未平倉</span><strong>${fmt(summary.open_positions, 0)} 檔</strong></div>
             <div class="strategy-kpi"><span>可行訊號</span><strong>${fmt(m.actionable_pct)}%</strong></div>
-            <div class="strategy-kpi"><span>平均 RSI</span><strong>${fmt(m.avg_rsi)}</strong></div>
-            <div class="strategy-kpi"><span>20日平均</span><strong>${fmt(m.avg_return_20d)}%</strong></div>
           </div>
         </div>
         <div class="content" style="padding:14px 0 0">
@@ -4052,7 +4039,7 @@ INDEX_HTML = r"""<!doctype html>
       const width = 1000;
       const height = 260;
       const pad = { left: 54, right: 72, top: 18, bottom: 34 };
-      target.setAttribute("viewBox", `0 0 ${width} ${height}`);
+      setChartBox(target, width, height);
       if (!rows || rows.length < 2) {
         target.innerHTML = `<text x="50%" y="50%" text-anchor="middle" class="chart-label">資料不足</text>`;
         return;
@@ -4112,7 +4099,7 @@ INDEX_HTML = r"""<!doctype html>
       const pad = { left: 58, right: 74, top: 20, bottom: 38 };
       const volumeTop = 244;
       const volumeBottom = height - pad.bottom;
-      target.setAttribute("viewBox", `0 0 ${width} ${height}`);
+      setChartBox(target, width, height);
       if (!rows || rows.length < 2) {
         target.innerHTML = `<text x="50%" y="50%" text-anchor="middle" class="chart-label">資料不足</text>`;
         return;
@@ -4518,7 +4505,7 @@ INDEX_HTML = r"""<!doctype html>
       const height = 420;
       const pad = { left: 54, right: 72, top: 20, bottom: 34 };
       const volumeBottom = height - pad.bottom;
-      target.setAttribute("viewBox", `0 0 ${width} ${height}`);
+      setChartBox(target, width, height);
       if (!rows || rows.length < 2) {
         target.innerHTML = `<text x="50%" y="50%" text-anchor="middle" class="chart-label">資料不足</text>`;
         return;
@@ -4599,7 +4586,7 @@ INDEX_HTML = r"""<!doctype html>
       const width = 1000;
       const height = 220;
       const pad = { left: 54, right: 72, top: 18, bottom: 34 };
-      target.setAttribute("viewBox", `0 0 ${width} ${height}`);
+      setChartBox(target, width, height);
       if (!rows || rows.length < 2) {
         target.innerHTML = `<text x="50%" y="50%" text-anchor="middle" class="chart-label">資料不足</text>`;
         return;
@@ -4632,7 +4619,7 @@ INDEX_HTML = r"""<!doctype html>
       const width = 1000;
       const height = 220;
       const pad = { left: 54, right: 72, top: 18, bottom: 34 };
-      target.setAttribute("viewBox", `0 0 ${width} ${height}`);
+      setChartBox(target, width, height);
       const valid = rsi.filter(row => row.value !== null);
       if (valid.length < 2) {
         target.innerHTML = `<text x="50%" y="50%" text-anchor="middle" class="chart-label">資料不足</text>`;
@@ -4665,7 +4652,7 @@ INDEX_HTML = r"""<!doctype html>
       const width = 1000;
       const height = 240;
       const pad = { left: 54, right: 72, top: 18, bottom: 34 };
-      target.setAttribute("viewBox", `0 0 ${width} ${height}`);
+      setChartBox(target, width, height);
       if (sourceValues.length < 35 || rows.length < 2) {
         target.innerHTML = `<text x="50%" y="50%" text-anchor="middle" class="chart-label">資料不足</text>`;
         return;
@@ -4705,7 +4692,7 @@ INDEX_HTML = r"""<!doctype html>
       const width = 1000;
       const height = 220;
       const pad = { left: 54, right: 72, top: 18, bottom: 34 };
-      target.setAttribute("viewBox", `0 0 ${width} ${height}`);
+      setChartBox(target, width, height);
       const valid = data.filter(row => row.k !== null);
       if (valid.length < 2) {
         target.innerHTML = `<text x="50%" y="50%" text-anchor="middle" class="chart-label">資料不足</text>`;
@@ -4734,7 +4721,7 @@ INDEX_HTML = r"""<!doctype html>
       const width = 1000;
       const height = 240;
       const pad = { left: 54, right: 72, top: 18, bottom: 36 };
-      target.setAttribute("viewBox", `0 0 ${width} ${height}`);
+      setChartBox(target, width, height);
       if (!rows.length) {
         target.innerHTML = `<text x="50%" y="50%" text-anchor="middle" class="chart-label">${data.message || "法人資料不足"}</text>`;
         return;
@@ -4892,8 +4879,7 @@ INDEX_HTML = r"""<!doctype html>
       renderDl(document.getElementById("strategySummary"), summaryRows);
       const overviewStrategy = document.getElementById("overviewStrategySummary");
       if (overviewStrategy) renderDl(overviewStrategy, summaryRows);
-      renderStrategyAdvice(document.getElementById("strategyAdvice"), data.market_context || {});
-      renderHighWinStrategy(document.getElementById("highWinStrategy"), document.getElementById("highWinTradesTable"), data.high_win_strategy || {});
+      renderStrategyAdvice(document.getElementById("strategyAdvice"), data.market_context || {}, s, data.high_win_strategy || {});
       renderStrategyLeaders(document.getElementById("strategyLeadersTable"), (data.market_context || {}).leaders || []);
       renderStrategyStockCards(document.getElementById("strategyStockCards"), (data.market_context || {}).leaders || []);
       renderStrategyEntries(document.getElementById("strategyEntriesTable"), data.recent_entries || []);
