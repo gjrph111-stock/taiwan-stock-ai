@@ -87,6 +87,8 @@ def _make_handler(db_path: Path):
                     self._send_json(api_watchlist_add(db_path, _param(params, "code", "")))
                 elif parsed.path == "/api/watchlist/remove":
                     self._send_json(api_watchlist_remove(db_path, _param(params, "code", "")))
+                elif parsed.path == "/api/watchlist/reorder":
+                    self._send_json(api_watchlist_reorder(db_path, _param(params, "codes", "")))
                 elif parsed.path == "/api/user/create":
                     self._send_json(api_user_create(db_path, _param(params, "name", "")))
                 elif parsed.path == "/api/user/profile":
@@ -97,6 +99,8 @@ def _make_handler(db_path: Path):
                     self._send_json(api_user_watchlist_add(db_path, _param(params, "user_key", ""), _param(params, "code", "")))
                 elif parsed.path == "/api/user/watchlist/remove":
                     self._send_json(api_user_watchlist_remove(db_path, _param(params, "user_key", ""), _param(params, "code", "")))
+                elif parsed.path == "/api/user/watchlist/reorder":
+                    self._send_json(api_user_watchlist_reorder(db_path, _param(params, "user_key", ""), _param(params, "codes", "")))
                 elif parsed.path == "/api/user/telegram/save":
                     self._send_json(api_user_telegram_save(db_path, _param(params, "user_key", ""), _param(params, "chat_id", "")))
                 elif parsed.path == "/api/user/telegram/test":
@@ -639,13 +643,14 @@ def api_watchlist_add(db_path: Path, code: str) -> dict:
         stock = conn.execute("SELECT code FROM stocks WHERE code = ?", (code,)).fetchone()
         if not stock:
             return {"error": f"找不到股票代號 {code}。"}
+        next_order = _next_watch_order(conn, "watchlist")
         conn.execute(
             """
-            INSERT INTO watchlist (code, created_at)
-            VALUES (?, datetime('now'))
+            INSERT INTO watchlist (code, created_at, sort_order)
+            VALUES (?, datetime('now'), ?)
             ON CONFLICT(code) DO UPDATE SET created_at = watchlist.created_at
             """,
-            (code,),
+            (code, next_order),
         )
         conn.commit()
     return api_watchlist(db_path)
@@ -664,6 +669,19 @@ def api_watchlist_remove(db_path: Path, code: str) -> dict:
     return api_watchlist(db_path)
 
 
+def api_watchlist_reorder(db_path: Path, raw_codes: str) -> dict:
+    if _public_demo_mode():
+        return {"error": "公開展示模式不會修改主機觀察名單，請使用瀏覽器本機排序。"}
+    codes = _parse_code_list(raw_codes)
+    if not codes:
+        return {"error": "沒有可排序的股票代號。"}
+    with _connect(db_path) as conn:
+        _ensure_watchlist(conn)
+        _apply_watchlist_order(conn, "watchlist", codes)
+        conn.commit()
+    return api_watchlist(db_path)
+
+
 def api_user_create(db_path: Path, name: str) -> dict:
     display_name = name.strip()[:40] or "朋友"
     user_key = secrets.token_urlsafe(18)
@@ -677,8 +695,8 @@ def api_user_create(db_path: Path, name: str) -> dict:
             (user_key, display_name),
         )
         conn.executemany(
-            "INSERT OR IGNORE INTO user_watchlist (user_key, code, created_at) VALUES (?, ?, datetime('now'))",
-            [(user_key, code) for code in ["2330", "2367", "2454"]],
+            "INSERT OR IGNORE INTO user_watchlist (user_key, code, created_at, sort_order) VALUES (?, ?, datetime('now'), ?)",
+            [(user_key, code, index + 1) for index, code in enumerate(["2330", "2367", "2454"])],
         )
         conn.commit()
     return api_user_profile(db_path, user_key)
@@ -718,9 +736,10 @@ def api_user_watchlist_add(db_path: Path, user_key: str, code: str) -> dict:
         stock = conn.execute("SELECT code FROM stocks WHERE code = ?", (code,)).fetchone()
         if not stock:
             return {"error": f"找不到股票代號 {code}。"}
+        next_order = _next_watch_order(conn, "user_watchlist", user_key)
         conn.execute(
-            "INSERT OR IGNORE INTO user_watchlist (user_key, code, created_at) VALUES (?, ?, datetime('now'))",
-            (user_key, code),
+            "INSERT OR IGNORE INTO user_watchlist (user_key, code, created_at, sort_order) VALUES (?, ?, datetime('now'), ?)",
+            (user_key, code, next_order),
         )
         conn.commit()
     return api_user_watchlist(db_path, user_key)
@@ -730,6 +749,19 @@ def api_user_watchlist_remove(db_path: Path, user_key: str, code: str) -> dict:
     with _connect(db_path) as conn:
         _ensure_user_tables(conn)
         conn.execute("DELETE FROM user_watchlist WHERE user_key = ? AND code = ?", (user_key, code.strip()))
+        conn.commit()
+    return api_user_watchlist(db_path, user_key)
+
+
+def api_user_watchlist_reorder(db_path: Path, user_key: str, raw_codes: str) -> dict:
+    if not _user_row(db_path, user_key):
+        return {"error": "找不到使用者，請先建立個人推播設定。"}
+    codes = _parse_code_list(raw_codes)
+    if not codes:
+        return {"error": "沒有可排序的股票代號。"}
+    with _connect(db_path) as conn:
+        _ensure_user_tables(conn)
+        _apply_watchlist_order(conn, "user_watchlist", codes, user_key)
         conn.commit()
     return api_user_watchlist(db_path, user_key)
 
@@ -1173,7 +1205,9 @@ def _ensure_watchlist(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    _ensure_column(conn, "watchlist", "sort_order", "INTEGER")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_watchlist_created_at ON watchlist(created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_watchlist_sort_order ON watchlist(sort_order, created_at)")
 
 
 def _ensure_user_tables(conn: sqlite3.Connection) -> None:
@@ -1201,7 +1235,48 @@ def _ensure_user_tables(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    _ensure_column(conn, "user_watchlist", "sort_order", "INTEGER")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_user_watchlist_user ON user_watchlist(user_key, created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_user_watchlist_order ON user_watchlist(user_key, sort_order, created_at)")
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
+def _parse_code_list(raw_codes: str) -> list[str]:
+    seen = set()
+    codes = []
+    for code in raw_codes.split(","):
+        clean = code.strip()
+        if clean and clean not in seen:
+            seen.add(clean)
+            codes.append(clean)
+    return codes
+
+
+def _next_watch_order(conn: sqlite3.Connection, table: str, user_key: str | None = None) -> int:
+    if table == "user_watchlist":
+        row = conn.execute(
+            "SELECT COALESCE(MAX(sort_order), 0) AS max_order FROM user_watchlist WHERE user_key = ?",
+            (user_key,),
+        ).fetchone()
+    else:
+        row = conn.execute("SELECT COALESCE(MAX(sort_order), 0) AS max_order FROM watchlist").fetchone()
+    return int(row["max_order"] or 0) + 1
+
+
+def _apply_watchlist_order(conn: sqlite3.Connection, table: str, codes: list[str], user_key: str | None = None) -> None:
+    for index, code in enumerate(codes, start=1):
+        if table == "user_watchlist":
+            conn.execute(
+                "UPDATE user_watchlist SET sort_order = ? WHERE user_key = ? AND code = ?",
+                (index, user_key, code),
+            )
+        else:
+            conn.execute("UPDATE watchlist SET sort_order = ? WHERE code = ?", (index, code))
 
 
 def _user_row(db_path: Path, user_key: str) -> sqlite3.Row | None:
@@ -1217,7 +1292,7 @@ def _user_watchlist_codes(db_path: Path, user_key: str) -> list[str]:
     with _connect(db_path) as conn:
         _ensure_user_tables(conn)
         rows = conn.execute(
-            "SELECT code FROM user_watchlist WHERE user_key = ? ORDER BY created_at, code",
+            "SELECT code FROM user_watchlist WHERE user_key = ? ORDER BY COALESCE(sort_order, 999999), created_at, code",
             (user_key,),
         ).fetchall()
     return [row["code"] for row in rows]
@@ -1241,8 +1316,8 @@ def _ensure_telegram_user(db_path: Path, chat_id: str, display_name: str) -> sql
             (user_key, display_name[:40] or "Telegram 使用者", chat_id),
         )
         conn.executemany(
-            "INSERT OR IGNORE INTO user_watchlist (user_key, code, created_at) VALUES (?, ?, datetime('now'))",
-            [(user_key, code) for code in ["2330", "2367", "2454"]],
+            "INSERT OR IGNORE INTO user_watchlist (user_key, code, created_at, sort_order) VALUES (?, ?, datetime('now'), ?)",
+            [(user_key, code, index + 1) for index, code in enumerate(["2330", "2367", "2454"])],
         )
         conn.commit()
         return conn.execute("SELECT * FROM app_users WHERE user_key = ?", (user_key,)).fetchone()
@@ -1437,7 +1512,7 @@ def _watchlist_codes(db_path: Path) -> list[str]:
                 [(code,) for code in default_codes],
             )
             conn.commit()
-        rows = conn.execute("SELECT code FROM watchlist ORDER BY created_at, code").fetchall()
+        rows = conn.execute("SELECT code FROM watchlist ORDER BY COALESCE(sort_order, 999999), created_at, code").fetchall()
     return [row["code"] for row in rows]
 
 
@@ -2264,6 +2339,26 @@ INDEX_HTML = r"""<!doctype html>
     .watch-tools .hint {
       color: var(--muted);
       font-size: 13px;
+    }
+    .drag-handle {
+      width: 34px;
+      color: #64748b;
+      cursor: grab;
+      font-weight: 900;
+      text-align: center;
+      user-select: none;
+    }
+    .drag-handle:active {
+      cursor: grabbing;
+    }
+    tr.watch-dragging {
+      opacity: .46;
+    }
+    tr.watch-drop-before {
+      box-shadow: inset 0 2px 0 #06b6d4;
+    }
+    tr.watch-drop-after {
+      box-shadow: inset 0 -2px 0 #06b6d4;
     }
     .stock-hero {
       background:
@@ -3609,9 +3704,10 @@ INDEX_HTML = r"""<!doctype html>
         return;
       }
       target.innerHTML = `
-        <thead><tr><th>代號</th><th>名稱</th><th>收盤</th><th>5日%</th><th>20日%</th><th>60日%</th><th>RSI</th><th>量比</th><th>訊號</th><th>買點</th><th>賣點</th><th>停損</th><th>操作</th></tr></thead>
+        <thead><tr><th></th><th>代號</th><th>名稱</th><th>收盤</th><th>5日%</th><th>20日%</th><th>60日%</th><th>RSI</th><th>量比</th><th>訊號</th><th>買點</th><th>賣點</th><th>停損</th><th>操作</th></tr></thead>
         <tbody>${rows.map(row => `
-          <tr>
+          <tr draggable="true" data-watch-code="${row.code}">
+            <td class="drag-handle" title="拖曳調整順序">☰</td>
             <td>${row.code}</td><td>${row.name}</td><td>${fmt(row.close)}</td>
             <td class="${pctClass(row.return_5d)}">${fmt(row.return_5d)}</td>
             <td class="${pctClass(row.return_20d)}">${fmt(row.return_20d)}</td>
@@ -3623,6 +3719,53 @@ INDEX_HTML = r"""<!doctype html>
               <button type="button" class="compact" onclick="removeWatchlistCode('${row.code}')">移除</button>
             </td>
           </tr>`).join("")}</tbody>`;
+      enableWatchlistDrag(target);
+    }
+    function enableWatchlistDrag(table) {
+      const tbody = table.querySelector("tbody");
+      if (!tbody) return;
+      let dragged = null;
+      tbody.querySelectorAll("tr[data-watch-code]").forEach(row => {
+        row.addEventListener("dragstart", event => {
+          dragged = row;
+          row.classList.add("watch-dragging");
+          event.dataTransfer.effectAllowed = "move";
+          event.dataTransfer.setData("text/plain", row.dataset.watchCode || "");
+        });
+        row.addEventListener("dragend", () => {
+          row.classList.remove("watch-dragging");
+          tbody.querySelectorAll("tr").forEach(item => item.classList.remove("watch-drop-before", "watch-drop-after"));
+          saveWatchlistOrderFromTable(table);
+        });
+        row.addEventListener("dragover", event => {
+          event.preventDefault();
+          if (!dragged || dragged === row) return;
+          const rect = row.getBoundingClientRect();
+          const after = event.clientY > rect.top + rect.height / 2;
+          row.classList.toggle("watch-drop-before", !after);
+          row.classList.toggle("watch-drop-after", after);
+          tbody.insertBefore(dragged, after ? row.nextSibling : row);
+        });
+        row.addEventListener("dragleave", () => {
+          row.classList.remove("watch-drop-before", "watch-drop-after");
+        });
+      });
+    }
+    async function saveWatchlistOrderFromTable(table) {
+      const codes = Array.from(table.querySelectorAll("tr[data-watch-code]")).map(row => row.dataset.watchCode).filter(Boolean);
+      if (!codes.length) return;
+      if (currentUserKey) {
+        const data = await getJson(`/api/user/watchlist/reorder?user_key=${encodeURIComponent(currentUserKey)}&codes=${encodeURIComponent(codes.join(","))}`);
+        document.getElementById("watchlistHint").textContent = data.error || `已更新排序。這是你的個人觀察名單。`;
+        return;
+      }
+      if (publicDemoMode) {
+        saveLocalWatchlist(codes);
+        document.getElementById("watchlistHint").textContent = "已更新排序。公開展示模式只會更新此瀏覽器。";
+        return;
+      }
+      const data = await getJson(`/api/watchlist/reorder?codes=${encodeURIComponent(codes.join(","))}`);
+      document.getElementById("watchlistHint").textContent = data.error || `已更新排序，目前觀察 ${codes.length} 檔。`;
     }
     function renderRealtime(target, rows) {
       if (!rows.length) {
@@ -4899,7 +5042,7 @@ INDEX_HTML = r"""<!doctype html>
       const modeText = currentUserKey
         ? "個人模式：觀察名單會綁定你的使用者代碼，推播只送到你的 Telegram。"
         : publicDemoMode ? "公開展示模式：觀察名單只存在此瀏覽器，不會影響主機與推播。" : "觀察名單會保存在本機資料庫，可同步到即時看盤與推播。";
-      document.getElementById("watchlistHint").textContent = `目前觀察 ${majors.length} 檔。${modeText}`;
+      document.getElementById("watchlistHint").textContent = `目前觀察 ${majors.length} 檔。可拖曳表格左側排序。${modeText}`;
       renderDl(document.getElementById("watchAfterSummary"), [
         ["盤後定位", "這裡只保留觀察名單與盤後摘要，AI 智選、強勢排行與量能焦點集中到股票探索。"],
         ["60 日新高", `${fmt(data.summary.new_high_60, 0)} 檔`],
