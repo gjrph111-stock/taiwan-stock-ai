@@ -437,9 +437,9 @@ def _strategy_market_context(conn: sqlite3.Connection, result: dict) -> dict:
         return {
             "date": None,
             "stance": "資料不足",
-            "position_suggestion": "暫不建立策略部位",
+            "position_suggestion": "暫不建立 AI 實操部位",
             "headline": "目前資料不足，請先更新市場資料。",
-            "actions": ["先執行資料更新，再重新載入策略研究。"],
+            "actions": ["先執行資料更新，再重新載入 AI 實操。"],
             "risks": [],
             "metrics": {},
             "leaders": [],
@@ -465,7 +465,7 @@ def _strategy_market_context(conn: sqlite3.Connection, result: dict) -> dict:
     if breadth20 >= 0.55 and breadth60 >= 0.45 and actionable >= 0.08:
         stance = "偏多進攻"
         position = "建議 60% - 75% 研究資金，分批布局強勢但未過熱標的"
-        headline = "市場廣度偏強，策略可以主動找多頭續航股。"
+        headline = "市場廣度偏強，AI 實操可以主動找多頭續航股。"
     elif breadth20 >= 0.45 and breadth60 >= 0.35:
         stance = "中性偏多"
         position = "建議 40% - 60% 研究資金，保留現金等待回測後的高勝率切入點"
@@ -473,7 +473,7 @@ def _strategy_market_context(conn: sqlite3.Connection, result: dict) -> dict:
     elif breadth20 < 0.35 or breadth60 < 0.30:
         stance = "防守觀望"
         position = "建議 20% - 35% 研究資金，以觀察名單和停損控管為主"
-        headline = "市場廣度偏弱，策略重點應放在防守與等待訊號轉強。"
+        headline = "市場廣度偏弱，AI 實操重點應放在防守與等待訊號轉強。"
     else:
         stance = "震盪選股"
         position = "建議 30% - 50% 研究資金，只挑量價結構明確的個股"
@@ -485,14 +485,14 @@ def _strategy_market_context(conn: sqlite3.Connection, result: dict) -> dict:
     if avg20 is not None and avg20 > 12:
         risks.append("20 日平均漲幅偏大，短線容易出現震盪洗盤。")
     if result.get("max_drawdown") is not None and result["max_drawdown"] < -8:
-        risks.append("策略歷史最大回撤偏大，建議把停損與持股上限放在第一優先。")
+        risks.append("AI 實操歷史最大回撤偏大，建議把停損與持股上限放在第一優先。")
     if weak / total > 0.45:
         risks.append("弱勢訊號占比偏高，避免把資金平均分散到落後股。")
 
     actions = [
         "優先從 AI 訊號與觀察名單交集找標的，避免只看單日漲幅。",
         "進場分兩到三批，不用一次買滿，並以 20 日線或最近低點作為風控參考。",
-        "若盤面跌破月線家數快速增加，策略自動降到防守模式。",
+        "若盤面跌破月線家數快速增加，AI 實操自動降到防守模式。",
     ]
     if stance in ("偏多進攻", "中性偏多"):
         actions.insert(0, "可優先研究 20 日與 60 日動能同時為正、RSI 未過熱的股票。")
@@ -551,7 +551,7 @@ def api_ai_monitor(db_path: Path) -> dict:
                 "urgent": 0,
                 "watch": 0,
                 "positive": 0,
-                "message": "AI 盯盤只在台股盤中顯示。盤後請看觀察名單、策略研究與個股分析。",
+                "message": "AI 盯盤只在台股盤中顯示。盤後請看觀察名單、AI 實操與個股分析。",
                 **session,
             },
         }
@@ -1017,7 +1017,22 @@ def api_institutional(db_path: Path, code: str) -> dict:
     if "error" in stock:
         return stock
     end = date.today()
-    start = end - timedelta(days=90)
+    start = end - timedelta(days=420)
+    with _connect(db_path) as conn:
+        price_dates = conn.execute(
+            """
+            SELECT date
+            FROM prices
+            WHERE stock_code = ?
+            ORDER BY date DESC
+            LIMIT 260
+            """,
+            (code,),
+        ).fetchall()
+    if price_dates:
+        sorted_dates = sorted(row["date"] for row in price_dates)
+        start = datetime.strptime(sorted_dates[0], "%Y-%m-%d").date()
+        end = datetime.strptime(sorted_dates[-1], "%Y-%m-%d").date()
     try:
         raw = fetch_finmind_institutional(code, start, end)
         grouped: dict[str, dict] = {}
@@ -1035,7 +1050,7 @@ def api_institutional(db_path: Path, code: str) -> dict:
             elif "自營" in name or "Dealer" in name:
                 item["dealer"] += net
         rows = []
-        for day in sorted(grouped)[-45:]:
+        for day in sorted(grouped):
             item = grouped[day]
             institutional_net = item["foreign"] + item["investment"] + item["dealer"]
             item["retail_proxy"] = -institutional_net
@@ -1933,8 +1948,8 @@ INDEX_HTML = r"""<!doctype html>
     th:first-child, td:first-child,
     th:nth-child(2), td:nth-child(2) { text-align: left; }
     .table-wrap { overflow-x: auto; }
-    .positive { color: var(--accent); }
-    .negative { color: var(--down); }
+    .positive { color: #00d9a6; }
+    .negative { color: #ff3b30; }
     .wide { grid-column: 1 / -1; }
     .note { color: var(--muted); }
     .status {
@@ -2961,10 +2976,30 @@ INDEX_HTML = r"""<!doctype html>
       cursor: pointer;
     }
     .realtime-row.selected {
-      background: #e0f2fe;
+      background: #06283a;
+      color: #f8fdff;
+      outline: 1px solid rgba(56,189,248,.65);
+      box-shadow: inset 3px 0 0 #22d3ee;
     }
     .desk-panel .realtime-row.selected {
-      background: rgba(14, 165, 233, .14);
+      background: #06283a;
+    }
+    .realtime-row.selected td,
+    .desk-panel .realtime-row.selected td {
+      color: #f8fdff;
+    }
+    .realtime-row.selected .positive,
+    .desk-panel .realtime-row.selected .positive {
+      color: #00ffc6;
+    }
+    .realtime-row.selected .negative,
+    .desk-panel .realtime-row.selected .negative {
+      color: #ff5c5c;
+    }
+    .realtime-row.selected button {
+      background: #e6fbff;
+      color: #082f49;
+      border-color: #7dd3fc;
     }
     .realtime-actions {
       display: flex;
@@ -3048,7 +3083,7 @@ INDEX_HTML = r"""<!doctype html>
   <header>
     <div class="brand">
       <h1>台股智研 Pro</h1>
-      <div class="subtitle">專業台股智能分析平台 · 訊號排行 · 策略研究 · 風控回測</div>
+      <div class="subtitle">專業台股智能分析平台 · 訊號排行 · AI 實操 · 風控回測</div>
     </div>
     <div class="version"><span id="range">載入中...</span> · UI v26</div>
   </header>
@@ -3060,7 +3095,7 @@ INDEX_HTML = r"""<!doctype html>
         <a class="nav-item" data-page="realtimePage" href="#" onclick="showPage('realtimePage', this); return false;"><span class="nav-icon">RT</span><span>即時看盤</span></a>
         <a class="nav-item" data-page="watchPage" href="#" onclick="showPage('watchPage', this); return false;"><span class="nav-icon">MK</span><span>盤後看盤</span></a>
         <a class="nav-item" data-page="signalsPage" href="#" onclick="showPage('signalsPage', this); return false;"><span class="nav-icon">AI</span><span>智能選股</span></a>
-        <a class="nav-item" data-page="strategyPage" href="#" onclick="showPage('strategyPage', this); return false;"><span class="nav-icon">BT</span><span>策略研究</span></a>
+        <a class="nav-item" data-page="strategyPage" href="#" onclick="showPage('strategyPage', this); return false;"><span class="nav-icon">OP</span><span>AI 實操</span></a>
         <a class="nav-item" data-page="stockPage" href="#" onclick="showPage('stockPage', this); return false;"><span class="nav-icon">ST</span><span>個股分析</span></a>
         <a class="nav-item" data-page="rankingPage" href="#" onclick="showPage('rankingPage', this); return false;"><span class="nav-icon">RK</span><span>市場排行</span></a>
         <a class="nav-item" data-page="hubPage" href="#" onclick="showPage('hubPage', this); return false;"><span class="nav-icon">HB</span><span>股票探索</span></a>
@@ -3072,7 +3107,7 @@ INDEX_HTML = r"""<!doctype html>
     <div class="dashboard-note overview-only">
       <div>
         <strong>智能投資決策中心</strong><br>
-        <span>整合上市櫃資料、AI 訊號分數、策略回測與 Telegram 盤後推播，協助快速建立每日觀察名單。</span>
+        <span>整合上市櫃資料、AI 訊號分數、AI 實操回測與 Telegram 盤後推播，協助快速建立每日觀察名單。</span>
       </div>
       <div class="pill">V1 研究模式</div>
     </div>
@@ -3081,7 +3116,7 @@ INDEX_HTML = r"""<!doctype html>
       <button type="button" class="primary" id="loadStock" onclick="searchStock()">智能搜尋</button>
       <button type="button" id="loadScan" onclick="runAction(fetchScan, '正在載入市場掃描...')">市場排行榜</button>
       <button type="button" id="loadSignals" onclick="runAction(fetchSignals, '正在載入訊號排行...')">AI 訊號</button>
-      <button type="button" id="loadStrategy" onclick="runAction(fetchStrategy, '正在執行策略回測，可能需要約一分鐘...')">策略研究</button>
+      <button type="button" id="loadStrategy" onclick="runAction(fetchStrategy, '正在執行 AI 實操回測，可能需要約一分鐘...')">AI 實操</button>
       <button type="button" id="refreshStatus" onclick="runAction(fetchStatus, '正在更新狀態...')">更新狀態</button>
     </div>
     <div class="status" id="statusLine">準備就緒。</div>
@@ -3091,12 +3126,12 @@ INDEX_HTML = r"""<!doctype html>
         <div>
           <div class="eyebrow">TAIWAN EQUITY RESEARCH DESK</div>
           <h2>今日台股研究工作台</h2>
-          <p>從盤勢廣度、AI 訊號、觀察名單與策略風控切入，先判斷市場環境，再決定要進攻、精選或防守。</p>
+          <p>從盤勢廣度、AI 訊號、觀察名單與實操風控切入，先判斷市場環境，再決定要進攻、精選或防守。</p>
           <div class="hero-actions">
             <button type="button" class="primary" onclick="showPage('signalsPage')">查看 AI 訊號</button>
             <button type="button" onclick="showPage('watchPage')">打開觀察名單</button>
             <button type="button" onclick="showPage('realtimePage')">即時看盤</button>
-            <button type="button" onclick="showPage('strategyPage')">策略研究中心</button>
+            <button type="button" onclick="showPage('strategyPage')">AI 實操中心</button>
           </div>
         </div>
         <div class="hero-stat-grid">
@@ -3107,7 +3142,7 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </div>
       <div class="market-strip">
-        <div class="market-tile accent"><span>策略研究</span><strong>盤勢 + 回測</strong></div>
+        <div class="market-tile accent"><span>AI 實操</span><strong>盤勢 + 回測</strong></div>
         <div class="market-tile blue"><span>即時看盤</span><strong>觀察名單同步</strong></div>
         <div class="market-tile gold"><span>智能選股</span><strong>風險調整分數</strong></div>
         <div class="market-tile cyan"><span>個股分析</span><strong>K 線與技術圖</strong></div>
@@ -3116,7 +3151,7 @@ INDEX_HTML = r"""<!doctype html>
         <section class="wide">
           <h2>今日研究流程</h2>
           <div class="content"><dl>
-            <dt>第一步</dt><dd>先看策略研究判斷目前盤面是進攻、精選或防守</dd>
+            <dt>第一步</dt><dd>先看 AI 實操判斷目前盤面是進攻、精選或防守</dd>
             <dt>第二步</dt><dd>用 AI 訊號與觀察名單縮小股票池</dd>
             <dt>第三步</dt><dd>進入個股 K 線、均線、RSI、MACD、KD 和布林通道確認風險</dd>
           </dl></div>
@@ -3127,7 +3162,7 @@ INDEX_HTML = r"""<!doctype html>
             <dt>股票探索</dt><dd>集中查看 AI 智選、強勢股票與量能焦點</dd>
             <dt>盤後看盤</dt><dd>只保留觀察名單與盤後摘要，避免資訊重複</dd>
             <dt>即時看盤</dt><dd>盤中報價、即時走勢與 AI 盤中盯盤</dd>
-            <dt>策略研究</dt><dd>查看建倉、了結、未平倉與回測績效</dd>
+            <dt>AI 實操</dt><dd>查看建倉、了結、未平倉與回測績效</dd>
           </dl></div>
         </section>
       </div>
@@ -3360,16 +3395,16 @@ INDEX_HTML = r"""<!doctype html>
     <div class="page" id="strategyPage">
       <div class="grid">
       <section class="wide">
-        <h2>目前盤面策略建議</h2>
+        <h2>AI 實操盤面建議</h2>
         <div class="content" id="strategyAdvice"></div>
       </section>
       <section class="wide">
-        <h2>策略研究怎麼看</h2>
+        <h2>AI 實操怎麼看</h2>
         <div class="content strategy-guide">
           <div><strong>勝率</strong><span>代表過去交易有多少比例賺錢，但不是越高越好，還要看賺賠幅度。</span></div>
-          <div><strong>最大回撤</strong><span>代表策略過程中曾經從高點跌下來多少，是新人最需要先看的風險指標。</span></div>
-          <div><strong>總報酬</strong><span>代表回測期間策略累積成果，需搭配最大回撤一起看。</span></div>
-          <div><strong>未平倉部位</strong><span>代表目前策略仍持有、尚未出場的標的，不等於立刻買進建議。</span></div>
+          <div><strong>最大回撤</strong><span>代表 AI 實操過程中曾經從高點跌下來多少，是新人最需要先看的風險指標。</span></div>
+          <div><strong>總報酬</strong><span>代表回測期間 AI 實操累積成果，需搭配最大回撤一起看。</span></div>
+          <div><strong>未平倉部位</strong><span>代表目前 AI 實操仍持有、尚未出場的標的，不等於立刻買進建議。</span></div>
         </div>
       </section>
       <section class="wide">
@@ -3378,11 +3413,11 @@ INDEX_HTML = r"""<!doctype html>
         <div class="table-wrap"><table id="highWinTradesTable"></table></div>
       </section>
       <section class="wide">
-        <h2>策略個股狀況</h2>
+        <h2>AI 實操個股狀況</h2>
         <div class="content" id="strategyStockCards"></div>
       </section>
       <section class="wide">
-        <h2>策略摘要</h2>
+        <h2>AI 實操摘要</h2>
         <div class="content"><dl id="strategySummary"></dl></div>
       </section>
       <section class="wide">
@@ -3390,20 +3425,20 @@ INDEX_HTML = r"""<!doctype html>
         <div class="table-wrap"><table id="strategyLeadersTable"></table></div>
       </section>
       <section class="wide">
-        <h2>策略建倉紀錄</h2>
+        <h2>AI 實操建倉紀錄</h2>
         <div class="table-wrap"><table id="strategyEntriesTable"></table></div>
       </section>
       <section class="wide">
-        <h2>策略了結紀錄</h2>
+        <h2>AI 實操了結紀錄</h2>
         <div class="table-wrap"><table id="strategyTradesTable"></table></div>
       </section>
       <section class="wide">
-        <h2>策略未平倉</h2>
+        <h2>AI 實操未平倉</h2>
         <div class="table-wrap"><table id="strategyOpenTable"></table></div>
       </section>
       <section class="wide">
         <h2>資金曲線</h2>
-        <div class="content"><svg id="equityChart" class="chart" role="img" aria-label="策略資金曲線"></svg></div>
+        <div class="content"><svg id="equityChart" class="chart" role="img" aria-label="AI 實操資金曲線"></svg></div>
         <div class="table-wrap"><table id="strategyCurveTable"></table></div>
       </section>
       </div>
@@ -3469,9 +3504,9 @@ INDEX_HTML = r"""<!doctype html>
         <section class="wide">
           <h2>使用手冊</h2>
           <div class="content"><dl>
-            <dt>快速入門</dt><dd>先看總覽，再用智能搜尋查個股，最後檢查 AI 訊號與策略研究。</dd>
+            <dt>快速入門</dt><dd>先看總覽，再用智能搜尋查個股，最後檢查 AI 訊號與 AI 實操。</dd>
             <dt>AI 智能分析</dt><dd>智研評分綜合技術面、籌碼面、消息面、產業面、三大法人、風險面與資金面。</dd>
-            <dt>策略研究</dt><dd>用歷史資料驗證 Top signals 的表現，包含勝率、最大回撤與交易明細。</dd>
+            <dt>AI 實操</dt><dd>用歷史資料驗證 Top signals 的表現，包含勝率、最大回撤與交易明細。</dd>
             <dt>推播設定</dt><dd>每天 15:30 盤後更新資料並推播 Telegram 摘要。</dd>
           </dl></div>
         </section>
@@ -3585,15 +3620,14 @@ INDEX_HTML = r"""<!doctype html>
         return;
       }
       target.innerHTML = `
-        <thead><tr><th>代號</th><th>名稱</th><th>市場</th><th>現價</th><th>漲跌</th><th>漲跌%</th><th>成交量</th><th>時間</th><th>操作</th></tr></thead>
+        <thead><tr><th>代號</th><th>名稱</th><th>市場</th><th>現價</th><th>漲跌</th><th>漲跌%</th><th>成交量</th><th>操作</th></tr></thead>
         <tbody>${rows.map(row => {
-          const time = row.time ? new Date(row.time * 1000).toLocaleString() : (row.date || "無資料");
           return `
           <tr class="realtime-row" data-code="${row.code}" onclick="selectRealtimeTrend('${row.code}')" title="點擊查看 ${row.code} 即時走勢">
             <td>${row.code}</td><td>${row.name}</td><td>${row.market}</td><td>${fmt(row.price)}</td>
             <td class="${pctClass(row.change)}">${fmt(row.change)}</td>
             <td class="${pctClass(row.change_percent)}">${fmt(row.change_percent)}</td>
-            <td>${fmt(row.volume, 0)}</td><td>${time}</td>
+            <td>${fmt(row.volume, 0)}</td>
             <td>
               <button type="button" class="compact" onclick="event.stopPropagation(); selectRealtimeTrend('${row.code}')">走勢</button>
               <button type="button" class="compact" onclick="event.stopPropagation(); openStock('${row.code}')">分析</button>
@@ -3969,7 +4003,7 @@ INDEX_HTML = r"""<!doctype html>
           </div>
         `;
       }).join("");
-      target.innerHTML = `<div class="strategy-stock-grid">${cards || "<div class='note'>目前沒有可顯示的策略個股。</div>"}</div>`;
+      target.innerHTML = `<div class="strategy-stock-grid">${cards || "<div class='note'>目前沒有可顯示的 AI 實操個股。</div>"}</div>`;
     }
     function renderStrategyAdvice(target, context) {
       const m = context.metrics || {};
@@ -3979,7 +4013,6 @@ INDEX_HTML = r"""<!doctype html>
             <strong>${context.stance || "資料不足"}</strong>
             <p>${context.headline || ""}</p>
             <p><b>部位建議：</b>${context.position_suggestion || "等待資料更新"}</p>
-            <p><b>資料日期：</b>${context.date || "無資料"}</p>
             <ul class="advice-list">${(context.actions || []).map(item => `<li>${item}</li>`).join("")}</ul>
           </div>
           <div class="strategy-kpis">
@@ -4208,9 +4241,9 @@ INDEX_HTML = r"""<!doctype html>
       const rows = visibleChartRows();
       renderCandlestickChart(document.getElementById("priceChart"), rows, currentChartMode);
       renderVolumeChart(document.getElementById("volumeChart"), rows);
-      renderRsiChart(document.getElementById("rsiChart"), rows);
-      renderMacdChart(document.getElementById("macdChart"), rows);
-      renderKdChart(document.getElementById("kdChart"), rows);
+      renderRsiChart(document.getElementById("rsiChart"), rows, currentPriceRows, chartWindowStart);
+      renderMacdChart(document.getElementById("macdChart"), rows, currentPriceRows, chartWindowStart);
+      renderKdChart(document.getElementById("kdChart"), rows, currentPriceRows, chartWindowStart);
       renderInstitutionalChart(document.getElementById("institutionalChart"), currentInstitutional || { rows: [] }, currentChipMode);
       setSyncedCursor(rows.length - 1, rows.length);
     }
@@ -4493,12 +4526,12 @@ INDEX_HTML = r"""<!doctype html>
         const low = Number(row.low);
         const cx = x(index);
         const up = close >= open;
-        const color = up ? "#d92d20" : "#00856f";
+        const color = up ? "#ff2d2d" : "#00ff5a";
         const bodyY = Math.min(y(open), y(close));
         const bodyH = Math.max(1, Math.abs(y(open) - y(close)));
         return `
-          <line x1="${cx}" y1="${y(high)}" x2="${cx}" y2="${y(low)}" stroke="${color}" stroke-width="1"></line>
-          <rect x="${cx - candleW / 2}" y="${bodyY}" width="${candleW}" height="${bodyH}" fill="${color}" opacity="0.86"></rect>
+          <line x1="${cx}" y1="${y(high)}" x2="${cx}" y2="${y(low)}" stroke="${color}" stroke-width="1.4"></line>
+          <rect x="${cx - candleW / 2}" y="${bodyY}" width="${candleW}" height="${bodyH}" fill="${color}" opacity="1"></rect>
         `;
       }).join("");
       const ma5 = smaValues(closes, 5);
@@ -4561,7 +4594,7 @@ INDEX_HTML = r"""<!doctype html>
       const x = index => pad.left + index * (plotW / (rows.length - 1));
       const barW = Math.max(2, Math.min(9, plotW / rows.length * .55));
       const bars = rows.map((row, index) => {
-        const color = Number(row.close) >= Number(row.open) ? "#ef4444" : "#00e676";
+        const color = Number(row.close) >= Number(row.open) ? "#ff2d2d" : "#00ff5a";
         const h = Math.max(1, Number(row.volume || 0) / max * plotH);
         return `<rect x="${x(index) - barW / 2}" y="${height - pad.bottom - h}" width="${barW}" height="${h}" fill="${color}" opacity=".76"><title>${trendLabel(row)} 量 ${fmt(row.volume, 0)}</title></rect>`;
       }).join("");
@@ -4575,9 +4608,10 @@ INDEX_HTML = r"""<!doctype html>
         ${syncCursorLayer(rows, width, height, pad)}
       `;
     }
-    function renderRsiChart(target, rows) {
-      const values = rows.map(row => Number(row.close));
-      const rsi = rsiValues(values, 14).map((value, index) => ({ date: rows[index].date, value }));
+    function renderRsiChart(target, rows, sourceRows = rows, startIndex = 0) {
+      const sourceValues = sourceRows.map(row => Number(row.close));
+      const visibleValues = rsiValues(sourceValues, 14).slice(startIndex, startIndex + rows.length);
+      const rsi = rows.map((row, index) => ({ date: row.date, label: trendLabel(row), value: visibleValues[index] }));
       const width = 1000;
       const height = 220;
       const pad = { left: 54, right: 72, top: 18, bottom: 34 };
@@ -4587,7 +4621,7 @@ INDEX_HTML = r"""<!doctype html>
         target.innerHTML = `<text x="50%" y="50%" text-anchor="middle" class="chart-label">資料不足</text>`;
         return;
       }
-      const x = index => pad.left + index * ((width - pad.left - pad.right) / (rsi.length - 1));
+      const x = index => pad.left + index * ((width - pad.left - pad.right) / (rows.length - 1));
       const y = value => pad.top + (100 - value) * ((height - pad.top - pad.bottom) / 100);
       const points = rsi.map((row, index) => row.value === null ? null : `${x(index)},${y(row.value)}`).filter(Boolean).join(" ");
       target.innerHTML = `
@@ -4598,19 +4632,24 @@ INDEX_HTML = r"""<!doctype html>
         <polyline class="chart-line" points="${points}"></polyline>
         <text class="chart-label" x="8" y="${y(70) + 4}">70</text>
         <text class="chart-label" x="8" y="${y(30) + 4}">30</text>
-        <text class="chart-label" x="${pad.left}" y="${height - 10}">${rows[0].date || ""}</text>
-        <text class="chart-label" x="${width - pad.right}" y="${height - 10}" text-anchor="end">${rows[rows.length - 1].date || ""}</text>
+        <text class="chart-label" x="${pad.left}" y="${height - 10}">${trendLabel(rows[0])}</text>
+        <text class="chart-label" x="${width - pad.right}" y="${height - 10}" text-anchor="end">${trendLabel(rows[rows.length - 1])}</text>
         ${syncCursorLayer(rows, width, height, pad)}
       `;
     }
-    function renderMacdChart(target, rows) {
-      const values = rows.map(row => Number(row.close));
-      const data = macdValues(values);
+    function renderMacdChart(target, rows, sourceRows = rows, startIndex = 0) {
+      const sourceValues = sourceRows.map(row => Number(row.close));
+      const fullData = macdValues(sourceValues);
+      const data = {
+        macd: fullData.macd.slice(startIndex, startIndex + rows.length),
+        signal: fullData.signal.slice(startIndex, startIndex + rows.length),
+        hist: fullData.hist.slice(startIndex, startIndex + rows.length),
+      };
       const width = 1000;
       const height = 240;
       const pad = { left: 54, right: 72, top: 18, bottom: 34 };
       target.setAttribute("viewBox", `0 0 ${width} ${height}`);
-      if (values.length < 35) {
+      if (sourceValues.length < 35 || rows.length < 2) {
         target.innerHTML = `<text x="50%" y="50%" text-anchor="middle" class="chart-label">資料不足</text>`;
         return;
       }
@@ -4624,7 +4663,7 @@ INDEX_HTML = r"""<!doctype html>
       const barW = Math.max(2, Math.min(7, (width - pad.left - pad.right) / rows.length * .55));
       const bars = data.hist.map((value, index) => {
         const up = value >= 0;
-        const color = up ? "#d92d20" : "#00856f";
+        const color = up ? "#ff2d2d" : "#00ff5a";
         const top = Math.min(y(value), zeroY);
         const h = Math.max(1, Math.abs(y(value) - zeroY));
         return `<rect x="${x(index) - barW / 2}" y="${top}" width="${barW}" height="${h}" fill="${color}" opacity=".75"></rect>`;
@@ -4636,15 +4675,15 @@ INDEX_HTML = r"""<!doctype html>
         ${bars}
         <polyline fill="none" stroke="#2563eb" stroke-width="2" points="${linePath(data.macd)}"></polyline>
         <polyline fill="none" stroke="#f59e0b" stroke-width="2" points="${linePath(data.signal)}"></polyline>
-        <text class="chart-label" x="${pad.left}" y="${height - 10}">${rows[0].date || ""}</text>
-        <text class="chart-label" x="${width - pad.right}" y="${height - 10}" text-anchor="end">${rows[rows.length - 1].date || ""}</text>
+        <text class="chart-label" x="${pad.left}" y="${height - 10}">${trendLabel(rows[0])}</text>
+        <text class="chart-label" x="${width - pad.right}" y="${height - 10}" text-anchor="end">${trendLabel(rows[rows.length - 1])}</text>
         <text class="chart-label" x="${width - 128}" y="22">MACD</text>
         <text class="chart-label" x="${width - 70}" y="22">Signal</text>
         ${syncCursorLayer(rows, width, height, pad)}
       `;
     }
-    function renderKdChart(target, rows) {
-      const data = kdValues(rows, 9);
+    function renderKdChart(target, rows, sourceRows = rows, startIndex = 0) {
+      const data = kdValues(sourceRows, 9).slice(startIndex, startIndex + rows.length);
       const width = 1000;
       const height = 220;
       const pad = { left: 54, right: 72, top: 18, bottom: 34 };
@@ -4654,7 +4693,7 @@ INDEX_HTML = r"""<!doctype html>
         target.innerHTML = `<text x="50%" y="50%" text-anchor="middle" class="chart-label">資料不足</text>`;
         return;
       }
-      const x = index => pad.left + index * ((width - pad.left - pad.right) / (data.length - 1));
+      const x = index => pad.left + index * ((width - pad.left - pad.right) / (rows.length - 1));
       const y = value => pad.top + (100 - value) * ((height - pad.top - pad.bottom) / 100);
       const linePath = key => data.map((row, index) => row[key] === null ? null : `${x(index)},${y(row[key])}`).filter(Boolean).join(" ");
       target.innerHTML = `
@@ -4666,8 +4705,8 @@ INDEX_HTML = r"""<!doctype html>
         <polyline fill="none" stroke="#f59e0b" stroke-width="2" points="${linePath("d")}"></polyline>
         <text class="chart-label" x="8" y="${y(80) + 4}">80</text>
         <text class="chart-label" x="8" y="${y(20) + 4}">20</text>
-        <text class="chart-label" x="${pad.left}" y="${height - 10}">${rows[0].date || ""}</text>
-        <text class="chart-label" x="${width - pad.right}" y="${height - 10}" text-anchor="end">${rows[rows.length - 1].date || ""}</text>
+        <text class="chart-label" x="${pad.left}" y="${height - 10}">${trendLabel(rows[0])}</text>
+        <text class="chart-label" x="${width - pad.right}" y="${height - 10}" text-anchor="end">${trendLabel(rows[rows.length - 1])}</text>
         <text class="chart-label" x="${width - 80}" y="22">K / D</text>
         ${syncCursorLayer(rows, width, height, pad)}
       `;
@@ -5012,7 +5051,7 @@ INDEX_HTML = r"""<!doctype html>
           <dt>風控</dt><dd>${fmt(m.urgent, 0)} 檔</dd>
           <dt>偏多</dt><dd>${fmt(m.positive, 0)} 檔</dd>
           <dt>觀察</dt><dd>${fmt(m.watch, 0)} 檔</dd>
-        </dl>` : `<div class="trade-callout"><strong>${m.session_label || "盤後整理"}</strong><p>${m.message || "AI 盯盤只在台股盤中顯示。盤後請看盤後觀察與策略研究。"}</p><p>目前時間：${m.now || ""}</p></div>`;
+        </dl>` : `<div class="trade-callout"><strong>${m.session_label || "盤後整理"}</strong><p>${m.message || "AI 盯盤只在台股盤中顯示。盤後請看盤後觀察與 AI 實操。"}</p><p>目前時間：${m.now || ""}</p></div>`;
       if (isIntraday) {
         renderAiMonitor(document.getElementById("aiMonitorTable"), monitor.items || []);
       } else {
@@ -5041,7 +5080,7 @@ INDEX_HTML = r"""<!doctype html>
     function showPage(pageId, navItem) {
       activatePage(pageId);
       if (navItem) navItem.classList.add("active");
-      if (pageId === "strategyPage") runAction(fetchStrategy, "正在執行策略回測，可能需要約一分鐘...");
+      if (pageId === "strategyPage") runAction(fetchStrategy, "正在執行 AI 實操回測，可能需要約一分鐘...");
       if (pageId === "realtimePage") runAction(fetchRealtime, "正在載入即時看盤...");
       if (pageId === "watchPage") runAction(fetchWatch, "正在載入盤後看盤資料...");
       if (pageId === "signalsPage") runAction(fetchSignals, "正在載入訊號排行...");
@@ -5078,7 +5117,7 @@ INDEX_HTML = r"""<!doctype html>
     initPublicConfig()
       .then(() => fetchStatus())
       .then(() => fetchStock())
-      .then(() => setStatus("準備就緒。排行與策略會在切換頁面時載入。"))
+      .then(() => setStatus("準備就緒。排行與 AI 實操會在切換頁面時載入。"))
       .catch(error => {
         setStatus(`錯誤：${error.message}`);
         alert(error.message);

@@ -216,9 +216,10 @@ def _chip_section(market_profile: dict) -> dict:
 
 def _news_proxy_section(market_profile: dict) -> dict:
     events = market_profile["event_flags"]
+    event_summary = "；".join(events[:2]) if events else "平穩"
     return {
         "title": "消息事件偵測",
-        "stance": "有事件" if events else "平穩",
+        "stance": event_summary,
         "points": events or [
             "近 20 日未偵測到明顯跳空、爆量長黑或異常波動。",
             "目前消息面以價格與量能異常作為代理，尚未串接新聞文字來源。",
@@ -389,13 +390,13 @@ def _event_flags(rows: list[sqlite3.Row]) -> list[str]:
         intraday = (close / open_price - 1) * 100 if open_price else 0
         span = (high / low - 1) * 100 if low else 0
         if gap >= 3 and volume > avg_volume * 1.3:
-            flags.append(f"{row['date']} 高開放量，需確認是否有利多或追價風險。")
+            flags.append("高開放量，需確認是否有利多或追價風險。")
         elif gap <= -3 and volume > avg_volume * 1.3:
-            flags.append(f"{row['date']} 低開放量，需追蹤是否有利空或停損賣壓。")
+            flags.append("低開放量，需追蹤是否有利空或停損賣壓。")
         if intraday <= -4 and volume > avg_volume * 1.4:
-            flags.append(f"{row['date']} 放量長黑，短線籌碼可能鬆動。")
+            flags.append("放量長黑，短線籌碼可能鬆動。")
         if span >= 7:
-            flags.append(f"{row['date']} 盤中波動超過 7%，適合列入事件追蹤。")
+            flags.append("盤中波動超過 7%，適合列入事件追蹤。")
     return flags[-4:]
 
 
