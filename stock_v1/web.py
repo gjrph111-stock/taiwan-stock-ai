@@ -894,11 +894,13 @@ def delete_telegram_webhook() -> dict:
 
 def api_realtime(db_path: Path, raw_codes: str) -> dict:
     codes = [code.strip() for code in raw_codes.split(",") if code.strip()]
+    order = {code: index for index, code in enumerate(codes)}
     with _connect(db_path) as conn:
         stocks = conn.execute(
             f"SELECT code, name, market FROM stocks WHERE code IN ({','.join('?' for _ in codes)})",
             codes,
         ).fetchall() if codes else []
+    stocks = sorted(stocks, key=lambda row: order.get(row["code"], 999999))
     if not stocks:
         return {"quotes": [], "message": "沒有可查詢的股票代號"}
 
@@ -3719,6 +3721,7 @@ INDEX_HTML = r"""<!doctype html>
               <button type="button" class="compact" onclick="removeWatchlistCode('${row.code}')">移除</button>
             </td>
           </tr>`).join("")}</tbody>`;
+      syncRealtimeCodes(rows.map(row => row.code));
       enableWatchlistDrag(target);
     }
     function enableWatchlistDrag(table) {
@@ -3754,18 +3757,25 @@ INDEX_HTML = r"""<!doctype html>
     async function saveWatchlistOrderFromTable(table) {
       const codes = Array.from(table.querySelectorAll("tr[data-watch-code]")).map(row => row.dataset.watchCode).filter(Boolean);
       if (!codes.length) return;
+      syncRealtimeCodes(codes);
+      const message = await persistWatchlistOrder(codes);
+      document.getElementById("watchlistHint").textContent = message || `已更新排序，目前觀察 ${codes.length} 檔。`;
+    }
+    function syncRealtimeCodes(codes) {
+      const input = document.getElementById("realtimeCodes");
+      if (input) input.value = codes.join(",");
+    }
+    async function persistWatchlistOrder(codes) {
       if (currentUserKey) {
         const data = await getJson(`/api/user/watchlist/reorder?user_key=${encodeURIComponent(currentUserKey)}&codes=${encodeURIComponent(codes.join(","))}`);
-        document.getElementById("watchlistHint").textContent = data.error || `已更新排序。這是你的個人觀察名單。`;
-        return;
+        return data.error || "已更新排序。這是你的個人觀察名單，會同步到即時看盤。";
       }
       if (publicDemoMode) {
         saveLocalWatchlist(codes);
-        document.getElementById("watchlistHint").textContent = "已更新排序。公開展示模式只會更新此瀏覽器。";
-        return;
+        return "已更新排序。公開展示模式只會更新此瀏覽器，並同步到即時看盤。";
       }
       const data = await getJson(`/api/watchlist/reorder?codes=${encodeURIComponent(codes.join(","))}`);
-      document.getElementById("watchlistHint").textContent = data.error || `已更新排序，目前觀察 ${codes.length} 檔。`;
+      return data.error || `已更新排序，目前觀察 ${codes.length} 檔，已同步到即時看盤。`;
     }
     function renderRealtime(target, rows) {
       if (!rows.length) {
@@ -3775,10 +3785,11 @@ INDEX_HTML = r"""<!doctype html>
         return;
       }
       target.innerHTML = `
-        <thead><tr><th>代號</th><th>名稱</th><th>市場</th><th>現價</th><th>漲跌</th><th>漲跌%</th><th>成交量</th><th>操作</th></tr></thead>
+        <thead><tr><th></th><th>代號</th><th>名稱</th><th>市場</th><th>現價</th><th>漲跌</th><th>漲跌%</th><th>成交量</th><th>操作</th></tr></thead>
         <tbody>${rows.map(row => {
           return `
-          <tr class="realtime-row" data-code="${row.code}" onclick="selectRealtimeTrend('${row.code}')" title="點擊查看 ${row.code} 即時走勢">
+          <tr class="realtime-row" draggable="true" data-code="${row.code}" onclick="selectRealtimeTrend('${row.code}')" title="點擊查看 ${row.code} 即時走勢">
+            <td class="drag-handle" onclick="event.stopPropagation()" title="拖曳同步調整觀察名單順序">☰</td>
             <td>${row.code}</td><td>${row.name}</td><td>${row.market}</td><td>${fmt(row.price)}</td>
             <td class="${pctClass(row.change)}">${fmt(row.change)}</td>
             <td class="${pctClass(row.change_percent)}">${fmt(row.change_percent)}</td>
@@ -3789,7 +3800,45 @@ INDEX_HTML = r"""<!doctype html>
             </td>
           </tr>`;
         }).join("")}</tbody>`;
+      enableRealtimeDrag(target);
       renderRealtimeBoard(rows[0]);
+    }
+    function enableRealtimeDrag(table) {
+      const tbody = table.querySelector("tbody");
+      if (!tbody) return;
+      let dragged = null;
+      tbody.querySelectorAll("tr[data-code]").forEach(row => {
+        row.addEventListener("dragstart", event => {
+          dragged = row;
+          row.classList.add("watch-dragging");
+          event.dataTransfer.effectAllowed = "move";
+          event.dataTransfer.setData("text/plain", row.dataset.code || "");
+        });
+        row.addEventListener("dragend", () => {
+          row.classList.remove("watch-dragging");
+          tbody.querySelectorAll("tr").forEach(item => item.classList.remove("watch-drop-before", "watch-drop-after"));
+          saveRealtimeOrderFromTable(table);
+        });
+        row.addEventListener("dragover", event => {
+          event.preventDefault();
+          if (!dragged || dragged === row) return;
+          const rect = row.getBoundingClientRect();
+          const after = event.clientY > rect.top + rect.height / 2;
+          row.classList.toggle("watch-drop-before", !after);
+          row.classList.toggle("watch-drop-after", after);
+          tbody.insertBefore(dragged, after ? row.nextSibling : row);
+        });
+        row.addEventListener("dragleave", () => {
+          row.classList.remove("watch-drop-before", "watch-drop-after");
+        });
+      });
+    }
+    async function saveRealtimeOrderFromTable(table) {
+      const codes = Array.from(table.querySelectorAll("tr[data-code]")).map(row => row.dataset.code).filter(Boolean);
+      if (!codes.length) return;
+      syncRealtimeCodes(codes);
+      const message = await persistWatchlistOrder(codes);
+      document.getElementById("realtimeNotice").textContent = message || "已同步調整觀察名單順序。";
     }
     function renderRealtimeBoard(row) {
       if (!row) return;
