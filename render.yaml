@@ -19,3 +19,5 @@ services:
         sync: false
       - key: STOCK_V1_TELEGRAM_CHAT_ID
         sync: false
+      - key: STOCK_V1_JOB_TOKEN
+        sync: false

@@ -112,6 +112,10 @@ def _make_handler(db_path: Path):
                     self._send_json(api_realtime_trend(db_path, _param(params, "code", "2330"), _param(params, "interval", "1d")))
                 elif parsed.path == "/api/institutional":
                     self._send_json(api_institutional(db_path, _param(params, "code", "2330")))
+                elif parsed.path == "/api/jobs/notify-users":
+                    self._send_json(api_job_notify_users(db_path, _param(params, "token", ""), int(_param(params, "limit", "5"))))
+                elif parsed.path == "/api/jobs/notify-users-intraday":
+                    self._send_json(api_job_notify_users_intraday(db_path, _param(params, "token", ""), int(_param(params, "limit", "5"))))
                 else:
                     self._send_json({"error": "not found"}, status=404)
             except Exception as exc:
@@ -799,6 +803,24 @@ def api_user_telegram_test(db_path: Path, user_key: str) -> dict:
     return {"ok": True, "message": "已送出 Telegram 測試推播。"}
 
 
+def api_job_notify_users(db_path: Path, token: str, limit: int = 5) -> dict:
+    ok, error = _job_authorized(token)
+    if not ok:
+        return {"error": error}
+    return send_enabled_user_telegrams(db_path, limit=limit)
+
+
+def api_job_notify_users_intraday(db_path: Path, token: str, limit: int = 5) -> dict:
+    ok, error = _job_authorized(token)
+    if not ok:
+        return {"error": error}
+    now = datetime.now(ZoneInfo("Asia/Taipei"))
+    allowed = now.weekday() < 5 and time(9, 0) <= now.time() <= time(14, 0)
+    if not allowed:
+        return {"skipped": True, "message": f"Not market time. Now={now:%Y-%m-%d %H:%M:%S} Asia/Taipei"}
+    return send_enabled_user_intraday_telegrams(db_path, limit=limit)
+
+
 def send_enabled_user_telegrams(db_path: Path, limit: int = 5) -> dict:
     with _connect(db_path) as conn:
         _ensure_user_tables(conn)
@@ -815,6 +837,29 @@ def send_enabled_user_telegrams(db_path: Path, limit: int = 5) -> dict:
     for user in users:
         try:
             message = _build_user_daily_message(db_path, user["user_key"], user["display_name"], limit=limit)
+            _send_telegram_to_chat(user["telegram_chat_id"], message)
+            sent += 1
+        except Exception as exc:
+            failures.append({"user_key": user["user_key"], "name": user["display_name"], "error": str(exc)})
+    return {"users": len(users), "sent": sent, "failures": failures}
+
+
+def send_enabled_user_intraday_telegrams(db_path: Path, limit: int = 5) -> dict:
+    with _connect(db_path) as conn:
+        _ensure_user_tables(conn)
+        users = conn.execute(
+            """
+            SELECT user_key, display_name, telegram_chat_id
+            FROM app_users
+            WHERE telegram_enabled = 1 AND telegram_chat_id IS NOT NULL AND telegram_chat_id != ''
+            ORDER BY created_at
+            """
+        ).fetchall()
+    sent = 0
+    failures = []
+    for user in users:
+        try:
+            message = _build_user_intraday_message(db_path, user["user_key"], user["display_name"], limit=limit)
             _send_telegram_to_chat(user["telegram_chat_id"], message)
             sent += 1
         except Exception as exc:
@@ -842,11 +887,16 @@ def handle_telegram_text(db_path: Path, chat_id: str, text: str, display_name: s
         user = _ensure_telegram_user(db_path, chat_id, display_name)
         return (
             f"已建立/綁定個人設定：{user['display_name']}\n"
+            f"你的個人代碼：{user['user_key']}\n"
             "你可以直接輸入股票代號，例如 2330。\n\n"
             + _telegram_help_text()
         )
     if lowered in {"/help", "help", "幫助", "說明"}:
         return _telegram_help_text()
+    if lowered.startswith(("綁定", "bind", "/bind")):
+        key = normalized.split(maxsplit=1)[1].strip() if len(normalized.split(maxsplit=1)) > 1 else ""
+        result = _bind_telegram_to_user(db_path, key, chat_id, display_name)
+        return result.get("message") or result.get("error") or "綁定完成。"
 
     user = _ensure_telegram_user(db_path, chat_id, display_name)
     code = _extract_stock_code(normalized)
@@ -1325,6 +1375,27 @@ def _ensure_telegram_user(db_path: Path, chat_id: str, display_name: str) -> sql
         return conn.execute("SELECT * FROM app_users WHERE user_key = ?", (user_key,)).fetchone()
 
 
+def _bind_telegram_to_user(db_path: Path, user_key: str, chat_id: str, display_name: str) -> dict:
+    key = user_key.strip()
+    if not key:
+        return {"error": "請輸入個人代碼，例如：綁定 abc123"}
+    with _connect(db_path) as conn:
+        _ensure_user_tables(conn)
+        row = conn.execute("SELECT * FROM app_users WHERE user_key = ?", (key,)).fetchone()
+        if not row:
+            return {"error": "找不到這個個人代碼，請回網站確認後再輸入。"}
+        conn.execute(
+            """
+            UPDATE app_users
+            SET telegram_chat_id = ?, telegram_enabled = 1, display_name = COALESCE(NULLIF(display_name, ''), ?), updated_at = datetime('now')
+            WHERE user_key = ?
+            """,
+            (chat_id, display_name[:40] or row["display_name"], key),
+        )
+        conn.commit()
+    return {"ok": True, "message": f"已綁定 Telegram，之後會把 {row['display_name']} 的個人觀察名單推播到這個聊天室。"}
+
+
 def _extract_stock_code(text: str) -> str | None:
     for token in text.replace("：", " ").replace(":", " ").replace(",", " ").split():
         clean = token.strip().lstrip("+-#")
@@ -1343,6 +1414,7 @@ def _telegram_help_text() -> str:
             "分析 2454｜查個股買點、賣點、停損",
             "加入 2367｜加入個人觀察名單",
             "移除 2367｜移除個人觀察名單",
+            "綁定 個人代碼｜把網站帳號綁到這個 Telegram",
             "我的觀察名單｜查看自己的股票提醒",
             "AI智選｜查看 AI Top 5",
         ]
@@ -1448,6 +1520,44 @@ def _build_user_daily_message(db_path: Path, user_key: str, display_name: str, l
     return "\n".join(lines)
 
 
+def _build_user_intraday_message(db_path: Path, user_key: str, display_name: str, limit: int = 5) -> str:
+    now = datetime.now(ZoneInfo("Asia/Taipei"))
+    codes = _user_watchlist_codes(db_path, user_key)
+    rows = api_watchlist(db_path, ",".join(codes)).get("watchlist", [])[:limit]
+    lines = [
+        f"台股智研｜{display_name} AI 盤中盯盤",
+        f"時間：{now:%Y-%m-%d %H:%M}",
+        "",
+        "觀察名單即時風控",
+    ]
+    if not rows:
+        lines.append("目前尚未加入觀察股票。")
+    for item in rows:
+        close = item.get("close")
+        stop = item.get("stop")
+        sell_zone = item.get("sell_zone")
+        buy_zone = item.get("buy_zone")
+        risk = "正常觀察"
+        if close is not None and stop not in (None, "-"):
+            try:
+                if float(close) <= float(stop):
+                    risk = "接近或跌破停損，優先風控"
+            except (TypeError, ValueError):
+                pass
+        lines.extend([
+            "",
+            f"{item['code']} {item['name']}｜{item.get('signal', '資料不足')}｜{risk}",
+            f"現價/收盤：{fmt_value(close)}｜RSI {fmt_value(item.get('rsi_14'))}｜量比 {fmt_value(item.get('volume_ratio'))}",
+            f"買點：{buy_zone or '無資料'}｜賣點：{sell_zone or '無資料'}｜停損：{stop or '無資料'}",
+            f"建議：{_simple_watch_advice(item)}",
+        ])
+    lines.extend([
+        "",
+        "提醒：盤中推播用於盯盤與風控，不是自動下單指令。",
+    ])
+    return "\n".join(lines)
+
+
 def _send_telegram_to_chat(chat_id: str, message: str) -> dict:
     return _telegram_api(
         "sendMessage",
@@ -1480,6 +1590,15 @@ def _telegram_bot_token() -> str:
     if not bot_token or "PASTE_" in str(bot_token):
         raise RuntimeError("主機 Telegram Bot token 尚未設定完成。請設定 STOCK_V1_TELEGRAM_BOT_TOKEN。")
     return bot_token
+
+
+def _job_authorized(token: str) -> tuple[bool, str]:
+    expected = os.environ.get("STOCK_V1_JOB_TOKEN", "").strip()
+    if not expected:
+        return False, "STOCK_V1_JOB_TOKEN 尚未設定，排程推播端點未啟用。"
+    if not secrets.compare_digest(str(token or ""), expected):
+        return False, "排程 token 錯誤。"
+    return True, ""
 
 
 def fmt_value(value, digits: int = 2) -> str:
@@ -3601,8 +3720,9 @@ INDEX_HTML = r"""<!doctype html>
           <div class="content"><dl>
             <dt>個人代碼</dt><dd id="notifyUserKey">尚未建立</dd>
             <dt>推播狀態</dt><dd id="notifyTelegramStatus">尚未設定</dd>
+            <dt>Telegram 綁定</dt><dd>朋友可先建立個人設定，再到 Telegram 對 bot 輸入「綁定 個人代碼」。若直接對 bot 輸入 /start，系統也會自動建立個人帳號。</dd>
             <dt>推播內容</dt><dd>個人觀察名單、AI 分數、買點、賣點、停損與操作提醒</dd>
-            <dt>自動排程</dt><dd>正式主機可每天盤後批次發送給所有已啟用 Telegram 的使用者</dd>
+            <dt>自動排程</dt><dd>盤中 09:00-14:00 發送個人 AI 盯盤；盤後發送個人觀察名單報告。</dd>
           </dl></div>
         </section>
       </div>
@@ -5176,13 +5296,13 @@ INDEX_HTML = r"""<!doctype html>
       if (!user) {
         keyEl.textContent = "尚未建立";
         statusEl.textContent = "尚未設定";
-        hintEl.textContent = "請先建立個人設定，再儲存 Telegram chat_id。";
+        hintEl.textContent = "請先建立個人設定。朋友也可以直接到 Telegram 對 bot 輸入 /start 自動建立。";
         return;
       }
       keyEl.textContent = user.user_key;
       document.getElementById("telegramChatId").value = user.telegram_chat_id || "";
       statusEl.textContent = user.telegram_enabled ? `已啟用：${user.telegram_chat_id}` : "尚未啟用";
-      hintEl.textContent = `${user.display_name} 的個人設定已啟用。請妥善保存個人代碼；同一個瀏覽器會自動記住。`;
+      hintEl.textContent = `${user.display_name} 的個人設定已啟用。可在 Telegram 對 bot 輸入「綁定 ${user.user_key}」完成推播綁定；同一個瀏覽器會自動記住。`;
     }
     async function createUserProfile() {
       const name = document.getElementById("notifyName").value.trim() || "朋友";

@@ -1,0 +1,33 @@
+name: Telegram Push
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Asia/Taipei 09:00-14:00, Monday-Friday.
+    - cron: "*/30 1-6 * * 1-5"
+    # Asia/Taipei 15:40, Monday-Friday.
+    - cron: "40 7 * * 1-5"
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    env:
+      RENDER_BASE_URL: https://taiwan-stock-ai-g6cf.onrender.com
+      RENDER_JOB_TOKEN: ${{ secrets.RENDER_JOB_TOKEN }}
+    steps:
+      - name: Trigger personal Telegram push
+        shell: bash
+        run: |
+          if [ -z "$RENDER_JOB_TOKEN" ]; then
+            echo "Missing GitHub secret RENDER_JOB_TOKEN"
+            exit 1
+          fi
+
+          if [ "${{ github.event.schedule }}" = "40 7 * * 1-5" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            path="notify-users"
+          else
+            path="notify-users-intraday"
+          fi
+
+          curl --fail --silent --show-error \
+            "${RENDER_BASE_URL}/api/jobs/${path}?token=${RENDER_JOB_TOKEN}&limit=5"
