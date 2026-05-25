@@ -7,6 +7,9 @@ from .indicators import pct_change, rsi, sma, volume_ratio
 from .names import short_name
 
 
+_INDUSTRY_AVG_CACHE: dict[tuple[str, str], float | None] = {}
+
+
 @dataclass
 class MonitorContext:
     latest: dict
@@ -477,6 +480,9 @@ def _fund_flow_facet(rows: list[sqlite3.Row], ctx: MonitorContext) -> dict:
 def _industry_average_return(conn: sqlite3.Connection, industry: str | None, latest_date: str) -> float | None:
     if not industry:
         return None
+    cache_key = (industry, latest_date)
+    if cache_key in _INDUSTRY_AVG_CACHE:
+        return _INDUSTRY_AVG_CACHE[cache_key]
     rows = conn.execute(
         """
         SELECT p.stock_code, p.date, p.close
@@ -493,7 +499,9 @@ def _industry_average_return(conn: sqlite3.Connection, industry: str | None, lat
         by_code.setdefault(row["stock_code"], []).append(float(row["close"]))
     returns = [pct_change(values, 20) for values in by_code.values() if len(values) >= 21]
     returns = [value for value in returns if value is not None]
-    return sum(returns) / len(returns) if returns else None
+    result = sum(returns) / len(returns) if returns else None
+    _INDUSTRY_AVG_CACHE[cache_key] = result
+    return result
 
 
 def _facet(name: str, stance: str, score: int, detail: str) -> dict:

@@ -25,6 +25,7 @@ from .signals import load_signal_rows, rank_signals, risk_adjusted_score, score_
 
 _FUNDAMENTAL_CACHE: dict[tuple[str, str | None], dict] = {}
 _STRATEGY_CACHE: dict[str | None, dict] = {}
+_AI_MONITOR_CACHE: dict[str, object] = {"expires_at": datetime.min, "data": None}
 
 
 def run(host: str = "127.0.0.1", port: int = 8765, db_path: Path = DEFAULT_DB_PATH) -> None:
@@ -581,8 +582,15 @@ def api_ai_monitor(db_path: Path) -> dict:
                 **session,
             },
         }
+    cached_until = _AI_MONITOR_CACHE.get("expires_at")
+    if isinstance(cached_until, datetime) and datetime.now() < cached_until and _AI_MONITOR_CACHE.get("data"):
+        result = dict(_AI_MONITOR_CACHE["data"])  # type: ignore[arg-type]
+        result["summary"] = {**result.get("summary", {}), **session, "cached": True}
+        return result
     result = build_ai_monitor(db_path)
     result["summary"] = {**result.get("summary", {}), **session}
+    _AI_MONITOR_CACHE["data"] = result
+    _AI_MONITOR_CACHE["expires_at"] = datetime.now() + timedelta(seconds=25)
     return result
 
 
@@ -5478,15 +5486,17 @@ INDEX_HTML = r"""<!doctype html>
     let selectedRealtimeCode = "";
     async function realtimeCodesFromWatchlist() {
       const manual = document.getElementById("realtimeCodes").value.trim();
-      if (manual) return manual;
       const data = await getWatchlistData();
       const codes = (data.codes || []).join(",");
-      if (codes) {
+      if (!manual && codes) {
         document.getElementById("realtimeCodes").value = codes;
+        return codes;
       }
-      return codes;
+      return manual || codes;
     }
     async function fetchRealtime() {
+      document.getElementById("realtimeNotice").textContent = "正在載入觀察名單報價與 AI 盯盤...";
+      document.getElementById("aiMonitorSummary").innerHTML = `<div class="trade-callout"><strong>AI 盯盤載入中</strong><p>正在整理觀察名單、盤中狀態與風控訊號。</p></div>`;
       const codes = await realtimeCodesFromWatchlist();
       if (!codes) {
         renderRealtime(document.getElementById("realtimeTable"), []);
@@ -5504,28 +5514,30 @@ INDEX_HTML = r"""<!doctype html>
       const quotes = data.quotes || [];
       renderRealtime(document.getElementById("realtimeTable"), quotes);
       renderRealtimeMonitor(monitor);
-      document.getElementById("realtimeNotice").textContent = data.message || "即時看盤資料已更新。";
+      document.getElementById("realtimeNotice").textContent = `${data.message || "即時看盤資料已更新。"} 顯示 ${quotes.length} 檔。`;
       if (quotes.length) {
         const nextCode = quotes.some(row => row.code === selectedRealtimeCode) ? selectedRealtimeCode : quotes[0].code;
         await selectRealtimeTrend(nextCode);
+      } else {
+        document.getElementById("realtimeTrendSummary").innerHTML = "";
+        document.getElementById("realtimeTrendChart").innerHTML = `<text x="50%" y="50%" text-anchor="middle" class="chart-label">目前沒有報價資料</text>`;
+        document.getElementById("realtimeTrendNotice").textContent = "請確認觀察名單股票代號。";
       }
     }
     function renderRealtimeMonitor(monitor) {
       const m = (monitor && monitor.summary) || {};
       const isIntraday = !!m.is_intraday;
-      document.getElementById("aiMonitorSummary").innerHTML = isIntraday ? `
+      document.getElementById("aiMonitorSummary").innerHTML = `
         <dl>
-          <dt>模式</dt><dd>${m.session_label || "盤中盯盤"}</dd>
+          <dt>模式</dt><dd>${m.session_label || (isIntraday ? "盤中盯盤" : "盤後預覽")}</dd>
           <dt>盯盤狀態</dt><dd>${m.stance || "資料不足"}</dd>
           <dt>風控</dt><dd>${fmt(m.urgent, 0)} 檔</dd>
           <dt>偏多</dt><dd>${fmt(m.positive, 0)} 檔</dd>
           <dt>觀察</dt><dd>${fmt(m.watch, 0)} 檔</dd>
-        </dl>` : `<div class="trade-callout"><strong>${m.session_label || "盤後整理"}</strong><p>${m.message || "AI 盯盤只在台股盤中顯示。盤後請看盤後觀察與 AI 實操。"}</p><p>目前時間：${m.now || ""}</p></div>`;
-      if (isIntraday) {
-        renderAiMonitor(document.getElementById("aiMonitorTable"), monitor.items || []);
-      } else {
-        document.getElementById("aiMonitorTable").innerHTML = `<thead><tr><th>盤中盯盤暫停</th></tr></thead><tbody><tr><td>現在不是台股盤中時段，系統不顯示盤中盯盤指令。</td></tr></tbody>`;
-      }
+          <dt>時間</dt><dd>${m.now || "-"}</dd>
+        </dl>
+        ${isIntraday ? "" : `<div class="trade-callout"><strong>盤後預覽</strong><p>${m.message || "現在不是台股盤中，以下顯示最新收盤資料的 AI 盯盤預覽，盤中會自動切換為即時模式。"}</p></div>`}`;
+      renderAiMonitor(document.getElementById("aiMonitorTable"), monitor.items || []);
     }
     async function selectRealtimeTrend(code) {
       selectedRealtimeCode = code;
