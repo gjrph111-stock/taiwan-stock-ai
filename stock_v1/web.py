@@ -2883,6 +2883,13 @@ INDEX_HTML = r"""<!doctype html>
       font-weight: 900;
       border-bottom: 1px solid #1f2933;
     }
+    .terminal-head.updating {
+      animation: terminal-flash .45s ease;
+    }
+    @keyframes terminal-flash {
+      0% { background: rgba(34, 211, 238, .26); }
+      100% { background: transparent; }
+    }
     .order-ratio {
       display: grid;
       grid-template-columns: 86px 1fr 86px;
@@ -4016,11 +4023,13 @@ INDEX_HTML = r"""<!doctype html>
     }
     function renderRealtime(target, rows) {
       if (!rows.length) {
+        latestRealtimeRows = [];
         target.innerHTML = `
           <thead><tr><th>狀態</th></tr></thead>
           <tbody><tr><td>目前沒有可顯示的報價，請確認股票代號是否正確。</td></tr></tbody>`;
         return;
       }
+      latestRealtimeRows = rows;
       target.innerHTML = `
         <thead><tr><th></th><th>代號</th><th>名稱</th><th>市場</th><th>現價</th><th>漲跌</th><th>漲跌%</th><th>成交量</th><th>操作</th></tr></thead>
         <tbody>${rows.map(row => {
@@ -4038,7 +4047,7 @@ INDEX_HTML = r"""<!doctype html>
           </tr>`;
         }).join("")}</tbody>`;
       enableRealtimeDrag(target);
-      renderRealtimeBoard(rows[0]);
+      renderRealtimeBoard(rows.find(row => row.code === selectedRealtimeCode) || rows[0]);
     }
     function enableRealtimeDrag(table) {
       const tbody = table.querySelector("tbody");
@@ -4081,7 +4090,11 @@ INDEX_HTML = r"""<!doctype html>
       if (!row) return;
       const head = document.getElementById("realtimeTerminalHead");
       if (head) {
-        head.innerHTML = `${row.code} ${row.name} <span class="${pctClass(row.change)}" style="margin-left:18px">${fmt(row.price)} ${fmt(row.change)}(${fmt(row.change_percent)}%)</span> <span style="float:right;color:#94a3b8">${row.date || ""}</span>`;
+        const stamp = new Date().toLocaleTimeString("zh-TW", { hour12: false });
+        head.innerHTML = `${row.code} ${row.name} <span class="${pctClass(row.change)}" style="margin-left:18px">${fmt(row.price)} ${fmt(row.change)}(${fmt(row.change_percent)}%)</span> <span style="float:right;color:#94a3b8">${row.date || ""} 更新 ${stamp}</span>`;
+        head.classList.remove("updating");
+        void head.offsetWidth;
+        head.classList.add("updating");
       }
       renderOrderRatio(row);
       const tape = document.getElementById("realtimeTape");
@@ -4517,7 +4530,11 @@ INDEX_HTML = r"""<!doctype html>
       renderRealtimeTrendChart(target, rows);
       const head = document.getElementById("realtimeTerminalHead");
       if (head) {
-        head.innerHTML = `${data.code || ""} ${data.name || ""} <span class="${pctClass(changePct)}" style="margin-left:18px">${fmt(latest.close)} ${fmt(change)}(${fmt(changePct)}%)</span> <span style="float:right;color:#94a3b8">${trendLabel(latest)}</span>`;
+        const stamp = new Date().toLocaleTimeString("zh-TW", { hour12: false });
+        head.innerHTML = `${data.code || ""} ${data.name || ""} <span class="${pctClass(changePct)}" style="margin-left:18px">${fmt(latest.close)} ${fmt(change)}(${fmt(changePct)}%)</span> <span style="float:right;color:#94a3b8">${trendLabel(latest)} 更新 ${stamp}</span>`;
+        head.classList.remove("updating");
+        void head.offsetWidth;
+        head.classList.add("updating");
       }
       renderOrderRatio({ change_percent: changePct });
       notice.textContent = `${data.code || ""} ${data.name || ""}｜${data.message || "走勢已更新"}`;
@@ -5484,6 +5501,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     let realtimeTimer = null;
     let selectedRealtimeCode = "";
+    let latestRealtimeRows = [];
     async function realtimeCodesFromWatchlist() {
       const manual = document.getElementById("realtimeCodes").value.trim();
       const data = await getWatchlistData();
@@ -5544,6 +5562,12 @@ INDEX_HTML = r"""<!doctype html>
       document.querySelectorAll(".realtime-row").forEach(row => {
         row.classList.toggle("selected", row.dataset.code === code);
       });
+      const selectedRow = latestRealtimeRows.find(row => row.code === code);
+      if (selectedRow) renderRealtimeBoard(selectedRow);
+      const chart = document.getElementById("realtimeTrendChart");
+      const notice = document.getElementById("realtimeTrendNotice");
+      if (chart) chart.innerHTML = `<text x="50%" y="50%" text-anchor="middle" class="chart-label">正在更新 ${code} 走勢...</text>`;
+      if (notice) notice.textContent = `正在更新 ${code} 走勢與儀表板...`;
       const data = await getJson(`/api/realtime-trend?code=${encodeURIComponent(code)}`);
       renderRealtimeTrend(data);
     }
@@ -5552,6 +5576,10 @@ INDEX_HTML = r"""<!doctype html>
       runAction(fetchRealtime, "正在刷新即時報價...");
       realtimeTimer = setInterval(() => runAction(fetchRealtime, "自動刷新即時報價..."), 30000);
       setStatus("已啟動 30 秒自動刷新。");
+    }
+    function ensureRealtimeAutoRefresh() {
+      if (realtimeTimer) return;
+      realtimeTimer = setInterval(() => runAction(fetchRealtime, "自動刷新即時報價..."), 30000);
     }
     function stopRealtime() {
       if (realtimeTimer) clearInterval(realtimeTimer);
@@ -5562,7 +5590,10 @@ INDEX_HTML = r"""<!doctype html>
       activatePage(pageId);
       if (navItem) navItem.classList.add("active");
       if (pageId === "strategyPage") runAction(fetchStrategy, "正在執行 AI 實操回測，可能需要約一分鐘...");
-      if (pageId === "realtimePage") runAction(fetchRealtime, "正在載入即時看盤...");
+      if (pageId === "realtimePage") {
+        runAction(fetchRealtime, "正在載入即時看盤...");
+        ensureRealtimeAutoRefresh();
+      }
       if (pageId === "watchPage") runAction(fetchWatch, "正在載入盤後看盤資料...");
       if (pageId === "signalsPage") runAction(fetchSignals, "正在載入訊號排行...");
       if (pageId === "rankingPage") runAction(fetchScan, "正在載入市場排行榜...");
