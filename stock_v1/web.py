@@ -84,7 +84,7 @@ def _make_handler(db_path: Path):
                 elif parsed.path == "/api/watch":
                     self._send_json(api_watch(db_path))
                 elif parsed.path == "/api/premarket":
-                    self._send_json(api_premarket(db_path, int(_param(params, "limit", "8"))))
+                    self._send_json(api_premarket(db_path, int(_param(params, "limit", "8")), _param(params, "force", "") == "1"))
                 elif parsed.path == "/api/ai-monitor":
                     self._send_json(api_ai_monitor(db_path))
                 elif parsed.path == "/api/ai-monitor-stock":
@@ -507,16 +507,17 @@ def api_strategy(db_path: Path) -> dict:
         else:
             result = run_daily_ai_ops(conn, INITIAL_CAPITAL)
         context = _strategy_market_context(conn, {"max_drawdown": result["summary"].get("max_drawdown")})
+    is_cloud = _cloud_web_mode()
     payload = {
         "summary": result["summary"],
         "strategy": result.get("strategy", {}),
         "market_context": context,
         "curve": result["curve"],
-        "recent_entries": result.get("recent_entries", [])[-10:],
-        "closed_trades": result.get("closed_trades", [])[-10:],
-        "recent_trades": result.get("recent_trades", [])[-10:],
-        "open_positions": result.get("open_positions", []),
-        "today_actions": result.get("today_actions", []),
+        "recent_entries": [] if is_cloud else result.get("recent_entries", [])[-10:],
+        "closed_trades": [] if is_cloud else result.get("closed_trades", [])[-10:],
+        "recent_trades": [] if is_cloud else result.get("recent_trades", [])[-10:],
+        "open_positions": [] if is_cloud else result.get("open_positions", []),
+        "today_actions": [] if is_cloud else result.get("today_actions", []),
         "high_win_strategy": {},
     }
     if len(_STRATEGY_CACHE) > 8:
@@ -544,7 +545,6 @@ def _cloud_strategy_backtest(conn: sqlite3.Connection) -> dict:
         "start_date": result["curve"][0]["date"] if result.get("curve") else result.get("start_date"),
         "tested_dates": result.get("tested_dates"),
         "trades": result["trades"],
-        "open_positions": result["open_positions"],
         "initial_capital": result["initial_capital"],
         "final_capital": result["final_capital"],
         "total_return": result["total_return"],
@@ -832,8 +832,8 @@ def api_watch(db_path: Path) -> dict:
     }
 
 
-def api_premarket(db_path: Path, limit: int = 8) -> dict:
-    snapshot = _premarket_snapshot()
+def api_premarket(db_path: Path, limit: int = 8, force: bool = False) -> dict:
+    snapshot = _premarket_snapshot(force=force)
     codes = _watchlist_codes(db_path)
     rows = api_watchlist(db_path, ",".join(codes)).get("watchlist", [])[:limit]
     news = fetch_market_news(max_items=12)
@@ -862,7 +862,7 @@ def api_ai_monitor(db_path: Path) -> dict:
                 "urgent": 0,
                 "watch": 0,
                 "positive": 0,
-                "message": "AI 盯盤只在台股盤中顯示。盤後請看觀察名單、AI 經理人與個股分析。",
+                "message": "AI 盯盤只在台股盤中顯示。",
                 **session,
             },
         }
@@ -874,7 +874,7 @@ def api_ai_monitor(db_path: Path) -> dict:
     result = build_ai_monitor(db_path)
     result["summary"] = {**result.get("summary", {}), **session}
     _AI_MONITOR_CACHE["data"] = result
-    _AI_MONITOR_CACHE["expires_at"] = datetime.now() + timedelta(seconds=25)
+    _AI_MONITOR_CACHE["expires_at"] = datetime.now() + timedelta(seconds=10)
     return result
 
 
@@ -3270,29 +3270,29 @@ def _premarket_snapshot(force: bool = False) -> dict:
         "summary": summary,
     }
     _PREMARKET_CACHE["data"] = result
-    _PREMARKET_CACHE["expires_at"] = datetime.now() + timedelta(minutes=45)
+    _PREMARKET_CACHE["expires_at"] = datetime.now() + timedelta(minutes=3)
     return result
 
 
 def _fetch_yahoo_snapshot(symbol: str) -> dict | None:
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=2d&interval=1d"
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=1d&interval=5m&includePrePost=true"
     request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urlopen(request, timeout=8) as response:
         payload = json.loads(response.read().decode("utf-8", errors="ignore"))
     result = ((payload.get("chart") or {}).get("result") or [None])[0]
     if not result:
         return None
+    meta = result.get("meta") or {}
     quote = ((result.get("indicators") or {}).get("quote") or [None])[0] or {}
     closes = [value for value in quote.get("close", []) if value is not None]
     timestamps = result.get("timestamp") or []
-    if len(closes) < 2:
-        meta = result.get("meta") or {}
-        regular = meta.get("regularMarketPrice")
-        previous = meta.get("chartPreviousClose") or meta.get("previousClose")
-        closes = [previous, regular] if previous and regular else closes
-    if len(closes) < 2:
+    latest = meta.get("regularMarketPrice") or (closes[-1] if closes else None)
+    previous = meta.get("chartPreviousClose") or meta.get("previousClose")
+    if previous in (None, 0) and len(closes) >= 2:
+        previous = closes[0]
+    if latest is None or previous in (None, 0):
         return None
-    previous, latest = float(closes[-2]), float(closes[-1])
+    previous, latest = float(previous), float(latest)
     change = latest - previous
     change_percent = change / previous * 100 if previous else None
     last_time = "-"
@@ -6287,7 +6287,7 @@ INDEX_HTML = r"""<!doctype html>
       <h1>台股智研 Pro</h1>
       <div class="subtitle">專業台股智能分析平台 · 訊號排行 · AI 經理人 · 風控紀律</div>
     </div>
-    <div class="version"><span id="range">載入中...</span> · UI v55</div>
+    <div class="version"><span id="range">載入中...</span> · UI v56</div>
   </header>
   <div class="app-shell">
     <aside class="sidebar">
@@ -6442,7 +6442,7 @@ INDEX_HTML = r"""<!doctype html>
           <span>整合美股期貨、費半、AI/半導體權值、台積 ADR、台股 ETF、匯率與 24H 新聞，預估早盤節奏。</span>
         </div>
         <div class="realtime-actions">
-          <button type="button" onclick="runAction(fetchPremarket, '正在更新盤前分析...')">刷新盤前分析</button>
+          <button type="button" onclick="runAction(() => fetchPremarket(true), '正在更新盤前分析...')">刷新盤前分析</button>
           <button type="button" onclick="showPage('realtimePage')">前往即時看盤</button>
         </div>
       </div>
@@ -6670,11 +6670,11 @@ INDEX_HTML = r"""<!doctype html>
         <h2>AI 經理人組合摘要</h2>
         <div class="content"><dl id="strategySummary"></dl></div>
       </section>
-      <section class="wide">
+      <section class="wide" data-strategy-section="open">
         <h2>AI 經理人未平倉</h2>
         <div class="table-wrap"><table id="strategyOpenTable"></table></div>
       </section>
-      <section class="wide">
+      <section class="wide" data-strategy-section="trades">
         <h2>AI 經理人買賣紀錄</h2>
         <div class="grid">
           <section>
@@ -6807,7 +6807,7 @@ INDEX_HTML = r"""<!doctype html>
     const rankListState = {};
     let latestCoverageContext = {};
     async function getJson(url) {
-      const response = await fetch(url);
+      const response = await fetch(url, { cache: "no-store" });
       const text = await response.text();
       if (!text.trim()) {
         throw new Error(`伺服器暫時沒有回應：${url}`);
@@ -6837,16 +6837,19 @@ INDEX_HTML = r"""<!doctype html>
       if (!cloudWebMode) return;
       document.body.classList.add("cloud-web-mode");
       document.querySelectorAll('[data-page="notifyPage"]').forEach(item => item.remove());
+      document.querySelectorAll('[data-page="guidePage"]').forEach(item => item.remove());
       const notifyPage = document.getElementById("notifyPage");
       if (notifyPage) notifyPage.remove();
+      const guidePage = document.getElementById("guidePage");
+      if (guidePage) guidePage.remove();
       const syncPushButton = Array.from(document.querySelectorAll("button")).find(button => button.textContent.trim() === "同步到推播");
       if (syncPushButton) syncPushButton.remove();
       replaceText("AI 經理人", "AI 回測");
-      replaceText("Telegram 盤中/盤後推播", "雲端資料查詢");
+      replaceText("與 Telegram 盤中/盤後推播", "");
       replaceText("提醒管道", "雲端模式");
       replaceText("Telegram", "網頁查詢");
       const subtitle = document.querySelector(".subtitle");
-      if (subtitle) subtitle.textContent = "專業台股智能分析平台 · 訊號排行 · AI 回測 · 風控紀律";
+      if (subtitle) subtitle.textContent = "專業台股智能分析平台 · 訊號排行 · AI 回測 · 盤前與即時看盤";
     }
     function replaceText(from, to) {
       const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
@@ -8019,7 +8022,6 @@ INDEX_HTML = r"""<!doctype html>
       const summary = data.summary || {};
       const strategy = data.strategy || {};
       const leaders = (context.leaders || []).slice(0, 8);
-      const m = context.metrics || {};
       const rules = (strategy.rules || []).map(rule => `<li>${rule}</li>`).join("");
       const rows = leaders.length ? leaders.map(row => `
         <tr>
@@ -8039,9 +8041,9 @@ INDEX_HTML = r"""<!doctype html>
           <div class="strategy-advice">
             <div class="advice-main">
               <strong>${strategy.name || "AI 風險調整動能策略"}｜${context.stance || "市場樣本"}｜${returnLabel}</strong>
-              <p>${strategy.description || "此頁呈現 AI 訊號策略的歷史回測，不做即時操盤或推播設定。"}</p>
+              <p>${strategy.description || "此頁呈現 AI 訊號策略的歷史回測。"}</p>
               <p><b>回測結論：</b>自 ${summary.start_date || "-"} 起，總報酬 ${fmt(summary.total_return)}%，勝率 ${fmt(summary.win_rate)}%，交易 ${fmt(summary.trades, 0)} 筆，最大回撤 ${fmt(summary.max_drawdown)}%。</p>
-              <p><b>基準：</b>${strategy.benchmark_note || "資金以 100 為基準指數化。"}</p>
+              <p><b>資金基準：</b>${strategy.benchmark_note || "資金以 100 為基準指數化。"}</p>
             </div>
             <div class="strategy-kpis">
               <div class="strategy-kpi"><span>交易筆數</span><strong>${fmt(summary.trades, 0)}</strong></div>
@@ -8071,10 +8073,6 @@ INDEX_HTML = r"""<!doctype html>
             <div class="manager-card">
               <h3>風險解讀</h3>
               <p>最大回撤 ${fmt(summary.max_drawdown)}%；中位數單筆 ${fmt(summary.median_trade_return)}%；最佳單筆 ${fmt(summary.best_trade)}%。</p>
-            </div>
-            <div class="manager-card">
-              <h3>限制</h3>
-              <p>回測只反映歷史資料，不代表未來績效；網頁版不提供 Telegram 推播設定。</p>
             </div>
           </div>
         </div>`;
@@ -9304,8 +9302,8 @@ INDEX_HTML = r"""<!doctype html>
         metric: row => `量比 ${fmt(row.volume_ratio)}`,
       });
     }
-    async function fetchPremarket() {
-      const data = await getJson("/api/premarket?limit=8");
+    async function fetchPremarket(force = false) {
+      const data = await getJson(`/api/premarket?limit=8${force ? "&force=1" : ""}&_=${Date.now()}`);
       const snapshot = data.snapshot || {};
       document.getElementById("premarketNotice").textContent =
         `${snapshot.prepared_at || "已更新"}｜${snapshot.stance || "資料不足"}｜${snapshot.summary || ""}`;
@@ -9321,7 +9319,7 @@ INDEX_HTML = r"""<!doctype html>
         ["早盤預估", snapshot.stance || "資料不足", `分數 ${fmt(snapshot.score, 0)}`],
         ["主要因子", `${fmt(factors.length, 0)} 項`, factors.slice(0, 2).map(item => item.name).join("、") || "暫無"],
         ["新聞風險", `${fmt(highNews, 0)} 則高影響`, `${fmt((news.items || []).length, 0)} 則已掃描`],
-        ["推播節奏", "08:30", cloudWebMode ? "網頁盤前分析，不提供推播設定" : "本機 Telegram 盤前報告"],
+        ["更新頻率", "3 分鐘", "自動刷新海外期貨、ADR、ETF 與新聞"],
       ].map(([label, value, note]) => `
         <div class="module-card"><strong>${value}</strong><span>${label}｜${note}</span></div>
       `).join("");
@@ -9360,14 +9358,8 @@ INDEX_HTML = r"""<!doctype html>
       const data = await getJson("/api/strategy");
       const s = data.summary;
       const summaryRows = cloudWebMode ? [
-        ["回測起始", s.start_date || "2026-05-01"],
-        ["基準資金", fmt(s.initial_capital)],
-        ["最大持股數", fmt(s.max_positions, 0)],
-        ["最長持有", `${fmt(s.horizon, 0)} 個交易日`],
-        ["檢查週期", `${fmt(s.step, 0)} 個交易日`],
-        ["測試期數", fmt(s.tested_dates, 0)],
+        ["回測起始", s.start_date || "-"],
         ["交易筆數", fmt(s.trades, 0)],
-        ["期末指數", fmt(s.final_capital)],
         ["總報酬", `${fmt(s.total_return)}%`],
         ["勝率", `${fmt(s.win_rate)}%`],
         ["平均單筆", `${fmt(s.avg_trade_return)}%`],
@@ -9391,9 +9383,14 @@ INDEX_HTML = r"""<!doctype html>
       if (overviewStrategy) renderDl(overviewStrategy, summaryRows);
       renderStrategyAdvice(document.getElementById("strategyAdvice"), data);
       renderStrategyStockCards(document.getElementById("strategyStockCards"), (data.market_context || {}).leaders || []);
-      renderStrategyEntries(document.getElementById("strategyEntriesTable"), data.recent_entries || []);
-      renderStrategyTrades(document.getElementById("strategyTradesTable"), data.closed_trades || data.recent_trades || []);
-      renderStrategyOpen(document.getElementById("strategyOpenTable"), data.open_positions || []);
+      document.querySelectorAll("[data-strategy-section]").forEach(section => {
+        section.style.display = cloudWebMode ? "none" : "";
+      });
+      if (!cloudWebMode) {
+        renderStrategyEntries(document.getElementById("strategyEntriesTable"), data.recent_entries || []);
+        renderStrategyTrades(document.getElementById("strategyTradesTable"), data.closed_trades || data.recent_trades || []);
+        renderStrategyOpen(document.getElementById("strategyOpenTable"), data.open_positions || []);
+      }
       renderCurve(document.getElementById("strategyCurveTable"), data.curve);
       renderLineChart(document.getElementById("equityChart"), data.curve, "capital");
     }
@@ -9405,9 +9402,11 @@ INDEX_HTML = r"""<!doctype html>
       const watchData = await getWatchlistData();
       const majors = watchData.watchlist || data.majors || [];
       renderMajors(document.getElementById("watchMajorsTable"), majors);
-      const modeText = currentUserKey
-        ? "個人模式：觀察名單會綁定你的使用者代碼，會同步到即時看盤與 Telegram 推播。"
-        : cloudWebMode ? "網頁版：觀察名單用於畫面與即時看盤，不提供 Telegram 推播設定。" : publicDemoMode ? "公開展示模式：觀察名單只存在此瀏覽器，不會影響主機與推播。" : "本機模式：觀察名單會保存在主機資料庫，會同步到即時看盤與既有推播設定。";
+      const modeText = cloudWebMode
+        ? "網頁版：觀察名單用於畫面、盤前分析與即時看盤。"
+        : currentUserKey
+          ? "個人模式：觀察名單會綁定你的使用者代碼，會同步到即時看盤與 Telegram 推播。"
+          : publicDemoMode ? "公開展示模式：觀察名單只存在此瀏覽器，不會影響主機與推播。" : "本機模式：觀察名單會保存在主機資料庫，會同步到即時看盤與既有推播設定。";
       document.getElementById("watchlistHint").textContent = `目前觀察 ${majors.length} 檔。可拖曳表格左側排序。${modeText}`;
       renderAfterHoursIndustryReport(document.getElementById("watchAfterSummary"), data.industry_after_report || {});
     }
@@ -9605,6 +9604,7 @@ INDEX_HTML = r"""<!doctype html>
       document.getElementById("notifyHint").textContent = "Telegram webhook 已更新。請到新 bot 輸入 /start 測試。";
     }
     let realtimeTimer = null;
+    let premarketTimer = null;
     let selectedRealtimeCode = "";
     let latestRealtimeRows = [];
     async function realtimeCodesFromWatchlist() {
@@ -9631,14 +9631,14 @@ INDEX_HTML = r"""<!doctype html>
         return;
       }
       const [data, monitor] = await Promise.all([
-        getJson(`/api/realtime?codes=${encodeURIComponent(codes)}`),
-        getJson("/api/ai-monitor"),
+        getJson(`/api/realtime?codes=${encodeURIComponent(codes)}&_=${Date.now()}`),
+        getJson(`/api/ai-monitor?_=${Date.now()}`),
       ]);
       const quotes = data.quotes || [];
       renderRealtime(document.getElementById("realtimeTable"), quotes);
       renderRealtimeMonitor(monitor);
       const alerts = data.large_order_alerts || [];
-      const alertText = alerts.length ? ` 已推播 ${alerts.length} 筆即時大單警報。` : "";
+      const alertText = alerts.length ? ` 偵測到 ${alerts.length} 筆即時大單。` : "";
       document.getElementById("realtimeNotice").textContent = `${data.message || "即時看盤資料已更新。"} 顯示 ${quotes.length} 檔。${alertText}`;
       if (quotes.length) {
         const nextCode = quotes.some(row => row.code === selectedRealtimeCode) ? selectedRealtimeCode : quotes[0].code;
@@ -9656,7 +9656,7 @@ INDEX_HTML = r"""<!doctype html>
         document.getElementById("aiMonitorSummary").innerHTML = `
           <div class="trade-callout">
             <strong>AI 盤中盯盤未啟動</strong>
-            <p>${m.message || "AI 盯盤只在台股盤中 09:00-13:30 顯示，盤後請看盤後看盤、股票探索與 AI 經理人。"}</p>
+            <p>${m.message || "AI 盯盤只在台股盤中 09:00-13:30 顯示。"}</p>
           </div>`;
         renderAiMonitor(document.getElementById("aiMonitorTable"), []);
         return;
@@ -9689,24 +9689,37 @@ INDEX_HTML = r"""<!doctype html>
     function startRealtime() {
       stopRealtime();
       runAction(fetchRealtime, "正在刷新即時報價...");
-      realtimeTimer = setInterval(() => runAction(fetchRealtime, "自動刷新即時報價..."), 30000);
-      setStatus("已啟動 30 秒自動刷新。");
+      realtimeTimer = setInterval(() => runAction(fetchRealtime, "自動刷新即時報價..."), 15000);
+      setStatus("已啟動 15 秒自動刷新。");
     }
     function ensureRealtimeAutoRefresh() {
       if (realtimeTimer) return;
-      realtimeTimer = setInterval(() => runAction(fetchRealtime, "自動刷新即時報價..."), 30000);
+      realtimeTimer = setInterval(() => runAction(fetchRealtime, "自動刷新即時報價..."), 15000);
     }
-    function stopRealtime() {
+    function stopRealtime(silent = false) {
       if (realtimeTimer) clearInterval(realtimeTimer);
       realtimeTimer = null;
-      setStatus("已停止自動刷新。");
+      if (!silent) setStatus("已停止自動刷新。");
+    }
+    function ensurePremarketAutoRefresh() {
+      if (premarketTimer) return;
+      premarketTimer = setInterval(() => runAction(() => fetchPremarket(false), "自動更新盤前分析..."), 180000);
+    }
+    function stopPremarket() {
+      if (premarketTimer) clearInterval(premarketTimer);
+      premarketTimer = null;
     }
     function showPage(pageId, navItem) {
       if (pageId === "signalsPage" || pageId === "rankingPage") pageId = "hubPage";
+      if (pageId !== "realtimePage") stopRealtime(true);
+      if (pageId !== "premarketPage") stopPremarket();
       activatePage(pageId);
       if (navItem) navItem.classList.add("active");
       if (pageId === "strategyPage") runAction(fetchStrategy, cloudWebMode ? "正在載入 AI 回測..." : "正在更新 AI 經理人決策...");
-      if (pageId === "premarketPage") runAction(fetchPremarket, "正在載入盤前分析...");
+      if (pageId === "premarketPage") {
+        runAction(() => fetchPremarket(true), "正在載入盤前分析...");
+        ensurePremarketAutoRefresh();
+      }
       if (pageId === "realtimePage") {
         runAction(fetchRealtime, "正在載入即時看盤...");
         ensureRealtimeAutoRefresh();
