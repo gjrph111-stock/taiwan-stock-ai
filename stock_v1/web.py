@@ -12,8 +12,7 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 from .ai_monitor import analyze_stock, build_ai_monitor
-from .ai_ops import INITIAL_CAPITAL, run_daily_ai_ops
-from .backtest import high_win_strategy_backtest
+from .ai_ops import INITIAL_CAPITAL, build_ai_ops_payload, run_daily_ai_ops
 from . import db
 from .config import DEFAULT_DB_PATH
 from .finmind import fetch_finmind_institutional, fetch_finmind_kbar, fetch_recent_finmind_prices
@@ -489,8 +488,10 @@ def api_strategy(db_path: Path) -> dict:
     if cache_key in _STRATEGY_CACHE:
         return _STRATEGY_CACHE[cache_key]
     with _connect(db_path) as conn:
-        result = run_daily_ai_ops(conn, INITIAL_CAPITAL)
-        high_win = high_win_strategy_backtest(conn, max_days=45)
+        if _public_demo_mode() or db_path.name == "tw_stocks_deploy.sqlite":
+            result = build_ai_ops_payload(conn, INITIAL_CAPITAL)
+        else:
+            result = run_daily_ai_ops(conn, INITIAL_CAPITAL)
         context = _strategy_market_context(conn, {"max_drawdown": result["summary"].get("max_drawdown")})
     payload = {
         "summary": result["summary"],
@@ -501,7 +502,7 @@ def api_strategy(db_path: Path) -> dict:
         "recent_trades": result.get("recent_trades", [])[-10:],
         "open_positions": result.get("open_positions", []),
         "today_actions": result.get("today_actions", []),
-        "high_win_strategy": high_win,
+        "high_win_strategy": {},
     }
     if len(_STRATEGY_CACHE) > 8:
         _STRATEGY_CACHE.clear()
@@ -5623,7 +5624,7 @@ INDEX_HTML = r"""<!doctype html>
       <h1>台股智研 Pro</h1>
       <div class="subtitle">專業台股智能分析平台 · 訊號排行 · AI 經理人 · 風控紀律</div>
     </div>
-    <div class="version"><span id="range">載入中...</span> · UI v49</div>
+    <div class="version"><span id="range">載入中...</span> · UI v50</div>
   </header>
   <div class="app-shell">
     <aside class="sidebar">
@@ -6111,7 +6112,16 @@ INDEX_HTML = r"""<!doctype html>
     let latestCoverageContext = {};
     async function getJson(url) {
       const response = await fetch(url);
-      const data = await response.json();
+      const text = await response.text();
+      if (!text.trim()) {
+        throw new Error(`伺服器暫時沒有回應：${url}`);
+      }
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch (error) {
+        throw new Error(`伺服器回傳格式異常：${url}`);
+      }
       if (!response.ok || data.error) throw new Error(data.error || "請求失敗");
       return data;
     }
