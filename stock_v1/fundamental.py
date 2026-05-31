@@ -9,6 +9,24 @@ from .names import short_name
 from .signals import risk_adjusted_score, score_stock
 
 
+def _latest_financial_profile(conn: sqlite3.Connection, code: str) -> dict:
+    try:
+        row = conn.execute(
+            """
+            SELECT stock_code, period, revenue, revenue_yoy, eps, gross_margin,
+                   operating_margin, roe, pe, pb, dividend_yield, source, summary
+            FROM financial_kpis
+            WHERE stock_code = ?
+            ORDER BY period DESC
+            LIMIT 1
+            """,
+            (code,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return {}
+    return dict(row) if row else {}
+
+
 def build_fundamental_analysis(db_path: Path = DEFAULT_DB_PATH, code: str = "2330") -> dict:
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
@@ -26,6 +44,7 @@ def build_fundamental_analysis(db_path: Path = DEFAULT_DB_PATH, code: str = "233
         ).fetchall()
         industry_stats = _industry_context(conn, stock, rows)
         industry = industry_profile(stock["code"], stock["name"], stock["industry"])
+        financial_profile = _latest_financial_profile(conn, stock["code"])
 
     if len(rows) < 80:
         return {
@@ -51,7 +70,7 @@ def build_fundamental_analysis(db_path: Path = DEFAULT_DB_PATH, code: str = "233
     market_profile = _market_profile(rows, closes, volumes, industry_stats, ret20, ret60, rsi14, volx)
     radar = _radar_metrics(closes, volumes, industry_stats, ret20, ret60, rsi14, volx, risk_score)
     peer_cards = _peer_cards(industry_stats)
-    summary = _research_summary(verdict, latest["close"], ma20, ma60, ret20, ret60, rsi14, volx, risk_score, radar, trend_stats, market_profile)
+    summary = _research_summary(verdict, latest["close"], ma20, ma60, ret20, ret60, rsi14, volx, risk_score, radar, trend_stats, market_profile, financial_profile)
 
     return {
         "code": stock["code"],
@@ -66,6 +85,7 @@ def build_fundamental_analysis(db_path: Path = DEFAULT_DB_PATH, code: str = "233
         "radar": radar,
         "summary": summary,
         "market_profile": market_profile,
+        "financial_profile": financial_profile,
         "trend_series": _trend_series(rows),
         "peer_cards": peer_cards,
         "yearly_stats": trend_stats["yearly"],
@@ -75,8 +95,8 @@ def build_fundamental_analysis(db_path: Path = DEFAULT_DB_PATH, code: str = "233
             _industry_section(stock, industry_stats, ret20, ret60, industry),
             _price_quality_section(trend_stats, radar),
             _peer_section(industry_stats),
-            _financial_health_section(market_profile, trend_stats),
-            _valuation_section(stock, industry_stats, market_profile),
+            _financial_health_section(market_profile, trend_stats, financial_profile),
+            _valuation_section(stock, industry_stats, market_profile, financial_profile),
             _chip_section(market_profile),
             _news_proxy_section(market_profile),
             _scenario_section(verdict, closes[-1], ma20, ma60, ret20, rsi14, volx),
@@ -136,7 +156,19 @@ def _industry_section(stock: sqlite3.Row, industry_stats: dict, ret20, ret60, in
     return {"title": "產業趨勢", "stance": industry_stats.get("relative_strength_label", "資料有限"), "points": points}
 
 
-def _financial_health_section(market_profile: dict, trend_stats: dict) -> dict:
+def _financial_health_section(market_profile: dict, trend_stats: dict, financial_profile: dict | None = None) -> dict:
+    financial_profile = financial_profile or {}
+    if financial_profile:
+        points = [
+            f"官方財報期間：{financial_profile.get('period') or '-'}，來源：{financial_profile.get('source') or '公開資料'}。",
+            f"EPS {financial_profile.get('eps'):.2f}、毛利率 {financial_profile.get('gross_margin'):.2f}%、營益率 {financial_profile.get('operating_margin'):.2f}%。" if financial_profile.get("eps") is not None and financial_profile.get("gross_margin") is not None else "EPS 或毛利率欄位仍需確認。",
+            f"ROE {financial_profile.get('roe'):.2f}%、營收年增率 {financial_profile.get('revenue_yoy'):.2f}%。" if financial_profile.get("roe") is not None and financial_profile.get("revenue_yoy") is not None else "ROE 或營收年增率欄位仍需確認。",
+        ]
+        return {
+            "title": "五年財務健康",
+            "stance": "官方財報已接入",
+            "points": points,
+        }
     yearly = trend_stats["yearly"]
     positive_years = sum(1 for item in yearly if item["return"] > 0)
     stance = "市場代理偏穩" if market_profile["stability_score"] >= 65 and positive_years >= max(1, len(yearly) // 2) else "需觀察"
@@ -183,7 +215,22 @@ def _peer_section(industry_stats: dict) -> dict:
     return {"title": "同業比較", "stance": industry_stats.get("relative_strength_label", "資料有限"), "points": points}
 
 
-def _valuation_section(stock: sqlite3.Row, industry_stats: dict, market_profile: dict) -> dict:
+def _valuation_section(stock: sqlite3.Row, industry_stats: dict, market_profile: dict, financial_profile: dict | None = None) -> dict:
+    financial_profile = financial_profile or {}
+    if financial_profile and (financial_profile.get("pe") is not None or financial_profile.get("pb") is not None):
+        pe = financial_profile.get("pe")
+        pb = financial_profile.get("pb")
+        dividend_yield = financial_profile.get("dividend_yield")
+        stance = "估值偏高" if pe and pe >= 35 else "估值偏低" if pe and pe <= 12 else "估值中性"
+        return {
+            "title": "估值分析",
+            "stance": stance,
+            "points": [
+                f"官方估值：PE {pe if pe is not None else '-'}、PB {pb if pb is not None else '-'}、殖利率 {dividend_yield if dividend_yield is not None else '-'}%。",
+                f"財報期間 {financial_profile.get('period') or '-'}，資料來源 {financial_profile.get('source') or '公開資料'}。",
+                "目前已使用官方 PE/PB/殖利率作相對估值；DCF 目標價仍需盈餘預測與折現率假設。",
+            ],
+        }
     heat = market_profile["valuation_heat"]
     if heat >= 75:
         stance = "估值熱度偏高"
@@ -269,7 +316,8 @@ def _decision_section(verdict: str, risk_score) -> dict:
     }
 
 
-def _research_summary(verdict: str, close, ma20, ma60, ret20, ret60, rsi14, volx, risk_score, radar: list[dict], trend_stats: dict, market_profile: dict) -> dict:
+def _research_summary(verdict: str, close, ma20, ma60, ret20, ret60, rsi14, volx, risk_score, radar: list[dict], trend_stats: dict, market_profile: dict, financial_profile: dict | None = None) -> dict:
+    financial_profile = financial_profile or {}
     radar_avg = mean([item["score"] for item in radar]) if radar else 0
     overall = round(radar_avg, 1)
     strongest = max(radar, key=lambda item: item["score"]) if radar else {"label": "無資料", "score": 0}
@@ -303,8 +351,14 @@ def _research_summary(verdict: str, close, ma20, ma60, ret20, ret60, rsi14, volx
         positives.append(f"60 日報酬 {ret60:.2f}%")
     if not positives:
         positives.append("等待趨勢重新轉強")
-    data_quality = 78
-    data_gaps = ["EPS/PE 真值", "月營收", "法人買賣超", "新聞文字情緒"]
+    data_quality = 92 if financial_profile else 78
+    data_gaps = []
+    if not financial_profile:
+        data_gaps.extend(["官方 EPS/PE", "月營收"])
+    if financial_profile and financial_profile.get("eps") is not None:
+        positives.append(f"官方 EPS {financial_profile.get('eps')}")
+    if financial_profile and financial_profile.get("revenue_yoy") is not None:
+        positives.append(f"月營收年增 {financial_profile.get('revenue_yoy'):.2f}%")
     return {
         "overall_score": overall,
         "action": action,
@@ -319,7 +373,7 @@ def _research_summary(verdict: str, close, ma20, ma60, ret20, ret60, rsi14, volx
             "收盤是否守住 20 日線",
             "量比是否回到 1 以上",
             "是否強於同產業平均",
-            f"估值熱度是否維持在 {market_profile['valuation_heat']:.0f} 分以下",
+            f"PE 是否維持在 {financial_profile.get('pe')}" if financial_profile and financial_profile.get("pe") is not None else f"估值熱度是否維持在 {market_profile['valuation_heat']:.0f} 分以下",
         ],
     }
 

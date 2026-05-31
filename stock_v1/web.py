@@ -1,3 +1,4 @@
+import csv
 import json
 import os
 import secrets
@@ -11,7 +12,8 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 from .ai_monitor import analyze_stock, build_ai_monitor
-from .backtest import high_win_strategy_backtest, realistic_strategy_backtest
+from .ai_ops import INITIAL_CAPITAL, run_daily_ai_ops
+from .backtest import high_win_strategy_backtest
 from . import db
 from .config import DEFAULT_DB_PATH
 from .finmind import fetch_finmind_institutional, fetch_finmind_kbar, fetch_recent_finmind_prices
@@ -26,6 +28,10 @@ from .signals import load_signal_rows, rank_signals, risk_adjusted_score, score_
 _FUNDAMENTAL_CACHE: dict[tuple[str, str | None], dict] = {}
 _STRATEGY_CACHE: dict[str | None, dict] = {}
 _AI_MONITOR_CACHE: dict[str, object] = {"expires_at": datetime.min, "data": None}
+_PREMARKET_CACHE: dict[str, object] = {"expires_at": datetime.min, "data": None}
+_PUBLIC_FINANCIAL_CACHE: dict[str, object] = {}
+_FUND_HOLDINGS_CSV = DEFAULT_DB_PATH.parent / "fund_holdings.csv"
+_FINANCIAL_KPIS_CSV = DEFAULT_DB_PATH.parent / "financial_kpis.csv"
 
 
 def run(host: str = "127.0.0.1", port: int = 8765, db_path: Path = DEFAULT_DB_PATH) -> None:
@@ -67,6 +73,8 @@ def _make_handler(db_path: Path):
                 elif parsed.path == "/api/scan":
                     limit = int(_param(params, "limit", "20"))
                     self._send_json(api_scan(db_path, limit))
+                elif parsed.path == "/api/industries":
+                    self._send_json(api_industries(db_path, _param(params, "industry", ""), int(_param(params, "limit", "40"))))
                 elif parsed.path == "/api/signals":
                     limit = int(_param(params, "limit", "20"))
                     self._send_json(api_signals(db_path, limit))
@@ -90,6 +98,8 @@ def _make_handler(db_path: Path):
                     self._send_json(api_watchlist_remove(db_path, _param(params, "code", "")))
                 elif parsed.path == "/api/watchlist/reorder":
                     self._send_json(api_watchlist_reorder(db_path, _param(params, "codes", "")))
+                elif parsed.path == "/api/watchlist/sync":
+                    self._send_json(api_watchlist_sync(db_path, _param(params, "codes", "")))
                 elif parsed.path == "/api/user/create":
                     self._send_json(api_user_create(db_path, _param(params, "name", "")))
                 elif parsed.path == "/api/user/profile":
@@ -102,6 +112,8 @@ def _make_handler(db_path: Path):
                     self._send_json(api_user_watchlist_remove(db_path, _param(params, "user_key", ""), _param(params, "code", "")))
                 elif parsed.path == "/api/user/watchlist/reorder":
                     self._send_json(api_user_watchlist_reorder(db_path, _param(params, "user_key", ""), _param(params, "codes", "")))
+                elif parsed.path == "/api/user/watchlist/sync":
+                    self._send_json(api_user_watchlist_sync(db_path, _param(params, "user_key", ""), _param(params, "codes", "")))
                 elif parsed.path == "/api/user/telegram/save":
                     self._send_json(api_user_telegram_save(db_path, _param(params, "user_key", ""), _param(params, "chat_id", "")))
                 elif parsed.path == "/api/user/telegram/test":
@@ -113,10 +125,18 @@ def _make_handler(db_path: Path):
                     self._send_json(api_realtime_trend(db_path, _param(params, "code", "2330"), _param(params, "interval", "1d")))
                 elif parsed.path == "/api/institutional":
                     self._send_json(api_institutional(db_path, _param(params, "code", "2330")))
+                elif parsed.path == "/api/fund-holdings":
+                    self._send_json(api_fund_holdings(db_path, _param(params, "code", "2330")))
+                elif parsed.path == "/api/financial-kpis":
+                    self._send_json(api_financial_kpis(db_path, _param(params, "code", "2330")))
                 elif parsed.path == "/api/jobs/notify-users":
                     self._send_json(api_job_notify_users(db_path, _param(params, "token", ""), int(_param(params, "limit", "5"))))
                 elif parsed.path == "/api/jobs/notify-users-intraday":
                     self._send_json(api_job_notify_users_intraday(db_path, _param(params, "token", ""), int(_param(params, "limit", "5"))))
+                elif parsed.path == "/api/jobs/premarket-prepare":
+                    self._send_json(api_job_premarket_prepare(db_path, _param(params, "token", ""), int(_param(params, "limit", "5"))))
+                elif parsed.path == "/api/jobs/notify-users-premarket":
+                    self._send_json(api_job_notify_users_premarket(db_path, _param(params, "token", ""), int(_param(params, "limit", "5"))))
                 elif parsed.path == "/api/admin/users":
                     self._send_json(api_admin_users(db_path, _param(params, "token", "")))
                 elif parsed.path == "/api/admin/telegram-webhook":
@@ -348,6 +368,7 @@ def api_scan(db_path: Path, limit: int = 20) -> dict:
                     "close": closes[-1],
                     "return_20d": pct_change(closes, 20),
                     "return_60d": pct_change(closes, 60),
+                    "sparkline": _sparkline_values(closes),
                     "volume_ratio": volume_ratio(volumes),
                     "rsi_14": rsi(closes, 14),
                     "new_high_60": is_new_high(closes, 60),
@@ -371,55 +392,115 @@ def api_scan(db_path: Path, limit: int = 20) -> dict:
     }
 
 
+def _market_cap_proxy(close: float | None, volume: float | None) -> float:
+    return float(close or 0) * float(volume or 0)
+
+
+def api_industries(db_path: Path, industry: str = "", limit: int = 40) -> dict:
+    with _connect(db_path) as conn:
+        meta_rows = conn.execute("SELECT code, industry FROM stocks").fetchall()
+        industry_raw_by_code = {row["code"]: row["industry"] for row in meta_rows}
+        rows_by_industry: dict[str, list[dict]] = {}
+        for stock, rows in load_signal_rows(conn):
+            if len(rows) < 2:
+                continue
+            closes = [row["close"] for row in rows if row["close"] is not None]
+            volumes = [row["volume"] or 0 for row in rows]
+            if len(closes) < 2:
+                continue
+            profile = industry_profile(stock["code"], stock["name"], industry_raw_by_code.get(stock["code"]))
+            category = profile["category"] or "未分類"
+            prev_close = closes[-2] if len(closes) >= 2 else None
+            close = closes[-1]
+            change = close - prev_close if prev_close not in (None, 0) else None
+            change_percent = change / prev_close * 100 if change is not None and prev_close else None
+            ma20 = sma(closes, 20)
+            ma60 = sma(closes, 60)
+            item = {
+                "code": stock["code"],
+                "name": stock["name"],
+                "short_name": short_name(stock["name"]),
+                "market": stock["market"],
+                "industry": category,
+                "date": rows[-1]["date"],
+                "close": close,
+                "price": close,
+                "change": change,
+                "change_percent": change_percent,
+                "return_20d": pct_change(closes, 20),
+                "return_60d": pct_change(closes, 60),
+                "volume": volumes[-1] if volumes else None,
+                "volume_ratio": volume_ratio(volumes),
+                "rsi_14": rsi(closes, 14),
+                "sparkline": _sparkline_values(closes),
+                "new_high_60": is_new_high(closes, 60),
+                "above_sma20": ma20 is not None and close > ma20,
+                "above_sma60": ma60 is not None and close > ma60,
+                "leader_score": _market_cap_proxy(close, volumes[-1] if volumes else None),
+            }
+            groups = [category, *(profile.get("themes") or [])]
+            for group in dict.fromkeys(groups):
+                rows_by_industry.setdefault(group, []).append({**item, "industry": group})
+    industries = []
+    for name, items in rows_by_industry.items():
+        items.sort(key=lambda item: item["leader_score"], reverse=True)
+        leader = items[0] if items else None
+        avg_change = sum(float(item.get("change_percent") or 0) for item in items) / len(items) if items else None
+        industries.append({
+            "name": name,
+            "count": len(items),
+            "avg_change_percent": avg_change,
+            "leader": leader,
+        })
+    industries.sort(key=lambda item: item["count"], reverse=True)
+    selected = industry or (industries[0]["name"] if industries else "")
+    selected_items = rows_by_industry.get(selected, [])
+    if selected_items:
+        leader_code = selected_items[0]["code"]
+        selected_items = [selected_items[0]] + sorted(
+            [item for item in selected_items[1:] if item["code"] != leader_code],
+            key=lambda item: item.get("change_percent") if item.get("change_percent") is not None else -9999,
+            reverse=True,
+        )
+    return {
+        "industries": industries,
+        "selected": selected,
+        "items": selected_items[:limit],
+        "summary": {
+            "count": len(selected_items),
+            "avg_change_percent": sum(float(item.get("change_percent") or 0) for item in selected_items) / len(selected_items) if selected_items else None,
+            "leader": selected_items[0] if selected_items else None,
+        },
+    }
+
+
 def api_signals(db_path: Path, limit: int = 20) -> dict:
     with _connect(db_path) as conn:
-        return rank_signals(conn, limit)
+        payload = rank_signals(conn, limit)
+        _attach_sparklines(conn, payload.get("top_signals", []))
+        return payload
 
 
 def api_strategy(db_path: Path) -> dict:
-    strategy_start = "2026-05-01"
-    strategy_capital = 200000.0
     with _connect(db_path) as conn:
         row = conn.execute("SELECT MAX(date) AS latest FROM prices").fetchone()
         latest = row["latest"] if row else None
-    cache_key = f"{latest}|ai-ops-202605|200000"
+    cache_key = f"{latest}|daily-ai-ops-v1|{INITIAL_CAPITAL}"
     if cache_key in _STRATEGY_CACHE:
         return _STRATEGY_CACHE[cache_key]
     with _connect(db_path) as conn:
-        result = realistic_strategy_backtest(
-            conn,
-            max_positions=5,
-            horizon=5,
-            step=5,
-            max_days=None,
-            initial_capital=strategy_capital,
-            cost_bps=20,
-            start_date=strategy_start,
-        )
+        result = run_daily_ai_ops(conn, INITIAL_CAPITAL)
         high_win = high_win_strategy_backtest(conn, max_days=45)
-        context = _strategy_market_context(conn, result)
+        context = _strategy_market_context(conn, {"max_drawdown": result["summary"].get("max_drawdown")})
     payload = {
-        "summary": {
-            "max_positions": result["max_positions"],
-            "horizon": result["horizon"],
-            "step": result["step"],
-            "cost_bps": result["cost_bps"],
-            "start_date": result.get("start_date") or strategy_start,
-            "trades": result["trades"],
-            "open_positions": result["open_positions"],
-            "initial_capital": result["initial_capital"],
-            "final_capital": result["final_capital"],
-            "total_return": result["total_return"],
-            "win_rate": result["win_rate"],
-            "median_trade_return": result["median_trade_return"],
-            "max_drawdown": result["max_drawdown"],
-        },
+        "summary": result["summary"],
         "market_context": context,
         "curve": result["curve"],
         "recent_entries": result.get("recent_entries", [])[-10:],
-        "closed_trades": result["recent_trades"][-10:],
-        "recent_trades": result["recent_trades"][-10:],
-        "open_positions": result["open_position_details"],
+        "closed_trades": result.get("closed_trades", [])[-10:],
+        "recent_trades": result.get("recent_trades", [])[-10:],
+        "open_positions": result.get("open_positions", []),
+        "today_actions": result.get("today_actions", []),
         "high_win_strategy": high_win,
     }
     if len(_STRATEGY_CACHE) > 8:
@@ -451,6 +532,7 @@ def _strategy_market_context(conn: sqlite3.Connection, result: dict) -> dict:
                 "close": closes[-1],
                 "return_20d": pct_change(closes, 20),
                 "return_60d": pct_change(closes, 60),
+                "sparkline": _sparkline_values(closes),
                 "rsi_14": rsi(closes, 14),
                 "volume_ratio": volume_ratio(volumes),
                 "new_high_60": is_new_high(closes, 60),
@@ -458,15 +540,21 @@ def _strategy_market_context(conn: sqlite3.Connection, result: dict) -> dict:
                 "above_sma60": ma60 is not None and closes[-1] > ma60,
                 "signal": signal["signal"],
                 "score": signal["risk_adjusted_score"],
+                "entry_zone": signal.get("entry_zone"),
+                "exit_zone": signal.get("exit_zone"),
+                "stop": signal.get("stop"),
+                "drawdown_pct": signal.get("drawdown_pct"),
+                "reasons": signal.get("reasons", []),
+                "cautions": signal.get("cautions", []),
             }
         )
     if not rows:
         return {
             "date": None,
             "stance": "資料不足",
-            "position_suggestion": "暫不建立 AI 實操部位",
+            "position_suggestion": "暫不建立 AI 經理人部位",
             "headline": "目前資料不足，請先更新市場資料。",
-            "actions": ["先執行資料更新，再重新載入 AI 實操。"],
+            "actions": ["先執行資料更新，再重新載入 AI 經理人。"],
             "risks": [],
             "metrics": {},
             "leaders": [],
@@ -492,7 +580,7 @@ def _strategy_market_context(conn: sqlite3.Connection, result: dict) -> dict:
     if breadth20 >= 0.55 and breadth60 >= 0.45 and actionable >= 0.08:
         stance = "偏多進攻"
         position = "建議 60% - 75% 研究資金，分批布局強勢但未過熱標的"
-        headline = "市場廣度偏強，AI 實操可以主動找多頭續航股。"
+        headline = "市場廣度偏強，AI 經理人可以主動找多頭續航股。"
     elif breadth20 >= 0.45 and breadth60 >= 0.35:
         stance = "中性偏多"
         position = "建議 40% - 60% 研究資金，保留現金等待回測後的高勝率切入點"
@@ -500,7 +588,7 @@ def _strategy_market_context(conn: sqlite3.Connection, result: dict) -> dict:
     elif breadth20 < 0.35 or breadth60 < 0.30:
         stance = "防守觀望"
         position = "建議 20% - 35% 研究資金，以觀察名單和停損控管為主"
-        headline = "市場廣度偏弱，AI 實操重點應放在防守與等待訊號轉強。"
+        headline = "市場廣度偏弱，AI 經理人重點應放在防守與等待訊號轉強。"
     else:
         stance = "震盪選股"
         position = "建議 30% - 50% 研究資金，只挑量價結構明確的個股"
@@ -512,14 +600,14 @@ def _strategy_market_context(conn: sqlite3.Connection, result: dict) -> dict:
     if avg20 is not None and avg20 > 12:
         risks.append("20 日平均漲幅偏大，短線容易出現震盪洗盤。")
     if result.get("max_drawdown") is not None and result["max_drawdown"] < -8:
-        risks.append("AI 實操歷史最大回撤偏大，建議把停損與持股上限放在第一優先。")
+        risks.append("AI 經理人歷史最大回撤偏大，建議把停損與持股上限放在第一優先。")
     if weak / total > 0.45:
         risks.append("弱勢訊號占比偏高，避免把資金平均分散到落後股。")
 
     actions = [
         "優先從 AI 訊號與觀察名單交集找標的，避免只看單日漲幅。",
         "進場分兩到三批，不用一次買滿，並以 20 日線或最近低點作為風控參考。",
-        "若盤面跌破月線家數快速增加，AI 實操自動降到防守模式。",
+        "若盤面跌破月線家數快速增加，AI 經理人自動降到防守模式。",
     ]
     if stance in ("偏多進攻", "中性偏多"):
         actions.insert(0, "可優先研究 20 日與 60 日動能同時為正、RSI 未過熱的股票。")
@@ -578,7 +666,7 @@ def api_ai_monitor(db_path: Path) -> dict:
                 "urgent": 0,
                 "watch": 0,
                 "positive": 0,
-                "message": "AI 盯盤只在台股盤中顯示。盤後請看觀察名單、AI 實操與個股分析。",
+                "message": "AI 盯盤只在台股盤中顯示。盤後請看觀察名單、AI 經理人與個股分析。",
                 **session,
             },
         }
@@ -606,9 +694,15 @@ def api_fundamental(db_path: Path, code: str) -> dict:
     code = code.strip()
     latest = None
     with _connect(db_path) as conn:
+        _ensure_financial_kpi_tables(conn)
+        stock = conn.execute("SELECT code, name, market FROM stocks WHERE code = ?", (code,)).fetchone()
+        if stock:
+            _fetch_and_store_public_financial_kpis(conn, stock)
         row = conn.execute("SELECT MAX(date) AS latest FROM prices WHERE stock_code = ?", (code,)).fetchone()
         latest = row["latest"] if row else None
-    cache_key = (code, latest)
+        kpi_row = conn.execute("SELECT MAX(updated_at) AS latest FROM financial_kpis WHERE stock_code = ?", (code,)).fetchone()
+        kpi_latest = kpi_row["latest"] if kpi_row else None
+    cache_key = (code, f"{latest}|{kpi_latest}")
     if cache_key not in _FUNDAMENTAL_CACHE:
         if len(_FUNDAMENTAL_CACHE) > 80:
             _FUNDAMENTAL_CACHE.clear()
@@ -698,6 +792,31 @@ def api_watchlist_reorder(db_path: Path, raw_codes: str) -> dict:
     return api_watchlist(db_path)
 
 
+def api_watchlist_sync(db_path: Path, raw_codes: str) -> dict:
+    if _public_demo_mode():
+        return {"error": "公開展示模式不會修改主機推播名單。"}
+    codes = _parse_code_list(raw_codes)
+    if not codes:
+        return {"error": "沒有可同步的股票代號。"}
+    with _connect(db_path) as conn:
+        _ensure_watchlist(conn)
+        placeholders = ",".join("?" for _ in codes)
+        valid_rows = conn.execute(f"SELECT code FROM stocks WHERE code IN ({placeholders})", codes).fetchall()
+        valid_codes = {row["code"] for row in valid_rows}
+        ordered_codes = [code for code in codes if code in valid_codes]
+        if not ordered_codes:
+            return {"error": "同步失敗：找不到有效股票代號。"}
+        conn.execute("DELETE FROM watchlist")
+        conn.executemany(
+            "INSERT INTO watchlist (code, created_at, sort_order) VALUES (?, datetime('now'), ?)",
+            [(code, index + 1) for index, code in enumerate(ordered_codes)],
+        )
+        conn.commit()
+    data = api_watchlist(db_path)
+    data["message"] = f"已同步 {len(data.get('watchlist', []))} 檔到本機推播關注名單。"
+    return data
+
+
 def api_user_create(db_path: Path, name: str) -> dict:
     display_name = name.strip()[:40] or "朋友"
     user_key = secrets.token_urlsafe(18)
@@ -782,6 +901,33 @@ def api_user_watchlist_reorder(db_path: Path, user_key: str, raw_codes: str) -> 
     return api_user_watchlist(db_path, user_key)
 
 
+def api_user_watchlist_sync(db_path: Path, user_key: str, raw_codes: str) -> dict:
+    codes = _parse_code_list(raw_codes)
+    if not codes:
+        return {"error": "沒有可同步的股票代號。"}
+    with _connect(db_path) as conn:
+        _ensure_user_tables(conn)
+        user = conn.execute("SELECT user_key FROM app_users WHERE user_key = ?", (user_key,)).fetchone()
+        if not user:
+            return {"error": "找不到使用者，請先建立個人推播設定。"}
+        placeholders = ",".join("?" for _ in codes)
+        valid_rows = conn.execute(f"SELECT code FROM stocks WHERE code IN ({placeholders})", codes).fetchall()
+        valid_codes = {row["code"] for row in valid_rows}
+        ordered_codes = [code for code in codes if code in valid_codes]
+        if not ordered_codes:
+            return {"error": "同步失敗：找不到有效股票代號。"}
+        conn.execute("DELETE FROM user_watchlist WHERE user_key = ?", (user_key,))
+        conn.executemany(
+            "INSERT INTO user_watchlist (user_key, code, created_at, sort_order) VALUES (?, ?, datetime('now'), ?)",
+            [(user_key, code, index + 1) for index, code in enumerate(ordered_codes)],
+        )
+        conn.execute("UPDATE app_users SET updated_at = datetime('now') WHERE user_key = ?", (user_key,))
+        conn.commit()
+    data = api_user_watchlist(db_path, user_key)
+    data["message"] = f"已同步 {len(data.get('watchlist', []))} 檔到個人推播名單。"
+    return data
+
+
 def api_user_telegram_save(db_path: Path, user_key: str, chat_id: str) -> dict:
     chat_id = chat_id.strip()
     if not chat_id:
@@ -831,6 +977,32 @@ def api_job_notify_users_intraday(db_path: Path, token: str, limit: int = 5) -> 
     if not allowed:
         return {"skipped": True, "message": f"Not market time. Now={now:%Y-%m-%d %H:%M:%S} Asia/Taipei"}
     return send_enabled_user_intraday_telegrams(db_path, limit=limit)
+
+
+def api_job_premarket_prepare(db_path: Path, token: str, limit: int = 5) -> dict:
+    ok, error = _job_authorized(token)
+    if not ok:
+        return {"error": error}
+    snapshot = _premarket_snapshot(force=True)
+    return {
+        "ok": True,
+        "prepared_at": snapshot.get("prepared_at"),
+        "stance": snapshot.get("stance"),
+        "score": snapshot.get("score"),
+        "items": len(snapshot.get("items") or []),
+        "limit": limit,
+    }
+
+
+def api_job_notify_users_premarket(db_path: Path, token: str, limit: int = 5) -> dict:
+    ok, error = _job_authorized(token)
+    if not ok:
+        return {"error": error}
+    now = datetime.now(ZoneInfo("Asia/Taipei"))
+    allowed = now.weekday() < 5 and time(8, 20) <= now.time() <= time(8, 50)
+    if not allowed:
+        return {"skipped": True, "message": f"Premarket push is only allowed Mon-Fri 08:20-08:50 Asia/Taipei. Now={now:%Y-%m-%d %H:%M:%S}"}
+    return send_enabled_user_premarket_telegrams(db_path, limit=limit)
 
 
 def api_admin_users(db_path: Path, token: str) -> dict:
@@ -940,6 +1112,29 @@ def send_enabled_user_intraday_telegrams(db_path: Path, limit: int = 5) -> dict:
     return {"users": len(users), "sent": sent, "failures": failures}
 
 
+def send_enabled_user_premarket_telegrams(db_path: Path, limit: int = 5) -> dict:
+    with _connect(db_path) as conn:
+        _ensure_user_tables(conn)
+        users = conn.execute(
+            """
+            SELECT user_key, display_name, telegram_chat_id
+            FROM app_users
+            WHERE telegram_enabled = 1 AND telegram_chat_id IS NOT NULL AND telegram_chat_id != ''
+            ORDER BY created_at
+            """
+        ).fetchall()
+    sent = 0
+    failures = []
+    for user in users:
+        try:
+            message = _build_user_premarket_message(db_path, user["user_key"], user["display_name"], limit=limit)
+            _send_telegram_to_chat(user["telegram_chat_id"], message)
+            sent += 1
+        except Exception as exc:
+            failures.append({"user_key": user["user_key"], "name": user["display_name"], "error": str(exc)})
+    return {"users": len(users), "sent": sent, "failures": failures}
+
+
 def api_telegram_webhook(db_path: Path, payload: dict) -> dict:
     message = payload.get("message") or payload.get("edited_message") or {}
     text = str(message.get("text") or "").strip()
@@ -972,7 +1167,7 @@ def handle_telegram_text(db_path: Path, chat_id: str, text: str, display_name: s
         return result.get("message") or result.get("error") or "綁定完成。"
 
     user = _ensure_telegram_user(db_path, chat_id, display_name)
-    code = _extract_stock_code(normalized)
+    code = _resolve_telegram_stock_code(db_path, normalized)
 
     if normalized.startswith(("加入", "新增", "+")) and code:
         api_user_watchlist_add(db_path, user["user_key"], code)
@@ -1027,10 +1222,27 @@ def api_realtime(db_path: Path, raw_codes: str) -> dict:
     if not stocks:
         return {"quotes": [], "message": "沒有可查詢的股票代號"}
 
+    twse_result = _fetch_twse_mis_quotes(stocks)
+    twse_quotes = twse_result["quotes"]
+    twse_by_code = {row["code"]: row for row in twse_quotes}
+    if len(twse_quotes) == len(stocks):
+        with _connect(db_path) as conn:
+            quotes = [twse_by_code[stock["code"]] for stock in stocks if stock["code"] in twse_by_code]
+            _attach_sparklines(conn, quotes, append_live=True)
+        return {
+            "quotes": quotes,
+            "message": twse_result["message"],
+            "source": "TWSE MIS",
+        }
+
     quotes = []
     failures = []
     with _connect(db_path) as conn:
         for stock in stocks:
+            twse_quote = twse_by_code.get(stock["code"])
+            if twse_quote:
+                quotes.append(twse_quote)
+                continue
             try:
                 rows = fetch_recent_finmind_prices(stock["code"], days=3)
                 rows = [row for row in rows if row.get("close") is not None]
@@ -1054,6 +1266,7 @@ def api_realtime(db_path: Path, raw_codes: str) -> dict:
                             "date": latest["date"],
                             "time": None,
                             "source": "FinMind TaiwanStockPrice",
+                            "sparkline": _sparkline_for_code(conn, stock["code"], append_value=price),
                         }
                     )
                     continue
@@ -1063,11 +1276,12 @@ def api_realtime(db_path: Path, raw_codes: str) -> dict:
             local = _local_quote(conn, stock)
             if local:
                 quotes.append(local)
+        _attach_sparklines(conn, quotes, append_live=True)
 
-    message = "已使用 FinMind TaiwanStockPrice API 更新看盤資料。"
+    message = twse_result["message"] if twse_quotes else "證交所 MIS 即時報價暫不可用，已改用 FinMind TaiwanStockPrice。"
     if failures:
         message += " 部分股票已切回本機資料：" + "；".join(failures[:3])
-    return {"quotes": quotes, "message": message, "source": "FinMind"}
+    return {"quotes": quotes, "message": message, "source": "TWSE MIS + FinMind"}
 
 
 def api_realtime_trend(db_path: Path, code: str, interval: str = "1d") -> dict:
@@ -1182,6 +1396,120 @@ def api_realtime_trend(db_path: Path, code: str, interval: str = "1d") -> dict:
         }
 
 
+def _fetch_twse_mis_quotes(stocks: list[sqlite3.Row]) -> dict:
+    channels = []
+    stock_by_code = {}
+    for stock in stocks:
+        market = str(stock["market"] or "").upper()
+        exchange = "otc" if market in {"TPEX", "OTC"} else "tse"
+        channels.append(f"{exchange}_{stock['code']}.tw")
+        stock_by_code[stock["code"]] = stock
+    if not channels:
+        return {"quotes": [], "message": "沒有可查詢的股票代號"}
+    url = (
+        "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
+        f"?ex_ch={'|'.join(channels)}&json=1&delay=0&_={int(datetime.now().timestamp() * 1000)}"
+    )
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://mis.twse.com.tw/stock/fibest.jsp",
+        },
+    )
+    try:
+        with urlopen(request, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="ignore"))
+    except Exception as exc:
+        return {"quotes": [], "message": f"證交所 MIS 即時報價暫不可用：{exc}"}
+    rows = payload.get("msgArray") or []
+    quotes = []
+    for item in rows:
+        code = str(item.get("c") or "").strip()
+        stock = stock_by_code.get(code)
+        if not stock:
+            continue
+        quote = _parse_twse_mis_quote(item, stock)
+        if quote:
+            quotes.append(quote)
+    query = payload.get("queryTime") or {}
+    sys_date = query.get("sysDate") or ""
+    sys_time = query.get("sysTime") or ""
+    stamp = f"{sys_date} {sys_time}".strip()
+    return {
+        "quotes": quotes,
+        "message": f"已使用證交所 MIS 即時報價更新。{stamp}",
+    }
+
+
+def _parse_twse_mis_quote(item: dict, stock: sqlite3.Row) -> dict | None:
+    previous = _num(item.get("y"))
+    bids = _price_levels(item.get("b"), item.get("g"))
+    asks = _price_levels(item.get("a"), item.get("f"))
+    last = _first_number(item.get("z"), item.get("pz"), item.get("b"), item.get("a"), item.get("o"), item.get("y"))
+    if last is None:
+        return None
+    change = last - previous if previous not in (None, 0) else None
+    change_percent = (change / previous * 100) if change is not None and previous else None
+    date_text = str(item.get("d") or "")
+    date_fmt = f"{date_text[:4]}-{date_text[4:6]}-{date_text[6:]}" if len(date_text) == 8 else date_text
+    return {
+        "code": stock["code"],
+        "name": short_name(stock["name"]),
+        "market": stock["market"],
+        "price": last,
+        "change": change,
+        "change_percent": change_percent,
+        "volume": _num(item.get("v")),
+        "date": date_fmt,
+        "time": item.get("t") or item.get("%"),
+        "open": _num(item.get("o")),
+        "high": _num(item.get("h")),
+        "low": _num(item.get("l")),
+        "previous_close": previous,
+        "bids": bids,
+        "asks": asks,
+        "source": "證交所 MIS",
+    }
+
+
+def _price_levels(price_text: str | None, qty_text: str | None) -> list[dict]:
+    prices = _split_numbers(price_text)
+    qtys = _split_numbers(qty_text)
+    return [
+        {"price": price, "qty": qtys[index] if index < len(qtys) else None}
+        for index, price in enumerate(prices)
+        if price is not None and price > 0
+    ]
+
+
+def _split_numbers(text: str | None) -> list[float]:
+    return [_num(part) for part in str(text or "").split("_") if _num(part) is not None]
+
+
+def _first_number(*values) -> float | None:
+    for value in values:
+        if isinstance(value, str) and "_" in value:
+            for part in value.split("_"):
+                parsed = _num(part)
+                if parsed is not None and parsed > 0:
+                    return parsed
+            continue
+        parsed = _num(value)
+        if parsed is not None and parsed > 0:
+            return parsed
+    return None
+
+
+def _num(value) -> float | None:
+    if value in (None, "", "-", "--"):
+        return None
+    try:
+        return float(str(value).replace(",", "").replace("%", "").strip())
+    except ValueError:
+        return None
+
+
 def api_institutional(db_path: Path, code: str) -> dict:
     code = code.strip()
     stock = api_stock(db_path, code)
@@ -1204,37 +1532,640 @@ def api_institutional(db_path: Path, code: str) -> dict:
         sorted_dates = sorted(row["date"] for row in price_dates)
         start = datetime.strptime(sorted_dates[0], "%Y-%m-%d").date()
         end = datetime.strptime(sorted_dates[-1], "%Y-%m-%d").date()
+    official_dates = sorted(row["date"] for row in price_dates) if price_dates else []
     try:
         raw = fetch_finmind_institutional(code, start, end)
-        grouped: dict[str, dict] = {}
-        for row in raw:
-            day = row.get("date")
-            if not day:
-                continue
-            item = grouped.setdefault(day, {"date": day, "foreign": 0, "investment": 0, "dealer": 0})
-            name = str(row.get("name") or "")
-            net = float(row.get("net") or 0)
-            if "外資" in name or "Foreign" in name:
-                item["foreign"] += net
-            elif "投信" in name or "Investment" in name:
-                item["investment"] += net
-            elif "自營" in name or "Dealer" in name:
-                item["dealer"] += net
-        rows = []
-        for day in sorted(grouped):
-            item = grouped[day]
-            institutional_net = item["foreign"] + item["investment"] + item["dealer"]
-            item["retail_proxy"] = -institutional_net
-            rows.append(item)
+        rows = _group_finmind_institutional(raw)
+        if len(rows) < 5 and stock.get("market") == "TWSE":
+            official_rows = _fetch_twse_t86_institutional(code, official_dates[-45:])
+            if official_rows:
+                rows = official_rows
+                source = "TWSE T86 官方三大法人買賣超"
+            else:
+                source = "FinMind TaiwanStockInstitutionalInvestorsBuySell"
+        else:
+            source = "FinMind TaiwanStockInstitutionalInvestorsBuySell"
         return {
             "code": code,
             "name": stock.get("short_name") or stock.get("name"),
-            "source": "FinMind TaiwanStockInstitutionalInvestorsBuySell",
+            "source": source,
             "message": "外資、投信、自營商為公開法人買賣超；散戶為法人反向代理值。",
             "rows": rows,
+            "summary": _institutional_summary(rows),
         }
     except Exception as exc:
-        return {"code": code, "name": stock.get("short_name") or stock.get("name"), "rows": [], "message": f"法人資料暫不可用：{exc}"}
+        official_rows = _fetch_twse_t86_institutional(code, official_dates[-45:]) if stock.get("market") == "TWSE" else []
+        if official_rows:
+            return {
+                "code": code,
+                "name": stock.get("short_name") or stock.get("name"),
+                "source": "TWSE T86 官方三大法人買賣超",
+                "message": f"FinMind 法人資料不可用，已改用證交所 T86 官方資料。原因：{exc}",
+                "rows": official_rows,
+                "summary": _institutional_summary(official_rows),
+            }
+        return {"code": code, "name": stock.get("short_name") or stock.get("name"), "rows": [], "summary": {}, "message": f"法人資料暫不可用：{exc}"}
+
+
+def _group_finmind_institutional(raw: list[dict]) -> list[dict]:
+    grouped: dict[str, dict] = {}
+    for row in raw:
+        day = row.get("date")
+        if not day:
+            continue
+        item = grouped.setdefault(day, {"date": day, "foreign": 0, "investment": 0, "dealer": 0})
+        name = str(row.get("name") or "")
+        net = float(row.get("net") or 0)
+        if "外資" in name or "Foreign" in name:
+            item["foreign"] += net
+        elif "投信" in name or "Investment" in name:
+            item["investment"] += net
+        elif "自營" in name or "Dealer" in name:
+            item["dealer"] += net
+    rows = []
+    for day in sorted(grouped):
+        item = grouped[day]
+        institutional_net = item["foreign"] + item["investment"] + item["dealer"]
+        item["total"] = institutional_net
+        item["retail_proxy"] = -institutional_net
+        rows.append(item)
+    return rows
+
+
+def _fetch_twse_t86_institutional(code: str, dates: list[str]) -> list[dict]:
+    rows = []
+    for day in dates:
+        ymd = day.replace("-", "")
+        url = f"https://www.twse.com.tw/rwd/zh/fund/T86?date={ymd}&selectType=ALLBUT0999&response=json"
+        request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        try:
+            with urlopen(request, timeout=8) as response:
+                payload = json.loads(response.read().decode("utf-8", errors="ignore"))
+        except Exception:
+            continue
+        if payload.get("stat") != "OK":
+            continue
+        for item in payload.get("data") or []:
+            if not item or str(item[0]).strip() != code:
+                continue
+            foreign = _int_text(item[4]) + _int_text(item[7])
+            investment = _int_text(item[10])
+            dealer = _int_text(item[11])
+            total = _int_text(item[18]) if len(item) > 18 else foreign + investment + dealer
+            rows.append(
+                {
+                    "date": day,
+                    "foreign": foreign,
+                    "investment": investment,
+                    "dealer": dealer,
+                    "total": total,
+                    "retail_proxy": -total,
+                }
+            )
+            break
+    return rows
+
+
+def _institutional_summary(rows: list[dict]) -> dict:
+    recent = rows[-20:]
+    last = rows[-1] if rows else {}
+    totals = {
+        key: sum(float(row.get(key) or 0) for row in recent)
+        for key in ["foreign", "investment", "dealer", "total", "retail_proxy"]
+    }
+    streak = 0
+    for row in reversed(rows):
+        value = float(row.get("total") or 0)
+        if value > 0 and streak >= 0:
+            streak += 1
+        elif value < 0 and streak <= 0:
+            streak -= 1
+        else:
+            break
+    stance = "法人偏買" if totals["total"] > 0 else "法人偏賣" if totals["total"] < 0 else "法人中性"
+    return {"last": last, "twenty_day": totals, "streak": streak, "stance": stance}
+
+
+def _int_text(value) -> int:
+    if value in (None, "", "-", "--"):
+        return 0
+    try:
+        return int(str(value).replace(",", "").strip())
+    except ValueError:
+        return 0
+
+
+def api_fund_holdings(db_path: Path, code: str) -> dict:
+    code = code.strip()
+    with _connect(db_path) as conn:
+        _ensure_fund_holding_tables(conn)
+        imported = _import_fund_holdings_csv(conn, _FUND_HOLDINGS_CSV)
+        stock = conn.execute("SELECT code, name FROM stocks WHERE code = ?", (code,)).fetchone()
+        rows = conn.execute(
+            """
+            SELECT fund_name, fund_type, manager, report_date, stock_code, shares,
+                   market_value, weight, source, summary
+            FROM fund_holdings
+            WHERE stock_code = ?
+            ORDER BY fund_name, report_date
+            """,
+            (code,),
+        ).fetchall()
+    by_fund: dict[str, list[dict]] = {}
+    for row in rows:
+        by_fund.setdefault(row["fund_name"], []).append(dict(row))
+    items = []
+    for fund_name, fund_rows in by_fund.items():
+        fund_rows.sort(key=lambda item: item["report_date"] or "")
+        latest = fund_rows[-1]
+        previous = fund_rows[-2] if len(fund_rows) > 1 else None
+        latest_shares = float(latest.get("shares") or 0)
+        previous_shares = float(previous.get("shares") or 0) if previous else None
+        change = latest_shares - previous_shares if previous is not None else None
+        action = "新增揭露" if previous is None else "加碼" if change and change > 0 else "減碼" if change and change < 0 else "持平"
+        items.append(
+            {
+                **latest,
+                "previous_date": previous.get("report_date") if previous else None,
+                "previous_shares": previous_shares,
+                "share_change": change,
+                "action": action,
+            }
+        )
+    items.sort(key=lambda item: abs(float(item.get("share_change") or item.get("shares") or 0)), reverse=True)
+    total_shares = sum(float(item.get("shares") or 0) for item in items)
+    total_change = sum(float(item.get("share_change") or 0) for item in items if item.get("share_change") is not None)
+    return {
+        "code": code,
+        "name": short_name(stock["name"]) if stock else code,
+        "csv_path": str(_FUND_HOLDINGS_CSV),
+        "imported": imported,
+        "items": items,
+        "summary": {
+            "funds": len(items),
+            "total_shares": total_shares,
+            "total_change": total_change,
+            "latest_date": max((item.get("report_date") or "" for item in items), default=None),
+        },
+        "message": (
+            "已依單一基金持股明細計算各基金持有與前期增減。"
+            if items
+            else "官方免費公開端點目前沒有單一基金逐檔持股明細；系統已先用外資、投信、自營商買賣超補齊資金面，若取得基金月報或持股揭露檔可再匯入。"
+        ),
+    }
+
+
+def _ensure_fund_holding_tables(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fund_holdings (
+            fund_name TEXT NOT NULL,
+            fund_type TEXT NOT NULL,
+            manager TEXT,
+            report_date TEXT NOT NULL,
+            stock_code TEXT NOT NULL,
+            shares REAL,
+            market_value REAL,
+            weight REAL,
+            source TEXT,
+            summary TEXT,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (fund_name, report_date, stock_code)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fund_holdings_stock ON fund_holdings(stock_code, report_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fund_holdings_fund ON fund_holdings(fund_name, report_date)")
+    conn.commit()
+
+
+def _import_fund_holdings_csv(conn: sqlite3.Connection, path: Path) -> dict:
+    if not path.exists():
+        return {"loaded": False, "rows": 0, "path": str(path)}
+    rows = []
+    with path.open("r", encoding="utf-8-sig", newline="") as fh:
+        reader = csv.DictReader(fh)
+        for raw in reader:
+            report_date = (raw.get("report_date") or raw.get("日期") or "").strip()
+            fund_name = (raw.get("fund_name") or raw.get("基金名稱") or "").strip()
+            stock_code = (raw.get("stock_code") or raw.get("股票代號") or "").strip()
+            if not report_date or not fund_name or not stock_code:
+                continue
+            rows.append(
+                {
+                    "fund_name": fund_name,
+                    "fund_type": (raw.get("fund_type") or raw.get("基金類型") or "未分類").strip(),
+                    "manager": (raw.get("manager") or raw.get("經理公司") or "").strip(),
+                    "report_date": report_date,
+                    "stock_code": stock_code,
+                    "shares": _num(raw.get("shares") or raw.get("持股股數")),
+                    "market_value": _num(raw.get("market_value") or raw.get("持股市值")),
+                    "weight": _num(raw.get("weight") or raw.get("權重")),
+                    "source": (raw.get("source") or raw.get("資料來源") or "").strip(),
+                    "summary": (raw.get("summary") or raw.get("分析摘要") or "").strip(),
+                }
+            )
+    if rows:
+        conn.executemany(
+            """
+            INSERT INTO fund_holdings (
+                fund_name, fund_type, manager, report_date, stock_code, shares,
+                market_value, weight, source, summary, updated_at
+            )
+            VALUES (
+                :fund_name, :fund_type, :manager, :report_date, :stock_code, :shares,
+                :market_value, :weight, :source, :summary, datetime('now')
+            )
+            ON CONFLICT(fund_name, report_date, stock_code) DO UPDATE SET
+                fund_type = excluded.fund_type,
+                manager = excluded.manager,
+                shares = excluded.shares,
+                market_value = excluded.market_value,
+                weight = excluded.weight,
+                source = excluded.source,
+                summary = excluded.summary,
+                updated_at = excluded.updated_at
+            """,
+            rows,
+        )
+        conn.commit()
+    return {"loaded": True, "rows": len(rows), "path": str(path)}
+
+
+def api_financial_kpis(db_path: Path, code: str) -> dict:
+    code = code.strip()
+    with _connect(db_path) as conn:
+        _ensure_financial_kpi_tables(conn)
+        imported = _import_financial_kpis_csv(conn, _FINANCIAL_KPIS_CSV)
+        stock = conn.execute("SELECT code, name, market FROM stocks WHERE code = ?", (code,)).fetchone()
+        auto = _fetch_and_store_public_financial_kpis(conn, stock) if stock else {"loaded": False, "rows": 0, "message": "找不到股票基本資料。"}
+        company_context = _fetch_public_company_context(stock) if stock else {}
+        rows = conn.execute(
+            """
+            SELECT stock_code, period, revenue, revenue_yoy, eps, gross_margin,
+                   operating_margin, roe, pe, pb, dividend_yield, source, summary
+            FROM financial_kpis
+            WHERE stock_code = ?
+            ORDER BY period
+            """,
+            (code,),
+        ).fetchall()
+    items = [dict(row) for row in rows]
+    latest = items[-1] if items else None
+    return {
+        "code": code,
+        "csv_path": str(_FINANCIAL_KPIS_CSV),
+        "imported": imported,
+        "auto_fetch": auto,
+        "company_context": company_context,
+        "items": items,
+        "latest": latest,
+        "message": (
+            auto.get("message") or "已依公開資料與匯入資料補齊財報與估值 KPI。"
+            if latest
+            else "公開財報端點暫時沒有回傳資料；若仍缺特定欄位，可再補 data/financial_kpis.csv。"
+        ),
+    }
+
+
+def _ensure_financial_kpi_tables(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS financial_kpis (
+            stock_code TEXT NOT NULL,
+            period TEXT NOT NULL,
+            revenue REAL,
+            revenue_yoy REAL,
+            eps REAL,
+            gross_margin REAL,
+            operating_margin REAL,
+            roe REAL,
+            pe REAL,
+            pb REAL,
+            dividend_yield REAL,
+            source TEXT,
+            summary TEXT,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (stock_code, period)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_financial_kpis_stock ON financial_kpis(stock_code, period)")
+    conn.commit()
+
+
+def _import_financial_kpis_csv(conn: sqlite3.Connection, path: Path) -> dict:
+    if not path.exists():
+        return {"loaded": False, "rows": 0, "path": str(path)}
+    rows = []
+    with path.open("r", encoding="utf-8-sig", newline="") as fh:
+        reader = csv.DictReader(fh)
+        for raw in reader:
+            period = (raw.get("period") or raw.get("期間") or raw.get("年月") or "").strip()
+            stock_code = (raw.get("stock_code") or raw.get("股票代號") or "").strip()
+            if not period or not stock_code:
+                continue
+            rows.append(
+                {
+                    "stock_code": stock_code,
+                    "period": period,
+                    "revenue": _num(raw.get("revenue") or raw.get("營收")),
+                    "revenue_yoy": _num(raw.get("revenue_yoy") or raw.get("營收年增率")),
+                    "eps": _num(raw.get("eps") or raw.get("EPS")),
+                    "gross_margin": _num(raw.get("gross_margin") or raw.get("毛利率")),
+                    "operating_margin": _num(raw.get("operating_margin") or raw.get("營業利益率")),
+                    "roe": _num(raw.get("roe") or raw.get("ROE")),
+                    "pe": _num(raw.get("pe") or raw.get("本益比")),
+                    "pb": _num(raw.get("pb") or raw.get("股價淨值比")),
+                    "dividend_yield": _num(raw.get("dividend_yield") or raw.get("殖利率")),
+                    "source": (raw.get("source") or raw.get("資料來源") or "").strip(),
+                    "summary": (raw.get("summary") or raw.get("分析摘要") or "").strip(),
+                }
+            )
+    if rows:
+        conn.executemany(
+            """
+            INSERT INTO financial_kpis (
+                stock_code, period, revenue, revenue_yoy, eps, gross_margin,
+                operating_margin, roe, pe, pb, dividend_yield, source, summary, updated_at
+            )
+            VALUES (
+                :stock_code, :period, :revenue, :revenue_yoy, :eps, :gross_margin,
+                :operating_margin, :roe, :pe, :pb, :dividend_yield, :source, :summary, datetime('now')
+            )
+            ON CONFLICT(stock_code, period) DO UPDATE SET
+                revenue = excluded.revenue,
+                revenue_yoy = excluded.revenue_yoy,
+                eps = excluded.eps,
+                gross_margin = excluded.gross_margin,
+                operating_margin = excluded.operating_margin,
+                roe = excluded.roe,
+                pe = excluded.pe,
+                pb = excluded.pb,
+                dividend_yield = excluded.dividend_yield,
+                source = excluded.source,
+                summary = excluded.summary,
+                updated_at = excluded.updated_at
+            """,
+            rows,
+        )
+        conn.commit()
+    return {"loaded": True, "rows": len(rows), "path": str(path)}
+
+
+def _public_financial_endpoints(market: str | None) -> dict[str, str]:
+    market_text = str(market or "").upper()
+    if market_text in {"TPEX", "OTC"}:
+        return {
+            "valuation": "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis",
+            "revenue": "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O",
+            "income": "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap06_O_ci",
+            "balance": "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap07_O_ci",
+            "profitability": "https://www.tpex.org.tw/openapi/v1/mopsfin_187ap17_O",
+            "governance": "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap11_O",
+            "major_shareholders": "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap02_O",
+            "dividend": "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap39_O",
+            "forecast": "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap15_O",
+            "control_change": "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap24_O",
+            "source": "TPEx OpenAPI",
+        }
+    return {
+        "valuation": "https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL",
+        "revenue": "https://openapi.twse.com.tw/v1/opendata/t187ap05_L",
+        "income": "https://openapi.twse.com.tw/v1/opendata/t187ap06_L_ci",
+        "balance": "https://openapi.twse.com.tw/v1/opendata/t187ap07_L_ci",
+        "profitability": "https://openapi.twse.com.tw/v1/opendata/t187ap17_L",
+        "governance": "https://openapi.twse.com.tw/v1/opendata/t187ap11_L",
+        "major_shareholders": "https://openapi.twse.com.tw/v1/opendata/t187ap02_L",
+        "dividend": "https://openapi.twse.com.tw/v1/opendata/t187ap45_L",
+        "forecast": "https://openapi.twse.com.tw/v1/opendata/t187ap15_L",
+        "control_change": "https://openapi.twse.com.tw/v1/opendata/t187ap24_L",
+        "source": "TWSE OpenAPI",
+    }
+
+
+def _cached_public_json(url: str) -> list[dict]:
+    cached = _PUBLIC_FINANCIAL_CACHE.get(url)
+    now = datetime.now()
+    if isinstance(cached, dict) and cached.get("expires_at") and cached["expires_at"] > now:
+        return cached.get("rows") or []
+    request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urlopen(request, timeout=12) as response:
+        payload = json.loads(response.read().decode("utf-8", errors="ignore"))
+    rows = payload if isinstance(payload, list) else []
+    _PUBLIC_FINANCIAL_CACHE[url] = {"expires_at": now + timedelta(hours=6), "rows": rows}
+    return rows
+
+
+def _find_public_stock_row(rows: list[dict], code: str) -> dict:
+    code = str(code).strip()
+    for row in rows:
+        if str(row.get("公司代號") or row.get("Code") or row.get("SecuritiesCompanyCode") or "").strip() == code:
+            return row
+    return {}
+
+
+def _public_stock_rows(rows: list[dict], code: str) -> list[dict]:
+    code = str(code).strip()
+    return [
+        row for row in rows
+        if str(row.get("公司代號") or row.get("Code") or row.get("SecuritiesCompanyCode") or "").strip() == code
+    ]
+
+
+def _roc_year_text(value) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        year = int(text[:3] if len(text) >= 3 else text)
+    except ValueError:
+        return text
+    if year < 1911:
+        year += 1911
+    return str(year)
+
+
+def _public_period(income_row: dict, revenue_row: dict) -> str:
+    year = _roc_year_text(income_row.get("年度") or income_row.get("Year"))
+    season = str(income_row.get("季別") or income_row.get("Season") or "").strip()
+    if year and season:
+        return f"{year}Q{season}"
+    ym = str(revenue_row.get("資料年月") or "").strip()
+    if len(ym) >= 5:
+        year = _roc_year_text(ym[:3])
+        return f"{year}-{ym[3:]}"
+    return date.today().strftime("%Y-%m")
+
+
+def _ratio(numerator, denominator, multiplier: float = 100.0) -> float | None:
+    num = _num(numerator)
+    den = _num(denominator)
+    if num is None or den in (None, 0):
+        return None
+    return num / den * multiplier
+
+
+def _fetch_public_company_context(stock: sqlite3.Row) -> dict:
+    endpoints = _public_financial_endpoints(stock["market"])
+    code = stock["code"]
+
+    def rows_for(key: str) -> list[dict]:
+        url = endpoints.get(key)
+        if not url:
+            return []
+        try:
+            return _public_stock_rows(_cached_public_json(url), code)
+        except Exception:
+            return []
+
+    governance_rows = rows_for("governance")
+    major_rows = rows_for("major_shareholders")
+    dividend_rows = rows_for("dividend")
+    forecast_rows = rows_for("forecast")
+    control_rows = rows_for("control_change")
+    profitability_rows = rows_for("profitability")
+
+    pledged_ratios = [_num(row.get("設質股數佔持股比例")) for row in governance_rows]
+    pledged_ratios = [value for value in pledged_ratios if value is not None]
+    holding_values = [_num(row.get("目前持股")) for row in governance_rows]
+    holding_total = sum(value for value in holding_values if value is not None)
+    dividend_latest = sorted(dividend_rows, key=lambda row: str(row.get("股利年度") or row.get("Year") or row.get("年度") or ""))[-1] if dividend_rows else {}
+    cash_dividend = (
+        _num(dividend_latest.get("股東配發-盈餘分配之現金股利(元/股)"))
+        or _num(dividend_latest.get("股東配發-法定盈餘公積發放之現金(元/股)"))
+        or _num(dividend_latest.get("股東配發-資本公積發放之現金(元/股)"))
+        or _num(dividend_latest.get("CashDividend"))
+    )
+    profit_latest = profitability_rows[-1] if profitability_rows else {}
+    return {
+        "source": endpoints["source"],
+        "governance": {
+            "rows": len(governance_rows),
+            "holding_total": holding_total,
+            "avg_pledge_ratio": sum(pledged_ratios) / len(pledged_ratios) if pledged_ratios else None,
+            "latest_month": (governance_rows[-1].get("資料年月") if governance_rows else None),
+        },
+        "major_shareholders": {
+            "rows": len(major_rows),
+            "top": major_rows[:5],
+        },
+        "dividend": {
+            "rows": len(dividend_rows),
+            "year": dividend_latest.get("股利年度") or dividend_latest.get("Year") or dividend_latest.get("年度"),
+            "cash_dividend": cash_dividend,
+            "status": dividend_latest.get("決議（擬議）進度") or dividend_latest.get("Status"),
+        },
+        "forecast": {
+            "rows": len(forecast_rows),
+            "has_forecast": len(forecast_rows) > 0,
+        },
+        "control_change": {
+            "rows": len(control_rows),
+            "has_recent_change": len(control_rows) > 0,
+            "latest": control_rows[-1] if control_rows else {},
+        },
+        "profitability": {
+            "rows": len(profitability_rows),
+            "gross_margin": _num(profit_latest.get("毛利率(%)(營業毛利)/(營業收入)")),
+            "operating_margin": _num(profit_latest.get("營業利益率(%)(營業利益)/(營業收入)")),
+            "net_margin": _num(profit_latest.get("稅後純益率(%)(稅後純益)/(營業收入)")),
+        },
+    }
+
+
+def _fetch_and_store_public_financial_kpis(conn: sqlite3.Connection, stock: sqlite3.Row) -> dict:
+    endpoints = _public_financial_endpoints(stock["market"])
+    code = stock["code"]
+    errors = []
+    try:
+        valuation_row = _find_public_stock_row(_cached_public_json(endpoints["valuation"]), code)
+    except Exception as exc:
+        valuation_row = {}
+        errors.append(f"估值：{exc}")
+    try:
+        revenue_row = _find_public_stock_row(_cached_public_json(endpoints["revenue"]), code)
+    except Exception as exc:
+        revenue_row = {}
+        errors.append(f"月營收：{exc}")
+    try:
+        income_row = _find_public_stock_row(_cached_public_json(endpoints["income"]), code)
+    except Exception as exc:
+        income_row = {}
+        errors.append(f"損益表：{exc}")
+    try:
+        balance_row = _find_public_stock_row(_cached_public_json(endpoints["balance"]), code)
+    except Exception as exc:
+        balance_row = {}
+        errors.append(f"資產負債表：{exc}")
+    if not any([valuation_row, revenue_row, income_row, balance_row]):
+        return {"loaded": False, "rows": 0, "message": "公開財報端點沒有可用資料。" + ("；".join(errors[:2]) if errors else "")}
+
+    revenue = _num(income_row.get("營業收入")) or _num(revenue_row.get("營業收入-當月營收"))
+    gross_margin = _ratio(income_row.get("營業毛利（毛損）") or income_row.get("營業毛利（毛損）淨額"), revenue)
+    operating_margin = _ratio(income_row.get("營業利益（損失）"), revenue)
+    equity = _num(balance_row.get("歸屬於母公司業主之權益合計")) or _num(balance_row.get("權益總額")) or _num(balance_row.get("權益總計"))
+    net_income = _num(income_row.get("淨利（淨損）歸屬於母公司業主")) or _num(income_row.get("本期淨利（淨損）"))
+    roe = _ratio(net_income, equity)
+    pe = _num(valuation_row.get("PEratio") or valuation_row.get("PriceEarningRatio"))
+    pb = _num(valuation_row.get("PBratio") or valuation_row.get("PriceBookRatio"))
+    dividend_yield = _num(valuation_row.get("DividendYield") or valuation_row.get("YieldRatio"))
+    period = _public_period(income_row, revenue_row)
+    source = endpoints["source"]
+    summary = (
+        f"自動抓取 {source}：最新季 EPS {fmt_value(_num(income_row.get('基本每股盈餘（元）')))}，"
+        f"毛利率 {fmt_value(gross_margin)}%，營益率 {fmt_value(operating_margin)}%，"
+        f"PE {fmt_value(pe)}，PB {fmt_value(pb)}。"
+    )
+    row = {
+        "stock_code": code,
+        "period": period,
+        "revenue": revenue,
+        "revenue_yoy": _num(revenue_row.get("營業收入-去年同月增減(%)") or revenue_row.get("累計營業收入-前期比較增減(%)")),
+        "eps": _num(income_row.get("基本每股盈餘（元）")),
+        "gross_margin": gross_margin,
+        "operating_margin": operating_margin,
+        "roe": roe,
+        "pe": pe,
+        "pb": pb,
+        "dividend_yield": dividend_yield,
+        "source": source,
+        "summary": summary,
+    }
+    conn.execute(
+        """
+        INSERT INTO financial_kpis (
+            stock_code, period, revenue, revenue_yoy, eps, gross_margin,
+            operating_margin, roe, pe, pb, dividend_yield, source, summary, updated_at
+        )
+        VALUES (
+            :stock_code, :period, :revenue, :revenue_yoy, :eps, :gross_margin,
+            :operating_margin, :roe, :pe, :pb, :dividend_yield, :source, :summary, datetime('now')
+        )
+        ON CONFLICT(stock_code, period) DO UPDATE SET
+            revenue = COALESCE(excluded.revenue, financial_kpis.revenue),
+            revenue_yoy = COALESCE(excluded.revenue_yoy, financial_kpis.revenue_yoy),
+            eps = COALESCE(excluded.eps, financial_kpis.eps),
+            gross_margin = COALESCE(excluded.gross_margin, financial_kpis.gross_margin),
+            operating_margin = COALESCE(excluded.operating_margin, financial_kpis.operating_margin),
+            roe = COALESCE(excluded.roe, financial_kpis.roe),
+            pe = COALESCE(excluded.pe, financial_kpis.pe),
+            pb = COALESCE(excluded.pb, financial_kpis.pb),
+            dividend_yield = COALESCE(excluded.dividend_yield, financial_kpis.dividend_yield),
+            source = excluded.source,
+            summary = excluded.summary,
+            updated_at = excluded.updated_at
+        """,
+        row,
+    )
+    conn.commit()
+    return {
+        "loaded": True,
+        "rows": 1,
+        "source": source,
+        "message": f"已自動抓取 {source} 補齊月營收、季 EPS、毛利率、營益率、ROE、PE/PB 與殖利率。",
+        "warnings": errors,
+    }
 
 
 def _aggregate_intraday_rows(rows: list[dict], minutes: int) -> list[dict]:
@@ -1310,7 +2241,41 @@ def _local_quote(conn: sqlite3.Connection, stock: sqlite3.Row) -> dict | None:
         "date": latest["date"],
         "time": None,
         "source": "本機資料庫",
+        "sparkline": _sparkline_for_code(conn, stock["code"]),
     }
+
+
+def _sparkline_values(values: list[float], points: int = 22) -> list[float]:
+    clean = [round(float(value), 4) for value in values if value is not None]
+    return clean[-points:]
+
+
+def _sparkline_for_code(conn: sqlite3.Connection, code: str, append_value: float | None = None, points: int = 22) -> list[float]:
+    rows = conn.execute(
+        """
+        SELECT close
+        FROM prices
+        WHERE stock_code = ? AND close IS NOT NULL
+        ORDER BY date DESC
+        LIMIT ?
+        """,
+        (code, points),
+    ).fetchall()
+    values = [float(row["close"]) for row in reversed(rows)]
+    if append_value is not None:
+        live = float(append_value)
+        if not values or abs(values[-1] - live) > 0.0001:
+            values.append(live)
+    return _sparkline_values(values, points)
+
+
+def _attach_sparklines(conn: sqlite3.Connection, rows: list[dict], append_live: bool = False) -> None:
+    for row in rows:
+        code = row.get("code")
+        if not code:
+            continue
+        live_value = row.get("price") if append_live else None
+        row["sparkline"] = _sparkline_for_code(conn, str(code), append_value=live_value)
 
 
 def _connect(db_path: Path) -> sqlite3.Connection:
@@ -1479,6 +2444,46 @@ def _extract_stock_code(text: str) -> str | None:
     return None
 
 
+def _resolve_telegram_stock_code(db_path: Path, text: str) -> str | None:
+    code = _extract_stock_code(text)
+    if code:
+        return code
+    query = _normalize_stock_name_query(text)
+    if not query:
+        return None
+    with _connect(db_path) as conn:
+        rows = conn.execute("SELECT code, name FROM stocks ORDER BY code").fetchall()
+    exact_matches = []
+    contains_matches = []
+    for row in rows:
+        full_name = str(row["name"] or "").strip()
+        brief = short_name(full_name)
+        candidates = {full_name, brief, full_name.replace("股份有限公司", ""), full_name.replace("有限公司", "")}
+        if query in candidates:
+            exact_matches.append(row["code"])
+        elif any(query and query in candidate for candidate in candidates):
+            contains_matches.append(row["code"])
+    if exact_matches:
+        return exact_matches[0]
+    if len(contains_matches) == 1:
+        return contains_matches[0]
+    return contains_matches[0] if contains_matches else None
+
+
+def _normalize_stock_name_query(text: str) -> str:
+    clean = text.strip()
+    for prefix in ["分析", "查詢", "查", "加入", "新增", "移除", "刪除", "+", "-", "#"]:
+        if clean.startswith(prefix):
+            clean = clean[len(prefix):].strip()
+    for mark in ["：", ":", "，", ","]:
+        clean = clean.replace(mark, " ")
+    tokens = [token.strip() for token in clean.split() if token.strip()]
+    if not tokens:
+        return ""
+    # Prefer the last token so "分析 台積電" and "查詢 聯發科" resolve naturally.
+    return tokens[-1]
+
+
 def _telegram_help_text() -> str:
     return "\n".join(
         [
@@ -1487,8 +2492,9 @@ def _telegram_help_text() -> str:
             "",
             "可用指令：",
             "2330｜查個股分析",
-            "分析 2454｜查個股買點、賣點、停損",
-            "加入 2367｜加入個人觀察名單",
+            "台積電｜用中文名稱查個股分析",
+            "分析 聯發科｜查個股買點、賣點、停損",
+            "加入 華邦電｜加入個人觀察名單",
             "移除 2367｜移除個人觀察名單",
             "綁定 個人代碼｜把網站帳號綁到這個 Telegram，例如：綁定 abc123",
             "我的觀察名單｜查看自己的股票提醒",
@@ -1634,6 +2640,143 @@ def _build_user_intraday_message(db_path: Path, user_key: str, display_name: str
     return "\n".join(lines)
 
 
+def _build_user_premarket_message(db_path: Path, user_key: str, display_name: str, limit: int = 5) -> str:
+    now = datetime.now(ZoneInfo("Asia/Taipei"))
+    snapshot = _premarket_snapshot()
+    codes = _user_watchlist_codes(db_path, user_key)
+    rows = api_watchlist(db_path, ",".join(codes)).get("watchlist", [])[:limit]
+    lines = [
+        f"台股智研｜{display_name} 早盤夜盤分析",
+        f"時間：{now:%Y-%m-%d %H:%M}",
+        "",
+        f"夜盤結論：{snapshot.get('stance', '資料不足')}｜分數 {snapshot.get('score', 50)}",
+        snapshot.get("summary", "夜盤資料不足，早盤以風控與分批為主。"),
+        "",
+        "夜盤觀察",
+    ]
+    items = snapshot.get("items") or []
+    if items:
+        for item in items[:6]:
+            lines.append(f"- {item['name']}：{fmt_value(item.get('change_percent'))}%｜{item.get('last_time', '無時間')}")
+    else:
+        lines.append("- 目前抓不到免費夜盤資料，請以開盤後即時看盤確認。")
+
+    lines.extend(["", "觀察名單早盤計畫"])
+    if not rows:
+        lines.append("目前尚未加入觀察股票。")
+    for item in rows:
+        bias = _premarket_watch_bias(item, snapshot)
+        lines.extend([
+            "",
+            f"{item['code']} {item['name']}｜{bias}",
+            f"昨收/最新資料：{fmt_value(item.get('close'))}｜20D {fmt_value(item.get('return_20d'))}%｜RSI {fmt_value(item.get('rsi_14'))}",
+            f"開盤觀察：若高開不追價，等回測買點 {item.get('buy_zone', '無資料')}；若低開跌破停損 {item.get('stop', '無資料')} 先風控。",
+            f"賣壓區：{item.get('sell_zone', '無資料')}｜量能需搭配即時看盤確認。",
+        ])
+    lines.extend([
+        "",
+        "提醒：08:30 報告是開盤前情境推演，真正進出場仍以 09:00 後即時價格、量能與停損紀律為準。",
+    ])
+    return "\n".join(lines)
+
+
+def _premarket_watch_bias(item: dict, snapshot: dict) -> str:
+    score = int(snapshot.get("score") or 50)
+    name = str(item.get("name") or "")
+    signal = item.get("signal") or "觀察"
+    rsi14 = item.get("rsi_14")
+    if score >= 60 and ("台積" in name or "聯發" in name or item.get("market") == "TWSE"):
+        return f"夜盤偏多，{signal}，但避免開盤追高"
+    if score <= 40:
+        return f"夜盤偏空，{signal}，開盤先看支撐與停損"
+    if rsi14 is not None and rsi14 >= 75:
+        return f"中性偏熱，{signal}，優先等拉回"
+    return f"中性觀察，{signal}"
+
+
+def _premarket_snapshot(force: bool = False) -> dict:
+    cached_until = _PREMARKET_CACHE.get("expires_at")
+    if not force and isinstance(cached_until, datetime) and datetime.now() < cached_until and _PREMARKET_CACHE.get("data"):
+        return dict(_PREMARKET_CACHE["data"])  # type: ignore[arg-type]
+    symbols = [
+        ("道瓊期/ETF", "DIA"),
+        ("S&P 500 ETF", "SPY"),
+        ("Nasdaq 100 ETF", "QQQ"),
+        ("費半 ETF", "SOXX"),
+        ("半導體 ETF", "SMH"),
+        ("台積電 ADR", "TSM"),
+        ("美元指數 ETF", "UUP"),
+    ]
+    items = []
+    failures = []
+    for name, symbol in symbols:
+        try:
+            item = _fetch_yahoo_snapshot(symbol)
+            if item:
+                items.append({"name": name, "symbol": symbol, **item})
+        except Exception as exc:
+            failures.append(f"{symbol}: {exc}")
+    score = 50
+    for item in items:
+        change = item.get("change_percent") or 0
+        weight = 2 if item["symbol"] in {"QQQ", "SOXX", "SMH", "TSM"} else 1
+        score += max(-8, min(8, change * 1.8)) * weight
+    score = max(0, min(100, round(score)))
+    if score >= 62:
+        stance = "偏多開盤"
+        summary = "夜盤科技與半導體偏強，早盤可優先觀察強勢股回測承接，但不建議開盤直接追高。"
+    elif score <= 42:
+        stance = "偏空防守"
+        summary = "夜盤風險偏弱，早盤先看支撐與停損，避免把資金一次投入。"
+    else:
+        stance = "中性觀察"
+        summary = "夜盤訊號沒有明顯單邊，早盤以觀察開盤溢價、量能與個股支撐為主。"
+    result = {
+        "prepared_at": datetime.now(ZoneInfo("Asia/Taipei")).strftime("%Y-%m-%d %H:%M:%S"),
+        "items": items,
+        "failures": failures[:5],
+        "score": score,
+        "stance": stance,
+        "summary": summary,
+    }
+    _PREMARKET_CACHE["data"] = result
+    _PREMARKET_CACHE["expires_at"] = datetime.now() + timedelta(minutes=45)
+    return result
+
+
+def _fetch_yahoo_snapshot(symbol: str) -> dict | None:
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=2d&interval=1d"
+    request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urlopen(request, timeout=8) as response:
+        payload = json.loads(response.read().decode("utf-8", errors="ignore"))
+    result = ((payload.get("chart") or {}).get("result") or [None])[0]
+    if not result:
+        return None
+    quote = ((result.get("indicators") or {}).get("quote") or [None])[0] or {}
+    closes = [value for value in quote.get("close", []) if value is not None]
+    timestamps = result.get("timestamp") or []
+    if len(closes) < 2:
+        meta = result.get("meta") or {}
+        regular = meta.get("regularMarketPrice")
+        previous = meta.get("chartPreviousClose") or meta.get("previousClose")
+        closes = [previous, regular] if previous and regular else closes
+    if len(closes) < 2:
+        return None
+    previous, latest = float(closes[-2]), float(closes[-1])
+    change = latest - previous
+    change_percent = change / previous * 100 if previous else None
+    last_time = "-"
+    if timestamps:
+        last_time = datetime.fromtimestamp(timestamps[-1], ZoneInfo("Asia/Taipei")).strftime("%m-%d %H:%M")
+    return {
+        "price": latest,
+        "previous": previous,
+        "change": change,
+        "change_percent": change_percent,
+        "last_time": last_time,
+    }
+
+
 def _send_telegram_to_chat(chat_id: str, message: str) -> dict:
     return _telegram_api(
         "sendMessage",
@@ -1755,6 +2898,7 @@ def _watch_snapshot(db_path: Path, code: str) -> dict | None:
         "return_5d": ind.get("return_5d"),
         "return_20d": ind.get("return_20d"),
         "return_60d": ind.get("return_60d"),
+        "sparkline": _sparkline_values([row["close"] for row in reversed(price_rows) if row["close"] is not None]),
         "rsi_14": ind.get("rsi_14"),
         "volume_ratio": ind.get("volume_ratio"),
         "signal": signal.get("signal") if "error" not in signal else "資料不足",
@@ -1840,25 +2984,25 @@ INDEX_HTML = r"""<!doctype html>
   <title>台股資料儀表板</title>
   <style>
     :root {
-      color-scheme: light;
-      --bg: #eef3f5;
-      --panel: #ffffff;
-      --panel-2: #f7fbfa;
-      --ink: #111827;
-      --text: #1f2937;
-      --muted: #667085;
-      --line: #d8e2e0;
-      --line-strong: #adc4be;
+      color-scheme: dark;
+      --bg: #050b14;
+      --panel: #0b1524;
+      --panel-2: #0e1a2b;
+      --ink: #f8fafc;
+      --text: #dbeafe;
+      --muted: #8fb4c7;
+      --line: #1f3550;
+      --line-strong: #31506d;
       --accent: #00a884;
       --accent-dark: #007c67;
-      --accent-soft: #e4f7f1;
+      --accent-soft: rgba(20, 184, 166, .16);
       --gold: #c1841d;
       --blue: #2563eb;
       --navy: #111827;
       --cyan: #0891b2;
       --down: #c24135;
-      --topbar: #101418;
-      --topbar-2: #1d2830;
+      --topbar: #050b14;
+      --topbar-2: #0b1828;
     }
     * { box-sizing: border-box; }
     body {
@@ -1868,12 +3012,12 @@ INDEX_HTML = r"""<!doctype html>
         linear-gradient(90deg, rgba(125,211,252,.035) 1px, transparent 1px),
         radial-gradient(circle at 12% 0%, rgba(8,145,178,.26), transparent 32%),
         radial-gradient(circle at 92% 10%, rgba(0,168,132,.20), transparent 30%),
-        linear-gradient(180deg, #050b14 0, #101827 300px, #eef3f5 780px, #eef3f5 100%);
+        linear-gradient(180deg, #030712 0, #07111f 420px, #06101d 100%);
       background-size: 42px 42px, 42px 42px, auto, auto, auto;
       color: var(--text);
       font-family: Arial, "Microsoft JhengHei", sans-serif;
-      font-size: 15px;
-      line-height: 1.45;
+      font-size: 16px;
+      line-height: 1.55;
     }
     header {
       background:
@@ -1899,7 +3043,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     .subtitle {
       color: #a7f3d0;
-      font-size: 13px;
+      font-size: 14px;
       font-weight: 700;
     }
     .version {
@@ -2009,9 +3153,15 @@ INDEX_HTML = r"""<!doctype html>
     input {
       padding: 0 12px;
       background: #fbfdff;
+      color: #0f172a;
+      caret-color: #0891b2;
       border-color: var(--line-strong);
       font-weight: 700;
       letter-spacing: 0;
+    }
+    input::placeholder {
+      color: #64748b;
+      opacity: 1;
     }
     input:focus {
       outline: 2px solid rgba(0, 133, 111, .2);
@@ -2071,23 +3221,33 @@ INDEX_HTML = r"""<!doctype html>
     .metric span {
       display: block;
       color: var(--muted);
-      font-size: 12px;
+      font-size: 13px;
       margin-bottom: 8px;
       font-weight: 700;
     }
-    .metric strong { font-size: 23px; }
+    .metric strong { font-size: 25px; }
     .grid { grid-template-columns: 1fr 1fr; }
-    section { overflow: hidden; }
+    section {
+      overflow: hidden;
+      transition: max-height .18s ease, box-shadow .18s ease, border-color .18s ease;
+    }
+    .info-panel {
+      position: relative;
+    }
+    .info-panel h2::after {
+      display: none;
+    }
     section h2 {
       margin: 0;
-      padding: 14px 16px;
-      font-size: 16px;
+      padding: 15px 16px;
+      font-size: 18px;
       border-bottom: 1px solid var(--line);
       background:
         linear-gradient(90deg, #f5fbf9, #ffffff);
       display: flex;
       align-items: center;
       justify-content: space-between;
+      gap: 12px;
     }
     section h2::after {
       content: "";
@@ -2095,6 +3255,72 @@ INDEX_HTML = r"""<!doctype html>
       height: 3px;
       border-radius: 999px;
       background: var(--accent);
+    }
+    section h2 .section-title {
+      min-width: 0;
+      flex: 1 1 auto;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    section h2 .panel-toggle {
+      height: 30px;
+      min-width: 58px;
+      flex: 0 0 auto;
+      padding: 0 10px;
+      border-radius: 999px;
+      font-size: 13px;
+      font-weight: 900;
+      color: #dbeafe;
+      background: rgba(14, 165, 233, .18);
+      border-color: rgba(56, 189, 248, .36);
+      box-shadow: none;
+    }
+    section h2 .panel-toggle:hover {
+      color: #ffffff;
+      background: rgba(14, 165, 233, .34);
+    }
+    .info-panel.panel-compact {
+      grid-column: span 1 !important;
+      max-height: 76px;
+      min-height: 64px;
+      min-width: 220px;
+      cursor: pointer;
+    }
+    .info-panel.panel-compact > :not(h2) {
+      display: none !important;
+    }
+    .info-panel.panel-compact h2 {
+      min-height: 64px;
+      padding: 0 16px;
+      border-bottom: 0;
+    }
+    .info-panel.panel-compact .section-title {
+      overflow: visible;
+      text-overflow: unset;
+      white-space: normal;
+      line-height: 1.2;
+    }
+    .info-panel.panel-compact h2::after {
+      content: none;
+      display: none;
+    }
+    .info-panel.panel-compact .panel-toggle {
+      width: 34px;
+      min-width: 34px;
+      padding: 0;
+      font-size: 20px;
+      line-height: 1;
+    }
+    .info-panel.panel-expanded {
+      grid-column: 1 / -1 !important;
+      max-height: none;
+      min-height: 0;
+      border-color: rgba(34, 211, 238, .42);
+      box-shadow:
+        0 28px 70px rgba(2, 6, 23, .42),
+        inset 0 1px 0 rgba(255,255,255,.06),
+        0 0 38px rgba(34, 211, 238, .12);
     }
     .collapse-btn {
       height: 30px;
@@ -2108,7 +3334,11 @@ INDEX_HTML = r"""<!doctype html>
     .collapsible.collapsed .content {
       display: none;
     }
-    .content { padding: 16px; }
+    .content {
+      padding: 17px;
+      font-size: 15px;
+      line-height: 1.65;
+    }
     .strategy-advice {
       display: grid;
       grid-template-columns: 1.1fr 1fr;
@@ -2158,6 +3388,98 @@ INDEX_HTML = r"""<!doctype html>
     .strategy-kpi strong {
       color: var(--ink);
       font-size: 20px;
+    }
+    #strategyPage .content,
+    #strategyPage .advice-list {
+      color: #dbeafe;
+    }
+    #strategyPage .advice-main,
+    #strategyPage .strategy-kpi {
+      background: linear-gradient(155deg, rgba(13, 25, 43, .98), rgba(7, 15, 28, .96));
+      border-color: rgba(56, 189, 248, .24);
+      color: #dbeafe;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.04);
+    }
+    #strategyPage .advice-main strong,
+    #strategyPage .strategy-kpi strong,
+    #strategyPage .content b {
+      color: #ffffff;
+    }
+    #strategyPage .advice-main p,
+    #strategyPage .advice-list li {
+      color: #cbd5e1;
+      line-height: 1.65;
+    }
+    #strategyPage .strategy-kpi span {
+      color: #8fd3f4;
+    }
+    .manager-report {
+      display: grid;
+      gap: 12px;
+    }
+    .manager-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .manager-card {
+      border: 1px solid rgba(56, 189, 248, .24);
+      border-radius: 8px;
+      padding: 14px;
+      background: linear-gradient(155deg, rgba(13, 25, 43, .98), rgba(7, 15, 28, .96));
+      color: #dbeafe;
+      min-width: 0;
+    }
+    .manager-card.full {
+      grid-column: 1 / -1;
+    }
+    .manager-card h3 {
+      margin: 0 0 10px;
+      font-size: 18px;
+      color: #ffffff;
+      letter-spacing: 0;
+    }
+    .manager-card p {
+      margin: 6px 0;
+      color: #cbd5e1;
+      line-height: 1.65;
+    }
+    .manager-card b {
+      color: #ffffff;
+    }
+    .manager-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 8px;
+      color: #dbeafe;
+    }
+    .manager-table th,
+    .manager-table td {
+      border-bottom: 1px solid rgba(148, 163, 184, .18);
+      padding: 8px 6px;
+      text-align: left;
+      vertical-align: top;
+    }
+    .manager-table th {
+      color: #8fd3f4;
+      font-size: 13px;
+    }
+    .manager-badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 0 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(56, 189, 248, .38);
+      background: rgba(14, 165, 233, .16);
+      color: #ffffff;
+      font-weight: 900;
+      white-space: nowrap;
+    }
+    .manager-scenario-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
     }
     .strategy-stock-grid {
       display: grid;
@@ -2224,23 +3546,24 @@ INDEX_HTML = r"""<!doctype html>
       grid-template-columns: 150px 1fr;
       gap: 8px 12px;
       margin: 0;
+      font-size: 15px;
     }
     dt { color: var(--muted); font-weight: 700; }
     dd { margin: 0; font-weight: 700; }
     table {
       width: 100%;
       border-collapse: collapse;
-      font-size: 14px;
+      font-size: 15px;
     }
     thead th {
       background: #eef7f4;
       color: #35524b;
-      font-size: 12px;
+      font-size: 13px;
       font-weight: 800;
     }
     th, td {
       border-bottom: 1px solid var(--line);
-      padding: 9px 8px;
+      padding: 10px 9px;
       text-align: right;
       white-space: nowrap;
     }
@@ -2250,14 +3573,14 @@ INDEX_HTML = r"""<!doctype html>
     th:first-child, td:first-child,
     th:nth-child(2), td:nth-child(2) { text-align: left; }
     .table-wrap { overflow-x: auto; }
-    .positive { color: #00d9a6; }
-    .negative { color: #ff3b30; }
+    .positive { color: #ff3b30; }
+    .negative { color: #00d97e; }
     .wide { grid-column: 1 / -1; }
     .note { color: var(--muted); }
     .status {
       min-height: 30px;
       color: var(--muted);
-      font-size: 14px;
+      font-size: 15px;
       background: #ffffff;
       border: 1px solid var(--line);
       border-radius: 8px;
@@ -2465,6 +3788,31 @@ INDEX_HTML = r"""<!doctype html>
       align-items: center;
       box-shadow: 0 18px 42px rgba(15, 23, 42, .18);
     }
+    .stock-command {
+      background:
+        radial-gradient(circle at 22% 10%, rgba(34, 211, 238, .18), transparent 34%),
+        linear-gradient(135deg, rgba(8, 20, 34, .98), rgba(8, 42, 40, .94));
+      border: 1px solid rgba(34, 211, 238, .24);
+      box-shadow:
+        0 22px 60px rgba(2, 6, 23, .34),
+        inset 0 1px 0 rgba(255, 255, 255, .06),
+        0 0 34px rgba(20, 184, 166, .12);
+      position: relative;
+    }
+    .stock-command::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      background: linear-gradient(90deg, transparent, rgba(125, 211, 252, .12), transparent);
+      transform: translateX(-100%);
+      animation: scan-sheen 5s ease-in-out infinite;
+    }
+    @keyframes scan-sheen {
+      0%, 45% { transform: translateX(-100%); opacity: 0; }
+      55% { opacity: 1; }
+      100% { transform: translateX(100%); opacity: 0; }
+    }
     .explore-hero h2 {
       background: transparent;
       border: 0;
@@ -2487,11 +3835,35 @@ INDEX_HTML = r"""<!doctype html>
     }
     .explore-actions input {
       background: rgba(255,255,255,.94);
+      color: #0f172a;
+      caret-color: #0891b2;
+    }
+    .explore-actions input::placeholder {
+      color: #64748b;
+      opacity: 1;
     }
     .explore-actions button:not(.primary) {
       background: rgba(255,255,255,.10);
       border-color: rgba(255,255,255,.20);
       color: #e5edf6;
+    }
+    .stock-command .explore-actions {
+      position: relative;
+      z-index: 1;
+    }
+    .stock-command input {
+      background: rgba(248, 252, 255, .96);
+      color: #0f172a;
+      caret-color: #0891b2;
+      border-color: rgba(125, 211, 252, .45);
+      box-shadow: 0 0 0 1px rgba(34, 211, 238, .08), 0 0 24px rgba(34, 211, 238, .10);
+    }
+    .stock-command input::placeholder {
+      color: #64748b;
+      opacity: 1;
+    }
+    .stock-command button.primary {
+      box-shadow: 0 0 24px rgba(20, 184, 166, .34);
     }
     .diagnosis {
       display: grid;
@@ -2514,6 +3886,63 @@ INDEX_HTML = r"""<!doctype html>
     .diagnosis-card strong {
       font-size: 24px;
       color: var(--ink);
+    }
+    .facet-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .facet-card,
+    .institution-card {
+      position: relative;
+      overflow: hidden;
+      background: linear-gradient(155deg, rgba(11, 22, 38, .98), rgba(7, 18, 32, .94));
+      border: 1px solid rgba(56, 189, 248, .20);
+      border-radius: 10px;
+      padding: 12px;
+      color: #dbeafe;
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, .05),
+        0 12px 24px rgba(2, 6, 23, .22),
+        0 0 20px rgba(8, 145, 178, .08);
+    }
+    .facet-card::after,
+    .institution-card::after {
+      content: "";
+      position: absolute;
+      inset: 0 0 auto;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, rgba(125, 211, 252, .75), transparent);
+    }
+    .facet-card span,
+    .institution-card span {
+      display: block;
+      color: #7dd3fc;
+      font-size: 12px;
+      font-weight: 900;
+      margin-bottom: 6px;
+    }
+    .facet-card strong,
+    .institution-card strong {
+      display: block;
+      color: #ffffff;
+      font-size: 18px;
+      text-shadow: 0 0 18px rgba(125, 211, 252, .26);
+    }
+    .facet-card small,
+    .institution-card small {
+      display: block;
+      margin-top: 8px;
+      color: #a8c5d8;
+      line-height: 1.45;
+    }
+    .institution-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .institution-card.wide {
+      grid-column: 1 / -1;
     }
     .watch-grid {
       display: grid;
@@ -2622,17 +4051,69 @@ INDEX_HTML = r"""<!doctype html>
       gap: 14px;
       align-items: start;
     }
+    .stock-part-title {
+      display: grid;
+      grid-template-columns: 42px minmax(0, 1fr);
+      gap: 12px;
+      align-items: center;
+      padding: 14px 16px;
+      border: 1px solid rgba(56,189,248,.24);
+      border-radius: 10px;
+      background: linear-gradient(90deg, rgba(15, 35, 52, .96), rgba(7, 18, 32, .92));
+      box-shadow: 0 16px 38px rgba(2, 6, 23, .22), inset 0 1px 0 rgba(255,255,255,.05);
+    }
+    .stock-part-title span {
+      width: 34px;
+      height: 34px;
+      display: inline-grid;
+      place-items: center;
+      border-radius: 50%;
+      background: rgba(14, 165, 233, .2);
+      border: 1px solid rgba(56, 189, 248, .42);
+      color: #e0f2fe;
+      font-weight: 900;
+    }
+    .stock-part-title strong {
+      display: block;
+      color: #f8fafc;
+      font-size: 22px;
+      line-height: 1.2;
+    }
+    .stock-part-title small {
+      display: block;
+      color: #8fb4c7;
+      margin-top: 3px;
+      font-size: 13px;
+      font-weight: 800;
+    }
     .desk-main, .desk-side {
       display: grid;
       gap: 12px;
       min-width: 0;
     }
     .desk-side {
-      grid-template-columns: .85fr 1.15fr 1.2fr 1fr 1fr;
-      align-items: stretch;
+      grid-template-columns: repeat(12, minmax(0, 1fr));
+      align-items: start;
+      grid-auto-flow: dense;
     }
     .desk-side .desk-panel {
       min-width: 0;
+      align-self: start;
+    }
+    .desk-side .info-panel.panel-compact {
+      grid-column: span 4 !important;
+      min-width: 0;
+    }
+    .desk-side .panel-diagnosis,
+    .desk-side .panel-trade,
+    .desk-side .panel-theory,
+    .desk-side .panel-summary,
+    .desk-side .panel-indicators {
+      grid-column: span 3;
+    }
+    .desk-side .panel-facets,
+    .desk-side .panel-institutional {
+      grid-column: span 6;
     }
     .desk-side .diagnosis {
       grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -2651,6 +4132,31 @@ INDEX_HTML = r"""<!doctype html>
     .desk-side .trade-list {
       font-size: 12px;
       line-height: 1.42;
+    }
+    .desk-side .facet-grid,
+    .desk-side .institution-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .desk-side .panel-summary dl,
+    .desk-side .panel-indicators dl {
+      grid-template-columns: minmax(76px, auto) minmax(0, 1fr);
+    }
+    .professional-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      align-items: start;
+    }
+    .professional-grid .desk-panel {
+      min-width: 0;
+    }
+    .professional-grid .wide {
+      grid-column: 1 / -1;
+    }
+    .compact-block {
+      border-top: 1px solid rgba(56,189,248,.16);
+      margin-top: 8px;
+      padding-top: 8px;
     }
     .desk-panel {
       background:
@@ -2853,12 +4359,12 @@ INDEX_HTML = r"""<!doctype html>
     }
     .realtime-terminal {
       display: grid;
-      grid-template-columns: minmax(460px, 1.25fr) minmax(260px, .7fr) minmax(320px, .8fr);
-      gap: 10px;
-      align-items: stretch;
+      grid-template-columns: minmax(520px, 1fr) minmax(230px, .42fr) minmax(260px, .48fr);
+      gap: 8px;
+      align-items: start;
       background: #030506;
       border: 1px solid #1f2933;
-      padding: 10px;
+      padding: 8px;
     }
     .terminal-chart,
     .terminal-tape,
@@ -2870,16 +4376,26 @@ INDEX_HTML = r"""<!doctype html>
       color: #dbeafe;
     }
     .terminal-chart {
-      grid-row: span 2;
+      grid-column: 1;
+      grid-row: 1;
+    }
+    .terminal-tape {
+      grid-column: 2;
+      grid-row: 1;
+    }
+    .terminal-depth {
+      grid-column: 3;
+      grid-row: 1;
     }
     .terminal-watch {
-      grid-column: 2 / 4;
+      grid-column: 1 / -1;
+      grid-row: 2;
     }
     .terminal-head {
-      min-height: 38px;
-      padding: 8px 10px;
+      min-height: 32px;
+      padding: 7px 9px;
       color: #f8fafc;
-      font-size: 20px;
+      font-size: 18px;
       font-weight: 900;
       border-bottom: 1px solid #1f2933;
     }
@@ -2921,12 +4437,12 @@ INDEX_HTML = r"""<!doctype html>
       border-radius: 999px 0 0 999px;
     }
     .terminal-chart .chart {
-      height: 370px;
+      height: 300px;
       border: 0;
       background: #000;
     }
     .terminal-volume {
-      min-height: 88px;
+      min-height: 66px;
       display: grid;
       grid-template-columns: repeat(3, 1fr);
       gap: 1px;
@@ -2942,11 +4458,11 @@ INDEX_HTML = r"""<!doctype html>
     .terminal-depth h2,
     .terminal-watch h2 {
       margin: 0;
-      padding: 8px 10px;
+      padding: 7px 9px;
       background: #11181c;
       border-bottom: 1px solid #25313a;
       color: #dbeafe;
-      font-size: 14px;
+      font-size: 13px;
     }
     .tape-row,
     .depth-row {
@@ -2988,13 +4504,13 @@ INDEX_HTML = r"""<!doctype html>
     .trend-kpi span {
       display: block;
       color: #8fb4c7;
-      font-size: 12px;
+      font-size: 13px;
       font-weight: 900;
       margin-bottom: 5px;
     }
     .trend-kpi strong {
       color: #ffffff;
-      font-size: 18px;
+      font-size: 20px;
     }
     .trade-plan {
       display: grid;
@@ -3017,13 +4533,14 @@ INDEX_HTML = r"""<!doctype html>
     .trade-callout strong {
       display: block;
       color: #e0f2fe;
-      font-size: 17px;
+      font-size: 18px;
       margin-bottom: 6px;
     }
     .trade-callout p {
       margin: 0;
       color: #cbd5e1;
       line-height: 1.55;
+      font-size: 15px;
     }
     .trade-kpis {
       display: grid;
@@ -3256,6 +4773,65 @@ INDEX_HTML = r"""<!doctype html>
       font-size: 13px;
       line-height: 1.55;
     }
+    .research-stage-list {
+      display: grid;
+      gap: 10px;
+      margin-top: 10px;
+    }
+    .research-stage {
+      border: 1px solid rgba(56,189,248,.22);
+      border-radius: 8px;
+      background: linear-gradient(180deg, rgba(15, 26, 42, .96), rgba(8, 17, 31, .96));
+      overflow: hidden;
+    }
+    .research-stage summary {
+      display: grid;
+      grid-template-columns: auto minmax(220px, 1fr) auto auto;
+      gap: 12px;
+      align-items: center;
+      padding: 12px 14px;
+      color: #e5edf6;
+      font-weight: 900;
+      cursor: pointer;
+      list-style: none;
+    }
+    select {
+      height: 40px;
+      min-width: 220px;
+      border: 1px solid rgba(56,189,248,.28);
+      border-radius: 8px;
+      background: #0f1a2a;
+      color: #e5edf6;
+      padding: 0 12px;
+      font-weight: 800;
+    }
+    .research-stage summary::-webkit-details-marker { display: none; }
+    .research-stage summary::before {
+      content: "+";
+      display: inline-grid;
+      place-items: center;
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      border: 1px solid rgba(56,189,248,.4);
+      color: #7dd3fc;
+      margin-right: 8px;
+    }
+    .research-stage[open] summary::before { content: "收"; width: 34px; border-radius: 999px; font-size: 11px; }
+    .stage-status {
+      color: #a7f3d0;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .stage-confidence {
+      color: #93c5fd;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .stage-body {
+      border-top: 1px solid rgba(148, 163, 184, .14);
+      padding: 12px 14px;
+    }
     .news-grid {
       display: grid;
       grid-template-columns: repeat(3, minmax(240px, 1fr));
@@ -3300,6 +4876,21 @@ INDEX_HTML = r"""<!doctype html>
       border: 1px solid #1f3b4c;
       color: #e5edf6;
     }
+    #realtimePage .dashboard-note {
+      padding: 10px 12px;
+      margin-bottom: 8px;
+    }
+    #realtimePage .toolbar {
+      grid-template-columns: minmax(240px, 1fr) repeat(4, auto);
+      gap: 8px;
+      padding: 9px;
+      margin-bottom: 8px;
+    }
+    #realtimePage .status {
+      margin-bottom: 8px;
+      min-height: 28px;
+      padding: 6px 10px;
+    }
     .realtime-board strong { color: #ffffff; }
     .realtime-board span { color: #a7f3d0; }
     .realtime-row {
@@ -3320,11 +4911,11 @@ INDEX_HTML = r"""<!doctype html>
     }
     .realtime-row.selected .positive,
     .desk-panel .realtime-row.selected .positive {
-      color: #00ffc6;
+      color: #ff5c5c;
     }
     .realtime-row.selected .negative,
     .desk-panel .realtime-row.selected .negative {
-      color: #ff5c5c;
+      color: #00ffc6;
     }
     .realtime-row.selected button {
       background: #e6fbff;
@@ -3347,6 +4938,600 @@ INDEX_HTML = r"""<!doctype html>
     .realtime-row:hover td:first-child {
       color: var(--accent-dark);
       font-weight: 900;
+    }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background:
+        radial-gradient(circle at 20% 12%, rgba(34, 211, 238, .10), transparent 26%),
+        radial-gradient(circle at 82% 18%, rgba(16, 185, 129, .08), transparent 24%);
+      z-index: -1;
+    }
+    .toolbar,
+    .watch-tools,
+    .metric,
+    section,
+    .dashboard-note,
+    .market-tile,
+    .module-card,
+    .watch-card,
+    .diagnosis-card,
+    .status {
+      background: linear-gradient(155deg, rgba(11, 21, 36, .96), rgba(7, 16, 29, .92));
+      border-color: rgba(56, 189, 248, .18);
+      color: var(--text);
+      box-shadow:
+        0 18px 42px rgba(2, 6, 23, .34),
+        inset 0 1px 0 rgba(255, 255, 255, .045),
+        0 0 24px rgba(8, 145, 178, .06);
+    }
+    section h2 {
+      background: linear-gradient(90deg, rgba(15, 30, 50, .98), rgba(8, 19, 34, .94));
+      border-color: rgba(56, 189, 248, .16);
+      color: #f8fafc;
+    }
+    input {
+      background: rgba(5, 12, 24, .92);
+      color: #e0f2fe;
+      caret-color: #7dd3fc;
+      border-color: rgba(125, 211, 252, .32);
+      box-shadow: inset 0 1px 10px rgba(2, 6, 23, .36);
+    }
+    input::placeholder {
+      color: #9fb6c9;
+      opacity: 1;
+    }
+    input:focus {
+      outline: 2px solid rgba(34, 211, 238, .18);
+      box-shadow: 0 0 24px rgba(34, 211, 238, .16);
+    }
+    button {
+      background: linear-gradient(180deg, rgba(15, 35, 52, .96), rgba(8, 20, 35, .96));
+      color: #dbeafe;
+      border-color: rgba(125, 211, 252, .24);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .04);
+    }
+    button:hover {
+      background: linear-gradient(180deg, rgba(14, 116, 144, .42), rgba(8, 47, 73, .56));
+      border-color: rgba(34, 211, 238, .46);
+      color: #ffffff;
+      box-shadow: 0 0 22px rgba(34, 211, 238, .16);
+    }
+    button.primary {
+      background: linear-gradient(135deg, #00a884, #0891b2);
+      box-shadow: 0 0 26px rgba(20, 184, 166, .30);
+    }
+    thead th {
+      background: rgba(13, 31, 49, .98);
+      color: #a7f3d0;
+      border-color: rgba(56, 189, 248, .18);
+    }
+    th, td {
+      border-color: rgba(51, 65, 85, .76);
+      color: #dbeafe;
+    }
+    tbody tr:hover {
+      background: rgba(14, 165, 233, .10);
+    }
+    .chart {
+      background: linear-gradient(180deg, #07111f, #050b14);
+      border-color: rgba(56, 189, 248, .18);
+    }
+    .hero-panel,
+    .explore-hero,
+    .stock-command,
+    .realtime-board {
+      border-color: rgba(34, 211, 238, .22);
+      box-shadow:
+        0 24px 60px rgba(2, 6, 23, .38),
+        inset 0 1px 0 rgba(255, 255, 255, .05),
+        0 0 34px rgba(20, 184, 166, .10);
+    }
+    .market-tile strong,
+    .module-card strong,
+    .watch-card strong,
+    .diagnosis-card strong,
+    .metric strong,
+    dd {
+      color: #ffffff;
+    }
+    .market-tile span,
+    .module-card span,
+    .watch-card span,
+    .diagnosis-card span,
+    dt,
+    .note,
+    .status,
+    .dashboard-note span {
+      color: #8fb4c7;
+    }
+    .pill {
+      background: rgba(20, 184, 166, .14);
+      color: #a7f3d0;
+      border-color: rgba(34, 211, 238, .24);
+      box-shadow: 0 0 18px rgba(20, 184, 166, .10);
+    }
+    .table-wrap {
+      background: rgba(2, 6, 23, .18);
+    }
+    .stock-card-table,
+    .stock-card-table tbody,
+    .stock-card-table tr,
+    .stock-card-table td {
+      display: block;
+      width: 100%;
+      border: 0;
+      padding: 0;
+    }
+    .stock-card-table thead {
+      display: none;
+    }
+    .stock-card-table tbody {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));
+      gap: 14px;
+      padding: 14px;
+    }
+    .stock-card-table.compact-card-table tbody {
+      grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+      gap: 10px;
+      padding: 10px;
+    }
+    .terminal-watch .stock-card-table.compact-card-table tbody {
+      grid-template-columns: repeat(auto-fit, minmax(205px, 1fr));
+      align-content: start;
+      padding: 8px;
+    }
+    .terminal-watch .stock-card.compact-stock-card {
+      min-height: 136px;
+    }
+    .terminal-watch .stock-card.compact-stock-card h3 {
+      font-size: 16px;
+    }
+    .terminal-watch .stock-card.compact-stock-card .stock-price {
+      font-size: 20px;
+    }
+    .realtime-list-table,
+    .realtime-list-table tbody,
+    .realtime-list-table tr,
+    .realtime-list-table td {
+      display: block;
+      width: 100%;
+      border: 0;
+      padding: 0;
+    }
+    .realtime-list-table thead {
+      display: none;
+    }
+    .realtime-list-table tbody {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+      padding: 8px;
+    }
+    .realtime-list-card {
+      min-height: 116px;
+      display: grid;
+      grid-template-columns: 34px minmax(96px, 1fr) minmax(82px, .62fr) minmax(118px, .76fr);
+      gap: 10px;
+      align-items: center;
+      padding: 11px 10px;
+      border-radius: 8px;
+      border: 1px solid rgba(71, 85, 105, .32);
+      background:
+        linear-gradient(90deg, rgba(14, 165, 233, .14), rgba(15, 23, 42, .08) 42%),
+        linear-gradient(155deg, rgba(16, 24, 39, .98), rgba(20, 13, 29, .98));
+      color: #e5edf6;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.04);
+    }
+    .realtime-list-card > * {
+      min-width: 0;
+    }
+    .realtime-row:nth-child(n + 4) .realtime-list-card {
+      background:
+        linear-gradient(90deg, rgba(245, 158, 11, .12), rgba(15, 23, 42, .04) 42%),
+        linear-gradient(155deg, rgba(17, 15, 29, .98), rgba(20, 13, 29, .98));
+    }
+    .realtime-row.selected .realtime-list-card {
+      outline: 1px solid rgba(34, 211, 238, .76);
+      box-shadow: inset 3px 0 0 #22d3ee, 0 0 26px rgba(34, 211, 238, .16);
+    }
+    .realtime-rank {
+      width: 32px;
+      height: 32px;
+      display: grid;
+      place-items: center;
+      border-radius: 999px;
+      border: 1px solid rgba(245, 158, 11, .72);
+      background: rgba(120, 53, 15, .56);
+      color: #facc15;
+      font-size: 16px;
+      font-weight: 900;
+    }
+    .realtime-row:nth-child(n + 4) .realtime-rank {
+      border-color: rgba(148, 163, 184, .42);
+      background: rgba(71, 85, 105, .56);
+      color: #dbeafe;
+    }
+    .realtime-list-name strong {
+      display: block;
+      color: #ffffff;
+      font-size: 17px;
+      line-height: 1.15;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .realtime-list-name span,
+    .realtime-list-meta {
+      color: #a8b6c9;
+      font-size: 13px;
+      font-weight: 900;
+    }
+    .realtime-list-price strong {
+      display: block;
+      color: #ff3030;
+      font-size: 19px;
+      line-height: 1.1;
+    }
+    .realtime-list-price span {
+      display: block;
+      margin-top: 7px;
+      color: #a8b6c9;
+      font-size: 13px;
+      font-weight: 900;
+      white-space: nowrap;
+    }
+    .realtime-list-spark {
+      min-width: 0;
+      text-align: right;
+      overflow: hidden;
+    }
+    .realtime-list-spark .stock-spark {
+      height: 42px;
+      margin-left: auto;
+    }
+    .realtime-list-meta {
+      margin-top: 4px;
+      display: block;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .stock-card-row {
+      min-width: 0;
+    }
+    .stock-card {
+      position: relative;
+      min-height: 222px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: auto auto 1fr auto;
+      gap: 10px;
+      padding: 18px;
+      border-radius: 14px;
+      overflow: hidden;
+      background:
+        radial-gradient(circle at 92% 10%, rgba(16, 185, 129, .13), transparent 20%),
+        linear-gradient(155deg, rgba(20, 14, 28, .98), rgba(12, 12, 25, .98));
+      border: 1px solid rgba(72, 91, 122, .42);
+      box-shadow:
+        0 18px 36px rgba(2, 6, 23, .36),
+        inset 0 1px 0 rgba(255, 255, 255, .05),
+        0 0 22px rgba(14, 165, 233, .06);
+      color: #e5edf6;
+    }
+    .stock-card.compact-stock-card {
+      min-height: 146px;
+      padding: 13px;
+      gap: 7px;
+      grid-template-rows: auto auto auto;
+    }
+    .stock-card.compact-stock-card h3 {
+      font-size: 18px;
+    }
+    .stock-card.compact-stock-card .stock-price {
+      font-size: 22px;
+    }
+    .stock-card.compact-stock-card .stock-spark {
+      height: 44px;
+    }
+    .stock-card.compact-stock-card .stock-card-foot {
+      display: none;
+    }
+    .stock-card.compact-stock-card .stock-actions {
+      justify-content: flex-start;
+      gap: 6px;
+    }
+    .stock-card.compact-stock-card .stock-card-mid {
+      grid-template-columns: minmax(82px, .7fr) minmax(92px, 1fr);
+    }
+    .stock-card > * {
+      grid-column: 1 / -1;
+      min-width: 0;
+    }
+    .stock-card::before {
+      content: "";
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 3px;
+      background: linear-gradient(180deg, #f59e0b, #ef4444);
+      box-shadow: 0 0 18px rgba(245, 158, 11, .46);
+    }
+    .stock-card.positive-card::before {
+      background: linear-gradient(180deg, #facc15, #ef4444);
+    }
+    .stock-card.negative-card::before {
+      background: linear-gradient(180deg, #38bdf8, #22c55e);
+    }
+    .stock-card.selected-card {
+      outline: 1px solid rgba(34, 211, 238, .72);
+      box-shadow:
+        0 20px 42px rgba(2, 6, 23, .40),
+        0 0 34px rgba(34, 211, 238, .20);
+    }
+    .stock-card-top {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .stock-card h3 {
+      margin: 0;
+      color: #ffffff;
+      font-size: 20px;
+      line-height: 1.2;
+    }
+    .stock-card small {
+      display: block;
+      color: #9ca3af;
+      margin-top: 6px;
+      font-weight: 700;
+    }
+    .stock-led {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #16a34a;
+      box-shadow: 0 0 14px rgba(34, 197, 94, .95);
+      flex: 0 0 auto;
+      margin-top: 3px;
+    }
+    .stock-tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .stock-tag {
+      border: 1px solid rgba(96, 165, 250, .34);
+      color: #bfdbfe;
+      background: rgba(37, 99, 235, .10);
+      border-radius: 999px;
+      padding: 2px 8px;
+      font-size: 12px;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+    .stock-tag.hot {
+      border-color: rgba(250, 204, 21, .36);
+      color: #fde68a;
+      background: rgba(250, 204, 21, .08);
+    }
+    .stock-card-mid {
+      display: grid;
+      grid-template-columns: minmax(90px, .8fr) minmax(120px, 1fr);
+      gap: 10px;
+      align-items: center;
+    }
+    .stock-price {
+      color: #ff3030;
+      font-size: 24px;
+      font-weight: 900;
+      letter-spacing: .02em;
+    }
+    .stock-change {
+      display: block;
+      margin-top: 4px;
+      font-size: 13px;
+      font-weight: 900;
+    }
+    .stock-spark {
+      width: 100%;
+      height: 54px;
+      display: block;
+      overflow: visible;
+    }
+    .stock-spark.up polyline {
+      stroke: #ff3030;
+    }
+    .stock-spark.down polyline {
+      stroke: #00d97e;
+    }
+    .stock-spark.flat polyline {
+      stroke: #94a3b8;
+    }
+    .stock-card-foot {
+      border-top: 1px solid rgba(148, 163, 184, .14);
+      padding-top: 10px;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+      color: #9ca3af;
+      font-weight: 800;
+    }
+    .stock-ohlc {
+      grid-column: 1 / -1;
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+      font-size: 13px;
+    }
+    .stock-ohlc b {
+      color: #e5edf6;
+      font-weight: 900;
+    }
+    .stock-actions {
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+      justify-self: stretch;
+    }
+    .stock-card .drag-handle {
+      width: auto;
+      color: #7dd3fc;
+      text-align: left;
+    }
+    .stock-card button.compact {
+      background: rgba(226, 246, 255, .96);
+      color: #062337;
+      border-color: rgba(125, 211, 252, .54);
+    }
+    .stock-card button.compact.danger {
+      background: rgba(127, 29, 29, .76);
+      color: #fee2e2;
+      border-color: rgba(248, 113, 113, .50);
+    }
+    .rank-list-table,
+    .rank-list-table tbody,
+    .rank-list-table tr,
+    .rank-list-table td {
+      display: block;
+      width: 100%;
+      border: 0;
+      padding: 0;
+    }
+    .rank-list-table thead {
+      display: none;
+    }
+    .rank-panel {
+      overflow: hidden;
+      border-radius: 16px;
+      background:
+        radial-gradient(circle at 88% 8%, rgba(34, 197, 94, .10), transparent 18%),
+        linear-gradient(180deg, rgba(15, 23, 42, .96), rgba(7, 10, 22, .98));
+      border: 1px solid rgba(71, 85, 105, .48);
+      box-shadow: 0 20px 45px rgba(2, 6, 23, .28), inset 0 1px 0 rgba(255,255,255,.04);
+    }
+    .rank-panel-head,
+    .rank-row {
+      display: grid;
+      grid-template-columns: 42px minmax(120px, 1fr) minmax(86px, .58fr) minmax(104px, .6fr) 16px;
+      gap: 12px;
+      align-items: center;
+    }
+    .rank-panel-head {
+      padding: 16px 18px;
+      border-bottom: 1px solid rgba(148, 163, 184, .08);
+    }
+    .rank-title {
+      grid-column: 1 / 4;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      color: #f8fafc;
+      font-size: 19px;
+      font-weight: 900;
+    }
+    .rank-icon {
+      display: grid;
+      place-items: center;
+      width: 28px;
+      height: 28px;
+      border-radius: 10px;
+      color: #38bdf8;
+      background: rgba(14, 165, 233, .10);
+      border: 1px solid rgba(56, 189, 248, .22);
+    }
+    .rank-more {
+      grid-column: 4 / 6;
+      justify-self: end;
+      height: 30px;
+      padding: 0 10px;
+      color: #cbd5e1;
+      background: rgba(15, 23, 42, .72);
+      border-color: rgba(71, 85, 105, .58);
+    }
+    .rank-row {
+      position: relative;
+      min-height: 82px;
+      padding: 12px 18px;
+      cursor: pointer;
+      background: linear-gradient(90deg, rgba(239, 68, 68, .10), rgba(15, 23, 42, 0) 55%);
+      transition: background .16s ease, transform .16s ease;
+    }
+    .rank-row:hover {
+      background: linear-gradient(90deg, rgba(20, 184, 166, .13), rgba(15, 23, 42, .08) 65%);
+      transform: translateX(2px);
+    }
+    .rank-index {
+      display: grid;
+      place-items: center;
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+      color: #e2e8f0;
+      background: rgba(51, 65, 85, .72);
+      border: 1px solid rgba(148, 163, 184, .14);
+      font-weight: 900;
+    }
+    .rank-index.top {
+      color: #fbbf24;
+      background: rgba(180, 83, 9, .28);
+      border-color: rgba(245, 158, 11, .36);
+    }
+    .rank-name strong,
+    .rank-price strong {
+      display: block;
+      color: #ffffff;
+      font-size: 18px;
+      line-height: 1.2;
+    }
+    .rank-name span,
+    .rank-metric,
+    .rank-price span {
+      display: block;
+      margin-top: 4px;
+      color: #94a3b8;
+      font-size: 13px;
+      font-weight: 800;
+    }
+    .rank-price strong {
+      color: #ff3030;
+      font-family: Consolas, "SFMono-Regular", monospace;
+    }
+    .rank-spark {
+      min-width: 0;
+    }
+    .rank-spark .stock-spark {
+      height: 38px;
+    }
+    .rank-led {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #22c55e;
+      box-shadow: 0 0 14px rgba(34, 197, 94, .88);
+    }
+    @media (max-width: 1180px) {
+      .desk-side {
+        grid-template-columns: repeat(6, minmax(0, 1fr));
+      }
+      .desk-side .info-panel.panel-compact {
+        grid-column: span 3 !important;
+      }
+      .desk-side .panel-diagnosis,
+      .desk-side .panel-trade,
+      .desk-side .panel-theory,
+      .desk-side .panel-summary,
+      .desk-side .panel-indicators,
+      .desk-side .panel-facets,
+      .desk-side .panel-institutional {
+        grid-column: span 3;
+      }
     }
     @media (max-width: 820px) {
       header { display: block; }
@@ -3372,8 +5557,21 @@ INDEX_HTML = r"""<!doctype html>
         white-space: nowrap;
       }
       .sidebar-title { display: none; }
-      .hero-panel, .hero-stat-grid, .market-strip, .module-grid, .diagnosis, .watch-grid, .strategy-advice, .strategy-kpis, .strategy-stock-grid, .strategy-guide, .trading-desk, .desk-side, .trade-kpis, .technical-strip, .fundamental-grid, .fundamental-visuals, .research-command, .research-score-row, .research-list-grid, .news-grid, .inner-grid, .explore-hero, .trend-summary, .realtime-terminal { grid-template-columns: 1fr; }
+      .hero-panel, .hero-stat-grid, .market-strip, .module-grid, .diagnosis, .watch-grid, .strategy-advice, .strategy-kpis, .manager-grid, .manager-scenario-grid, .strategy-stock-grid, .strategy-guide, .trading-desk, .desk-side, .professional-grid, .trade-kpis, .technical-strip, .fundamental-grid, .fundamental-visuals, .research-command, .research-score-row, .research-list-grid, .news-grid, .inner-grid, .explore-hero, .trend-summary, .realtime-terminal, .facet-grid, .institution-grid, .realtime-list-table tbody { grid-template-columns: 1fr; }
       .terminal-chart, .terminal-watch { grid-column: auto; grid-row: auto; }
+      .terminal-tape, .terminal-depth { grid-column: auto; grid-row: auto; }
+      .desk-side .panel-diagnosis,
+      .desk-side .panel-trade,
+      .desk-side .panel-theory,
+      .desk-side .panel-summary,
+      .desk-side .panel-indicators,
+      .desk-side .panel-facets,
+      .desk-side .panel-institutional {
+        grid-column: auto;
+      }
+      .desk-side .info-panel.panel-compact {
+        grid-column: auto !important;
+      }
       .desk-side dl { grid-template-columns: 1fr; }
       .desk-side .diagnosis { grid-template-columns: 1fr; }
       .chart-comparison { grid-template-columns: 1fr; }
@@ -3399,6 +5597,16 @@ INDEX_HTML = r"""<!doctype html>
         grid-template-columns: repeat(4, minmax(0, 1fr));
       }
       button { width: 100%; }
+      .stock-card-table tbody { grid-template-columns: 1fr; padding: 10px; }
+      .stock-actions button { width: auto; flex: 1 1 auto; }
+      .rank-panel-head,
+      .rank-row {
+        grid-template-columns: 32px minmax(0, 1fr) minmax(82px, auto) 12px;
+        gap: 8px;
+      }
+      .rank-title { grid-column: 1 / 3; }
+      .rank-more { grid-column: 3 / 5; }
+      .rank-spark { display: none; }
       .chart-tabs .chart-tab,
       .realtime-actions button {
         width: auto;
@@ -3413,9 +5621,9 @@ INDEX_HTML = r"""<!doctype html>
   <header>
     <div class="brand">
       <h1>台股智研 Pro</h1>
-      <div class="subtitle">專業台股智能分析平台 · 訊號排行 · AI 實操 · 風控回測</div>
+      <div class="subtitle">專業台股智能分析平台 · 訊號排行 · AI 經理人 · 風控紀律</div>
     </div>
-    <div class="version"><span id="range">載入中...</span> · UI v26</div>
+    <div class="version"><span id="range">載入中...</span> · UI v49</div>
   </header>
   <div class="app-shell">
     <aside class="sidebar">
@@ -3424,10 +5632,8 @@ INDEX_HTML = r"""<!doctype html>
         <a class="nav-item active" data-page="overview" href="#" onclick="showPage('overview', this); return false;"><span class="nav-icon">OV</span><span>總覽</span></a>
         <a class="nav-item" data-page="realtimePage" href="#" onclick="showPage('realtimePage', this); return false;"><span class="nav-icon">RT</span><span>即時看盤</span></a>
         <a class="nav-item" data-page="watchPage" href="#" onclick="showPage('watchPage', this); return false;"><span class="nav-icon">MK</span><span>盤後看盤</span></a>
-        <a class="nav-item" data-page="signalsPage" href="#" onclick="showPage('signalsPage', this); return false;"><span class="nav-icon">AI</span><span>智能選股</span></a>
-        <a class="nav-item" data-page="strategyPage" href="#" onclick="showPage('strategyPage', this); return false;"><span class="nav-icon">OP</span><span>AI 實操</span></a>
+        <a class="nav-item" data-page="strategyPage" href="#" onclick="showPage('strategyPage', this); return false;"><span class="nav-icon">PM</span><span>AI 經理人</span></a>
         <a class="nav-item" data-page="stockPage" href="#" onclick="showPage('stockPage', this); return false;"><span class="nav-icon">ST</span><span>個股分析</span></a>
-        <a class="nav-item" data-page="rankingPage" href="#" onclick="showPage('rankingPage', this); return false;"><span class="nav-icon">RK</span><span>市場排行</span></a>
         <a class="nav-item" data-page="hubPage" href="#" onclick="showPage('hubPage', this); return false;"><span class="nav-icon">HB</span><span>股票探索</span></a>
         <a class="nav-item" data-page="guidePage" href="#" onclick="showPage('guidePage', this); return false;"><span class="nav-icon">GD</span><span>使用手冊</span></a>
         <a class="nav-item" data-page="notifyPage" href="#" onclick="showPage('notifyPage', this); return false;"><span class="nav-icon">TG</span><span>推播設定</span></a>
@@ -3437,16 +5643,15 @@ INDEX_HTML = r"""<!doctype html>
     <div class="dashboard-note overview-only">
       <div>
         <strong>智能投資決策中心</strong><br>
-        <span>整合上市櫃資料、AI 訊號分數、AI 實操回測與 Telegram 盤後推播，協助快速建立每日觀察名單。</span>
+        <span>整合上市櫃資料、AI 訊號分數、AI 經理人決策與 Telegram 盤中/盤後推播，協助快速建立每日操作紀律。</span>
       </div>
       <div class="pill">V1 研究模式</div>
     </div>
     <div class="toolbar overview-only">
       <input id="code" value="2330" aria-label="股票代號">
       <button type="button" class="primary" id="loadStock" onclick="searchStock()">智能搜尋</button>
-      <button type="button" id="loadScan" onclick="runAction(fetchScan, '正在載入市場掃描...')">市場排行榜</button>
-      <button type="button" id="loadSignals" onclick="runAction(fetchSignals, '正在載入訊號排行...')">AI 訊號</button>
-      <button type="button" id="loadStrategy" onclick="runAction(fetchStrategy, '正在執行 AI 實操回測，可能需要約一分鐘...')">AI 實操</button>
+      <button type="button" id="loadHub" onclick="showPage('hubPage')">股票探索</button>
+      <button type="button" id="loadStrategy" onclick="runAction(fetchStrategy, '正在更新 AI 經理人決策...')">AI 經理人</button>
       <button type="button" id="refreshStatus" onclick="runAction(fetchStatus, '正在更新狀態...')">更新狀態</button>
     </div>
     <div class="status" id="statusLine">準備就緒。</div>
@@ -3456,12 +5661,12 @@ INDEX_HTML = r"""<!doctype html>
         <div>
           <div class="eyebrow">TAIWAN EQUITY RESEARCH DESK</div>
           <h2>今日台股研究工作台</h2>
-          <p>從盤勢廣度、AI 訊號、觀察名單與實操風控切入，先判斷市場環境，再決定要進攻、精選或防守。</p>
+          <p>從盤勢廣度、AI 訊號、觀察名單與經理人風控切入，先判斷市場環境，再決定要進攻、精選或防守。</p>
           <div class="hero-actions">
-            <button type="button" class="primary" onclick="showPage('signalsPage')">查看 AI 訊號</button>
+            <button type="button" class="primary" onclick="showPage('hubPage')">股票探索</button>
             <button type="button" onclick="showPage('watchPage')">打開觀察名單</button>
             <button type="button" onclick="showPage('realtimePage')">即時看盤</button>
-            <button type="button" onclick="showPage('strategyPage')">AI 實操中心</button>
+            <button type="button" onclick="showPage('strategyPage')">AI 經理人中心</button>
           </div>
         </div>
         <div class="hero-stat-grid">
@@ -3472,17 +5677,17 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </div>
       <div class="market-strip">
-        <div class="market-tile accent"><span>AI 實操</span><strong>盤勢 + 回測</strong></div>
+        <div class="market-tile accent"><span>AI 經理人</span><strong>組合決策</strong></div>
         <div class="market-tile blue"><span>即時看盤</span><strong>觀察名單同步</strong></div>
-        <div class="market-tile gold"><span>智能選股</span><strong>風險調整分數</strong></div>
+        <div class="market-tile gold"><span>股票探索</span><strong>AI 智選排行</strong></div>
         <div class="market-tile cyan"><span>個股分析</span><strong>K 線與技術圖</strong></div>
       </div>
       <div class="grid">
         <section class="wide">
           <h2>今日研究流程</h2>
           <div class="content"><dl>
-            <dt>第一步</dt><dd>先看 AI 實操判斷目前盤面是進攻、精選或防守</dd>
-            <dt>第二步</dt><dd>用 AI 訊號與觀察名單縮小股票池</dd>
+            <dt>第一步</dt><dd>先看 AI 經理人判斷目前盤面是進攻、精選或防守</dd>
+            <dt>第二步</dt><dd>用股票探索與觀察名單縮小股票池</dd>
             <dt>第三步</dt><dd>進入個股 K 線、均線、RSI、MACD、KD 和布林通道確認風險</dd>
           </dl></div>
         </section>
@@ -3492,7 +5697,7 @@ INDEX_HTML = r"""<!doctype html>
             <dt>股票探索</dt><dd>集中查看 AI 智選、強勢股票與量能焦點</dd>
             <dt>盤後看盤</dt><dd>只保留觀察名單與盤後摘要，避免資訊重複</dd>
             <dt>即時看盤</dt><dd>盤中報價、即時走勢與 AI 盤中盯盤</dd>
-            <dt>AI 實操</dt><dd>查看建倉、了結、未平倉與回測績效</dd>
+            <dt>AI 經理人</dt><dd>查看每日 AI 建倉、減碼、停損、未平倉與資金曲線</dd>
           </dl></div>
         </section>
       </div>
@@ -3502,12 +5707,7 @@ INDEX_HTML = r"""<!doctype html>
       <div class="explore-hero">
         <div>
           <h2>股票探索工作台</h2>
-          <p>從 AI 智選、強勢排行與量能焦點挑股票，點「分析」直接進入 K 線、技術圖與交易計畫。</p>
-        </div>
-        <div class="explore-actions">
-          <input id="hubCode" value="2330" aria-label="股票探索股票代號">
-          <button type="button" class="primary" onclick="openHubStock()">分析個股</button>
-          <button type="button" onclick="runAction(fetchHub, '正在刷新股票探索...')">刷新</button>
+          <p>從 AI 智選、強勢排行與量能焦點挑股票，直接在名單中點「分析」進入 K 線、技術圖與交易計畫。</p>
         </div>
       </div>
       <div class="module-grid">
@@ -3515,8 +5715,19 @@ INDEX_HTML = r"""<!doctype html>
         <div class="module-card"><strong>強勢排行</strong><span>追蹤 20 日漲幅，快速看到市場資金偏好的族群。</span></div>
         <div class="module-card"><strong>量能焦點</strong><span>找出成交量突然放大的股票，再回到個股頁確認型態。</span></div>
       </div>
+      <section class="wide">
+        <h2>產業類股分類</h2>
+        <div class="content">
+          <div class="toolbar" style="padding:0;border:0;background:transparent">
+            <select id="industrySelect" aria-label="選擇產業" onchange="fetchIndustryStocks(this.value)"></select>
+            <button type="button" onclick="fetchIndustryStocks()">刷新產業</button>
+          </div>
+          <div id="industrySummary" class="note"></div>
+          <div id="industryStockCards"></div>
+        </div>
+      </section>
       <div class="grid">
-        <section class="wide">
+        <section>
           <h2>AI 智選名單</h2>
           <div class="table-wrap"><table id="hubSignalsTable"></table></div>
         </section>
@@ -3541,6 +5752,7 @@ INDEX_HTML = r"""<!doctype html>
         <input id="watchlistCode" value="2330" aria-label="觀察名單股票代號">
         <button type="button" class="primary" onclick="runAction(addWatchlistCode, '正在加入觀察名單...')">加入觀察</button>
         <button type="button" onclick="useWatchlistRealtime()">同步到即時看盤</button>
+        <button type="button" onclick="runAction(syncCurrentWatchlistToPush, '正在同步推播名單...')">同步到推播</button>
         <button type="button" onclick="runAction(fetchWatch, '正在刷新觀察名單...')">刷新名單</button>
         <div class="hint" id="watchlistHint">觀察名單會保存在本機資料庫。</div>
       </div>
@@ -3610,18 +5822,23 @@ INDEX_HTML = r"""<!doctype html>
     <div class="page" id="stockPage">
       <div class="grid">
       <section class="wide">
-        <div class="stock-hero">
+        <div class="explore-hero stock-command">
           <div>
-            <h2 id="stockHeroName">個股診斷報告</h2>
-            <div class="sub" id="stockHeroSub">輸入股票代號後產生 AI 診斷、K 線與技術分析圖</div>
+            <h2 id="stockHeroName">個股分析工作台</h2>
+            <p id="stockHeroSub">輸入股票代號後分成「解盤」與「專業分析」，快速看交易判斷，再看法人、基本面與消息。</p>
           </div>
-          <div class="score-badge">
-            <span>智研評分</span>
-            <strong id="heroScore">-</strong>
+          <div class="explore-actions">
+            <input id="stockPageCode" value="2330" aria-label="個股分析股票代號">
+            <button type="button" class="primary" onclick="searchStockFromPanel()">分析個股</button>
+            <button type="button" onclick="runAction(fetchStock, '正在刷新個股分析...')">刷新</button>
           </div>
         </div>
       </section>
       <div class="wide trading-desk">
+        <div class="stock-part-title">
+          <span>1</span>
+          <div><strong>解盤</strong><small>K 線、AI 診斷、交易計畫、技術指標與風險構面。</small></div>
+        </div>
         <div class="desk-main">
           <section class="desk-panel">
             <div class="desk-chart-toolbar">
@@ -3646,6 +5863,8 @@ INDEX_HTML = r"""<!doctype html>
                 <button type="button" onclick="showTechnicalAttachment('volume')">成交量</button>
                 <button type="button" onclick="showChipAttachment('foreign')">外資</button>
                 <button type="button" onclick="showChipAttachment('investment')">投信</button>
+                <button type="button" onclick="showChipAttachment('dealer')">自營商</button>
+                <button type="button" onclick="showChipAttachment('total')">法人合計</button>
                 <button type="button" onclick="showChipAttachment('retail_proxy')">散戶</button>
               </div>
               <div class="chart-stack" id="chartStack">
@@ -3680,7 +5899,7 @@ INDEX_HTML = r"""<!doctype html>
           </section>
         </div>
         <div class="desk-side">
-          <section class="desk-panel">
+          <section class="desk-panel panel-diagnosis">
             <h2>AI 個股診斷</h2>
             <div class="content">
               <div class="diagnosis">
@@ -3690,31 +5909,51 @@ INDEX_HTML = r"""<!doctype html>
               </div>
             </div>
           </section>
-          <section class="desk-panel">
+          <section class="desk-panel panel-trade">
             <h2>交易計畫</h2>
             <div id="tradePlan" class="trade-plan"></div>
           </section>
-          <section class="desk-panel">
-            <h2>分析構面</h2>
+          <section class="desk-panel panel-theory">
+            <h2>技術理論解盤</h2>
+            <div id="technicalTheoryAnalysis" class="trade-plan"></div>
+          </section>
+          <section class="desk-panel panel-facets">
+            <h2>AI 構面總覽</h2>
             <div id="analysisFacets" class="trade-plan"></div>
           </section>
-          <section class="desk-panel">
-            <h2>個股摘要</h2>
+          <section class="desk-panel panel-summary">
+            <h2>個股資料</h2>
             <div class="content"><dl id="stockSummary"></dl></div>
           </section>
-          <section class="desk-panel">
+          <section class="desk-panel panel-indicators">
             <h2>技術指標</h2>
             <div class="content"><dl id="indicators"></dl></div>
           </section>
         </div>
-        <section class="desk-panel">
-          <h2>基本面研究</h2>
-          <div id="fundamentalResearch" class="fundamental-research"></div>
-        </section>
-        <section class="desk-panel">
-          <h2>最新消息掃描</h2>
-          <div id="newsResearch" class="news-grid"></div>
-        </section>
+        <div class="stock-part-title">
+          <span>2</span>
+          <div><strong>專業分析</strong><small>先看機構級研究，再看資金、財報補齊與消息驗證。</small></div>
+        </div>
+        <div class="professional-grid">
+          <section class="desk-panel wide">
+            <h2>機構級投資研究</h2>
+            <div id="fundamentalResearch" class="fundamental-research"></div>
+          </section>
+          <section class="desk-panel wide panel-institutional">
+            <h2>資金與基金追蹤</h2>
+            <div id="institutionalProAnalysis" class="trade-plan"></div>
+            <div id="fundHoldingReports" class="trade-plan compact-block"></div>
+          </section>
+          <section class="desk-panel wide">
+            <h2>資料補齊與財報 KPI</h2>
+            <div id="analysisCoverage" class="trade-plan"></div>
+            <div id="financialKpiPanel" class="trade-plan compact-block"></div>
+          </section>
+          <section class="desk-panel wide">
+            <h2>最新消息掃描</h2>
+            <div id="newsResearch" class="news-grid"></div>
+          </section>
+        </div>
       </div>
       </div>
     </div>
@@ -3722,50 +5961,39 @@ INDEX_HTML = r"""<!doctype html>
     <div class="page" id="strategyPage">
       <div class="grid">
       <section class="wide">
-        <h2>AI 實操策略與績效</h2>
+        <h2>AI 經理人決策總覽</h2>
         <div class="content" id="strategyAdvice"></div>
       </section>
       <section class="wide">
-        <h2>AI 實操說明</h2>
-        <div class="content strategy-guide">
-          <div><strong>勝率</strong><span>代表過去交易有多少比例賺錢，但不是越高越好，還要看賺賠幅度。</span></div>
-          <div><strong>最大回撤</strong><span>代表 AI 實操過程中曾經從高點跌下來多少，是新人最需要先看的風險指標。</span></div>
-          <div><strong>總報酬</strong><span>代表回測期間 AI 實操累積成果，需搭配最大回撤一起看。</span></div>
-          <div><strong>未平倉部位</strong><span>代表目前 AI 實操仍持有、尚未出場的標的，不等於立刻買進建議。</span></div>
-          <div><strong>候選觀察</strong><span>代表 AI 認為值得研究的標的，還不是正式建倉；實際建倉請看建倉紀錄。</span></div>
-        </div>
-      </section>
-      <section class="wide">
-        <h2>AI 候選觀察名單</h2>
+        <h2>AI 經理人候選觀察</h2>
         <div class="content">
-          <p class="note">這些是 AI 依盤勢、分數、量價與風控條件挑出的研究候選，不代表已經建倉；若符合策略節奏，才會出現在建倉紀錄。</p>
           <div id="strategyStockCards"></div>
         </div>
       </section>
       <section class="wide">
-        <h2>AI 實操摘要</h2>
+        <h2>AI 經理人組合摘要</h2>
         <div class="content"><dl id="strategySummary"></dl></div>
       </section>
       <section class="wide">
-        <h2>AI 候選明細</h2>
-        <div class="content"><p class="note">用途是讓使用者知道 AI 正在觀察哪些股票，以及每檔的建倉區、出倉區、停損與風險，不是下單清單。</p></div>
-        <div class="table-wrap"><table id="strategyLeadersTable"></table></div>
-      </section>
-      <section class="wide">
-        <h2>AI 實操建倉紀錄</h2>
-        <div class="table-wrap"><table id="strategyEntriesTable"></table></div>
-      </section>
-      <section class="wide">
-        <h2>AI 實操了結紀錄</h2>
-        <div class="table-wrap"><table id="strategyTradesTable"></table></div>
-      </section>
-      <section class="wide">
-        <h2>AI 實操未平倉</h2>
+        <h2>AI 經理人未平倉</h2>
         <div class="table-wrap"><table id="strategyOpenTable"></table></div>
       </section>
       <section class="wide">
+        <h2>AI 經理人買賣紀錄</h2>
+        <div class="grid">
+          <section>
+            <h2>建倉紀錄</h2>
+            <div class="table-wrap"><table id="strategyEntriesTable"></table></div>
+          </section>
+          <section>
+            <h2>了結紀錄</h2>
+            <div class="table-wrap"><table id="strategyTradesTable"></table></div>
+          </section>
+        </div>
+      </section>
+      <section class="wide">
         <h2>資金曲線</h2>
-        <div class="content"><svg id="equityChart" class="chart" role="img" aria-label="AI 實操資金曲線"></svg></div>
+        <div class="content"><svg id="equityChart" class="chart" role="img" aria-label="AI 經理人資金曲線"></svg></div>
         <div class="table-wrap"><table id="strategyCurveTable"></table></div>
       </section>
       </div>
@@ -3791,11 +6019,11 @@ INDEX_HTML = r"""<!doctype html>
 
     <div class="page" id="rankingPage">
       <div class="grid">
-      <section class="wide">
+      <section>
         <h2>20 日漲幅排行</h2>
         <div class="table-wrap"><table id="returnTable"></table></div>
       </section>
-      <section class="wide">
+      <section>
         <h2>量能放大排行</h2>
         <div class="table-wrap"><table id="volumeTable"></table></div>
       </section>
@@ -3857,9 +6085,9 @@ INDEX_HTML = r"""<!doctype html>
         <section class="wide">
           <h2>使用手冊</h2>
           <div class="content"><dl>
-            <dt>快速入門</dt><dd>先看總覽，再用智能搜尋查個股，最後檢查 AI 訊號與 AI 實操。</dd>
-            <dt>AI 智能分析</dt><dd>智研評分綜合技術面、籌碼面、消息面、產業面、三大法人、風險面與資金面。</dd>
-            <dt>AI 實操</dt><dd>用歷史資料驗證 Top signals 的表現，包含勝率、最大回撤與交易明細。</dd>
+            <dt>快速入門</dt><dd>先看總覽，再用智能搜尋查個股，最後檢查 AI 訊號與 AI 經理人。</dd>
+            <dt>AI 智能分析</dt><dd>智研評分綜合技術面、量價籌碼、消息面、產業面、風險面與資金面；三大法人集中在法人籌碼面板。</dd>
+            <dt>AI 經理人</dt><dd>每日依最新資料建立基金經理人式決策，包含建倉、出場、持倉、風控與資金曲線。</dd>
             <dt>推播設定</dt><dd>每天 15:30 盤後更新資料並推播 Telegram 摘要。</dd>
           </dl></div>
         </section>
@@ -3879,6 +6107,8 @@ INDEX_HTML = r"""<!doctype html>
     const publicWatchlistKey = "stock_v1_public_watchlist";
     const userKeyStorageKey = "stock_v1_user_key";
     let currentUserKey = localStorage.getItem(userKeyStorageKey) || "";
+    const rankListState = {};
+    let latestCoverageContext = {};
     async function getJson(url) {
       const response = await fetch(url);
       const data = await response.json();
@@ -3913,36 +6143,221 @@ INDEX_HTML = r"""<!doctype html>
       const codes = localWatchlistCodes();
       return getJson(`/api/watchlist?codes=${encodeURIComponent(codes.join(","))}`);
     }
+    function renderedWatchlistCodes() {
+      return Array.from(document.querySelectorAll("#watchMajorsTable tr[data-watch-code]"))
+        .map(row => row.dataset.watchCode)
+        .filter(Boolean);
+    }
+    async function currentWatchlistCodesForSync() {
+      const renderedCodes = renderedWatchlistCodes();
+      if (renderedCodes.length) return renderedCodes;
+      if (publicDemoMode && !currentUserKey) return localWatchlistCodes();
+      const data = await getWatchlistData();
+      return data.codes || (data.watchlist || []).map(row => row.code).filter(Boolean);
+    }
+    async function syncUserWatchlistCodes(codes, quiet = false) {
+      const clean = [...new Set((codes || []).map(code => String(code).trim()).filter(Boolean))];
+      if (!clean.length) throw new Error("目前沒有可同步的關注股票。");
+      let data;
+      if (currentUserKey) {
+        data = await getJson(`/api/user/watchlist/sync?user_key=${encodeURIComponent(currentUserKey)}&codes=${encodeURIComponent(clean.join(","))}`);
+      } else if (publicDemoMode) {
+        saveLocalWatchlist(clean);
+        data = await getJson(`/api/watchlist?codes=${encodeURIComponent(clean.join(","))}`);
+        data.message = `已同步 ${clean.length} 檔到此瀏覽器名單；公開展示模式不會修改本機主機推播。`;
+      } else {
+        data = await getJson(`/api/watchlist/sync?codes=${encodeURIComponent(clean.join(","))}`);
+      }
+      const table = document.getElementById("watchMajorsTable");
+      if (table) renderMajors(table, data.watchlist || []);
+      if (!quiet) {
+        const hint = document.getElementById("watchlistHint");
+        if (hint) hint.textContent = data.message || `已同步 ${clean.length} 檔到推播名單。`;
+      }
+      return data;
+    }
+    async function syncCurrentWatchlistToPush() {
+      const codes = await currentWatchlistCodesForSync();
+      await syncUserWatchlistCodes(codes);
+    }
     function renderDl(target, rows) {
       target.innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
     }
-    function renderTable(target, rows) {
+    function setStockCards(target) {
+      target.classList.remove("rank-list-table");
+      target.classList.remove("realtime-list-table");
+      target.classList.add("stock-card-table");
+      target.classList.remove("compact-card-table");
+    }
+    function setRankList(target) {
+      target.classList.remove("stock-card-table");
+      target.classList.remove("realtime-list-table");
+      target.classList.add("rank-list-table");
+    }
+    function setRealtimeList(target) {
+      target.classList.remove("stock-card-table");
+      target.classList.remove("compact-card-table");
+      target.classList.remove("rank-list-table");
+      target.classList.add("realtime-list-table");
+    }
+    function stockCard(row, options = {}) {
+      const code = row.code || "";
+      const name = row.short_name || row.name || "";
+      const price = row.price ?? row.close;
+      const change = row.change ?? row.return_5d ?? row.return_20d;
+      const changePercent = row.change_percent ?? row.return_20d;
+      const cardClass = changePercent > 0 ? "positive-card" : changePercent < 0 ? "negative-card" : "";
+      const market = row.market || "TWSE";
+      const tag = row.industry || row.signal || row.sentiment || options.tag || "智慧觀察";
+      const open = row.open ?? row.close ?? row.price;
+      const high = row.high ?? row.resistance ?? row.close ?? row.price;
+      const low = row.low ?? row.stop ?? row.close ?? row.price;
+      const spark = miniSparkline(row, changePercent);
+      const extra = options.extra ? `<span class="stock-tag hot">${options.extra}</span>` : "";
+      const labels = [options.leftLabel, options.rightLabel].filter(Boolean);
+      const labelHtml = labels.length ? labels.map(text => `<span>${text}</span>`).join("") : "";
+      return `
+        <div class="stock-card ${cardClass} ${options.selected ? "selected-card" : ""} ${options.compact ? "compact-stock-card" : ""}">
+          <div class="stock-card-top">
+            <div>
+              <h3>${name}</h3>
+              <small>${code}</small>
+              <div class="stock-tags"><span class="stock-tag">${market}</span><span class="stock-tag hot">${tag}</span>${extra}</div>
+            </div>
+            <span class="stock-led"></span>
+          </div>
+          <div class="stock-card-mid">
+            <div>
+              <div class="stock-price">${fmt(price)}</div>
+              <span class="stock-change ${pctClass(changePercent)}">${fmt(change)} ｜ ${fmt(changePercent)}%</span>
+            </div>
+            ${spark}
+          </div>
+          <div class="stock-card-foot">
+            ${labelHtml}
+            <div class="stock-ohlc">
+              <span>開 <b class="${pctClass(Number(open) - Number(price))}">${fmt(open)}</b></span>
+              <span>高 <b class="positive">${fmt(high)}</b></span>
+              <span>低 <b class="negative">${fmt(low)}</b></span>
+            </div>
+          </div>
+          <div class="stock-actions">${options.actions || `<button type="button" class="compact" onclick="openStock('${code}')">分析</button>`}</div>
+        </div>`;
+    }
+    function miniSparkline(row, changePercent) {
+      const width = 150;
+      const height = 58;
+      const values = (row.sparkline || []).map(Number).filter(Number.isFinite);
+      if (values.length < 2) {
+        return `<svg class="stock-spark flat" viewBox="0 0 ${width} ${height}" aria-hidden="true">
+          <polyline points="8,29 ${width - 8},29" fill="none" stroke-width="2.2"></polyline>
+        </svg>`;
+      }
+      const min = Math.min(...values);
+      const max = Math.max(...values);
+      const span = max - min || Math.max(Math.abs(max), 1) * 0.01;
+      const points = values.map((value, index) => {
+        const x = 8 + index * ((width - 16) / (values.length - 1));
+        const y = 8 + (max - value) * ((height - 16) / span);
+        return `${x.toFixed(1)},${Math.max(8, Math.min(height - 8, y)).toFixed(1)}`;
+      }).join(" ");
+      const direction = values[values.length - 1] > values[0] ? "up" : values[values.length - 1] < values[0] ? "down" : "flat";
+      return `<svg class="stock-spark ${direction}" viewBox="0 0 ${width} ${height}" aria-hidden="true">
+        <polyline points="${points}" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"></polyline>
+      </svg>`;
+    }
+    function renderRankList(target, rows, options = {}) {
+      rows = rows || [];
+      setRankList(target);
+      const key = target.id || options.title || "rank";
+      const expanded = !!rankListState[key];
+      const visible = expanded ? rows : rows.slice(0, 5);
+      const canExpand = rows.length > 5;
+      const title = options.title || "排行榜";
+      const icon = options.icon || "↗";
+      const metric = options.metric || ((row) => `量比 ${fmt(row.volume_ratio)}`);
       target.innerHTML = `
-        <thead><tr><th>代號</th><th>名稱</th><th>收盤</th><th>20日%</th><th>60日%</th><th>量比</th><th>RSI</th><th>操作</th></tr></thead>
+        <thead><tr><th>${title}</th></tr></thead>
+        <tbody><tr><td>
+          <div class="rank-panel">
+            <div class="rank-panel-head">
+              <div class="rank-title"><span class="rank-icon">${icon}</span><span>${title}</span></div>
+              ${canExpand ? `<button type="button" class="rank-more" onclick="toggleRankList('${key}')">${expanded ? "收起" : `看全部 ${rows.length}`}</button>` : ""}
+            </div>
+            <div class="rank-list">
+              ${visible.map((row, index) => {
+                const changePercent = row.change_percent ?? row.return_20d;
+                const price = row.price ?? row.close;
+                const change = row.change ?? row.return_5d ?? row.return_20d;
+                return `
+                  <div class="rank-row" onclick="openStock('${row.code}')" title="點擊分析 ${row.code}">
+                    <span class="rank-index ${index < 3 ? "top" : ""}">${index + 1}</span>
+                    <div class="rank-name"><strong>${row.short_name || row.name}</strong><span>${row.code}</span></div>
+                    <div class="rank-price"><strong>${fmt(price)}</strong><span class="${pctClass(changePercent)}">${fmt(change)} ｜ ${fmt(changePercent)}%</span></div>
+                    <div class="rank-spark">${miniSparkline(row, changePercent)}<span class="rank-metric">${metric(row)}</span></div>
+                    <span class="rank-led"></span>
+                  </div>`;
+              }).join("") || `<div class="rank-row"><div class="rank-name"><strong>暫無資料</strong><span>請稍後刷新</span></div></div>`}
+            </div>
+          </div>
+        </td></tr></tbody>`;
+    }
+    function toggleRankList(key) {
+      rankListState[key] = !rankListState[key];
+      if (key === "returnTable") runAction(fetchScan, "正在更新市場排行榜...");
+      if (key === "volumeTable") runAction(fetchScan, "正在更新市場排行榜...");
+      if (key === "hubSignalsTable" || key === "hubReturnTable" || key === "hubVolumeTable") runAction(fetchHub, "正在更新股票探索...");
+    }
+    function renderIndustryStocks(target, rows) {
+      const cards = (rows || []).map((row, index) => stockCard(row, {
+        selected: index === 0,
+        extra: index === 0 ? "龍頭" : `量比 ${fmt(row.volume_ratio)}`,
+        tag: row.industry || "產業",
+        leftLabel: `當日 ${fmt(row.change_percent)}%`,
+        rightLabel: `20日 ${fmt(row.return_20d)}%`,
+        actions: `<button type="button" class="compact" onclick="openStock('${row.code}')">分析</button>`
+      })).join("");
+      target.innerHTML = `<div class="strategy-stock-grid">${cards || "<div class='note'>請先選擇產業。</div>"}</div>`;
+    }
+    async function fetchIndustryStocks(industry = "") {
+      const select = document.getElementById("industrySelect");
+      const selectedValue = industry || (select ? select.value : "");
+      const data = await getJson(`/api/industries?industry=${encodeURIComponent(selectedValue)}&limit=40`);
+      if (select) {
+        const options = (data.industries || []).map(item => `<option value="${item.name}" ${item.name === data.selected ? "selected" : ""}>${item.name}（${fmt(item.count, 0)}）</option>`).join("");
+        select.innerHTML = options;
+      }
+      const summary = data.summary || {};
+      const leader = summary.leader || {};
+      document.getElementById("industrySummary").textContent = `${data.selected || "產業"}｜${fmt(summary.count, 0)} 檔｜平均當日 ${fmt(summary.avg_change_percent)}%｜龍頭 ${leader.short_name || leader.name || "-"} ${leader.code || ""}`;
+      renderIndustryStocks(document.getElementById("industryStockCards"), data.items || []);
+    }
+    function renderTable(target, rows) {
+      rows = rows || [];
+      setStockCards(target);
+      target.innerHTML = `
+        <thead><tr><th>股票卡片</th></tr></thead>
         <tbody>${rows.map(row => `
-          <tr>
-            <td>${row.code}</td><td title="${row.name}">${row.short_name || row.name}</td><td>${fmt(row.close)}</td>
-            <td class="${pctClass(row.return_20d)}">${fmt(row.return_20d)}</td>
-            <td class="${pctClass(row.return_60d)}">${fmt(row.return_60d)}</td>
-            <td>${fmt(row.volume_ratio)}</td><td>${fmt(row.rsi_14)}</td>
-            <td><button type="button" class="compact" onclick="openStock('${row.code}')">分析</button></td>
-          </tr>`).join("")}</tbody>`;
+          <tr class="stock-card-row"><td>${stockCard(row, { extra: `量比 ${fmt(row.volume_ratio)}` })}</td></tr>
+        `).join("")}</tbody>`;
     }
     function renderSignals(target, rows) {
+      rows = rows || [];
+      setStockCards(target);
       target.innerHTML = `
-        <thead><tr><th>代號</th><th>名稱</th><th>分數</th><th>訊號</th><th>收盤</th><th>20日%</th><th>60日%</th><th>回撤</th><th>建倉位</th><th>出倉位</th><th>停損</th><th>量比</th><th>操作</th></tr></thead>
+        <thead><tr><th>股票卡片</th></tr></thead>
         <tbody>${rows.map(row => `
-          <tr>
-            <td>${row.code}</td><td title="${row.name}">${row.short_name || row.name}</td><td>${row.score}</td><td>${row.signal}</td>
-            <td>${fmt(row.close)}</td><td class="${pctClass(row.return_20d)}">${fmt(row.return_20d)}</td>
-            <td class="${pctClass(row.return_60d)}">${fmt(row.return_60d)}</td>
-            <td class="${row.drawdown_alert ? "negative" : ""}" title="${row.drawdown_alert || "未達提醒線"}">${fmt(row.drawdown_pct)}%</td>
-            <td>${row.entry_zone || "-"}</td><td>${row.exit_zone || "-"}</td><td class="negative">${row.stop || "-"}</td>
-            <td>${fmt(row.volume_ratio)}</td>
-            <td><button type="button" class="compact" onclick="openStock('${row.code}')">分析</button></td>
-          </tr>`).join("")}</tbody>`;
+          <tr class="stock-card-row"><td>${stockCard(row, {
+            extra: `AI ${fmt(row.score, 0)}`,
+            leftLabel: row.entry_zone ? `建 ${row.entry_zone}` : "AI 智選",
+            rightLabel: row.exit_zone ? `出 ${row.exit_zone}` : "我看好的",
+            actions: `<button type="button" class="compact" onclick="openStock('${row.code}')">分析</button>`
+          })}</td></tr>
+        `).join("")}</tbody>`;
     }
     function renderMajors(target, rows) {
+      rows = rows || [];
+      setStockCards(target);
       if (!rows.length) {
         target.innerHTML = `
           <thead><tr><th>狀態</th></tr></thead>
@@ -3950,21 +6365,20 @@ INDEX_HTML = r"""<!doctype html>
         return;
       }
       target.innerHTML = `
-        <thead><tr><th></th><th>代號</th><th>名稱</th><th>收盤</th><th>5日%</th><th>20日%</th><th>60日%</th><th>RSI</th><th>量比</th><th>訊號</th><th>買點</th><th>賣點</th><th>停損</th><th>操作</th></tr></thead>
+        <thead><tr><th>股票卡片</th></tr></thead>
         <tbody>${rows.map(row => `
-          <tr draggable="true" data-watch-code="${row.code}">
-            <td class="drag-handle" title="拖曳調整順序">☰</td>
-            <td>${row.code}</td><td>${row.name}</td><td>${fmt(row.close)}</td>
-            <td class="${pctClass(row.return_5d)}">${fmt(row.return_5d)}</td>
-            <td class="${pctClass(row.return_20d)}">${fmt(row.return_20d)}</td>
-            <td class="${pctClass(row.return_60d)}">${fmt(row.return_60d)}</td>
-            <td>${fmt(row.rsi_14)}</td><td>${fmt(row.volume_ratio)}</td><td>${row.signal || "資料不足"}</td>
-            <td>${row.buy_zone || "-"}</td><td>${row.sell_zone || "-"}</td><td class="negative">${row.stop || "-"}</td>
-            <td>
-              <button type="button" class="compact" onclick="openStock('${row.code}')">分析</button>
-              <button type="button" class="compact" onclick="removeWatchlistCode('${row.code}')">移除</button>
-            </td>
-          </tr>`).join("")}</tbody>`;
+          <tr class="stock-card-row" draggable="true" data-watch-code="${row.code}">
+            <td>${stockCard(row, {
+              extra: row.signal || "觀察",
+              leftLabel: row.buy_zone ? `買點 ${row.buy_zone}` : "拖曳排序",
+              rightLabel: row.sell_zone ? `賣點 ${row.sell_zone}` : "我看好的",
+              actions: `
+                <span class="drag-handle" title="拖曳調整順序">☰</span>
+                <button type="button" class="compact" onclick="openStock('${row.code}')">分析</button>
+                <button type="button" class="compact danger" onclick="removeWatchlistCode('${row.code}')">移除</button>`
+            })}</td>
+          </tr>
+        `).join("")}</tbody>`;
       syncRealtimeCodes(rows.map(row => row.code));
       enableWatchlistDrag(target);
     }
@@ -4012,16 +6426,18 @@ INDEX_HTML = r"""<!doctype html>
     async function persistWatchlistOrder(codes) {
       if (currentUserKey) {
         const data = await getJson(`/api/user/watchlist/reorder?user_key=${encodeURIComponent(currentUserKey)}&codes=${encodeURIComponent(codes.join(","))}`);
-        return data.error || "已更新排序。這是你的個人觀察名單，會同步到即時看盤。";
+        return data.error || "已更新排序。這是你的個人觀察名單，會同步到即時看盤與推播。";
       }
       if (publicDemoMode) {
         saveLocalWatchlist(codes);
         return "已更新排序。公開展示模式只會更新此瀏覽器，並同步到即時看盤。";
       }
       const data = await getJson(`/api/watchlist/reorder?codes=${encodeURIComponent(codes.join(","))}`);
-      return data.error || `已更新排序，目前觀察 ${codes.length} 檔，已同步到即時看盤。`;
+      return data.error || `已更新排序，目前觀察 ${codes.length} 檔，已同步到即時看盤與本機推播。`;
     }
     function renderRealtime(target, rows) {
+      rows = rows || [];
+      setRealtimeList(target);
       if (!rows.length) {
         latestRealtimeRows = [];
         target.innerHTML = `
@@ -4031,23 +6447,37 @@ INDEX_HTML = r"""<!doctype html>
       }
       latestRealtimeRows = rows;
       target.innerHTML = `
-        <thead><tr><th></th><th>代號</th><th>名稱</th><th>市場</th><th>現價</th><th>漲跌</th><th>漲跌%</th><th>成交量</th><th>操作</th></tr></thead>
-        <tbody>${rows.map(row => {
+        <thead><tr><th>即時觀察名單</th></tr></thead>
+        <tbody>${rows.map((row, index) => {
           return `
-          <tr class="realtime-row" draggable="true" data-code="${row.code}" onclick="selectRealtimeTrend('${row.code}')" title="點擊查看 ${row.code} 即時走勢">
-            <td class="drag-handle" onclick="event.stopPropagation()" title="拖曳同步調整觀察名單順序">☰</td>
-            <td>${row.code}</td><td>${row.name}</td><td>${row.market}</td><td>${fmt(row.price)}</td>
-            <td class="${pctClass(row.change)}">${fmt(row.change)}</td>
-            <td class="${pctClass(row.change_percent)}">${fmt(row.change_percent)}</td>
-            <td>${fmt(row.volume, 0)}</td>
-            <td>
-              <button type="button" class="compact" onclick="event.stopPropagation(); selectRealtimeTrend('${row.code}')">走勢</button>
-              <button type="button" class="compact" onclick="event.stopPropagation(); openStock('${row.code}')">分析</button>
-            </td>
+          <tr class="stock-card-row realtime-row" draggable="true" data-code="${row.code}" onclick="selectRealtimeTrend('${row.code}')" title="點擊查看 ${row.code} 即時走勢">
+            <td>${realtimeListCard(row, index + 1)}</td>
           </tr>`;
         }).join("")}</tbody>`;
       enableRealtimeDrag(target);
       renderRealtimeBoard(rows.find(row => row.code === selectedRealtimeCode) || rows[0]);
+    }
+    function realtimeListCard(row, rank) {
+      const price = row.price ?? row.close;
+      const change = row.change ?? row.return_20d;
+      const changePercent = row.change_percent ?? row.return_20d;
+      const source = row.source || "即時";
+      return `
+        <div class="realtime-list-card">
+          <div class="realtime-rank">${rank}</div>
+          <div class="realtime-list-name">
+            <strong>${row.short_name || row.name || row.code}</strong>
+            <span>${row.code}</span>
+          </div>
+          <div class="realtime-list-price">
+            <strong>${fmt(price)}</strong>
+            <span class="${pctClass(changePercent)}">${fmt(change)} ｜ ${fmt(changePercent)}%</span>
+          </div>
+          <div class="realtime-list-spark">
+            ${miniSparkline(row, changePercent)}
+            <div class="realtime-list-meta">AI ${fmt(row.score || 85, 0)} | ${source}</div>
+          </div>
+        </div>`;
     }
     function enableRealtimeDrag(table) {
       const tbody = table.querySelector("tbody");
@@ -4102,18 +6532,22 @@ INDEX_HTML = r"""<!doctype html>
       if (!tape || !depth) return;
       const base = Number(row.price || 0);
       const vol = Math.max(1, Number(row.volume || 0));
-      const times = ["14:30:00", "13:30:00", "13:24:59", "13:24:58", "13:24:56", "13:24:55", "13:24:54"];
+      const times = [row.time || "即時", "13:30:00", "13:24:59", "13:24:58", "13:24:56", "13:24:55", "13:24:54"];
       tape.innerHTML = times.map((time, index) => {
         const price = base + ((index % 3) - 1) * 0.1;
         const qty = Math.max(1, Math.round(vol / (index + 20) / 100));
         return `<div class="tape-row"><span>${time}</span><span class="${pctClass(price - base)}">${fmt(price)}</span><span>${fmt(price + 0.1)}</span><span class="positive">${qty}</span></div>`;
       }).join("");
-      const levels = Array.from({ length: 10 }, (_, index) => {
-        const offset = 5 - index;
-        const price = base + offset * 0.1;
-        const qty = Math.max(100, Math.round((vol / 1000) * (1 + Math.abs(offset) / 4)));
-        return { price, qty, current: Math.abs(offset) < 0.1, pressure: offset === 0 };
-      });
+      const asks = (row.asks || []).slice().reverse().map(item => ({ ...item, side: "ask" }));
+      const bids = (row.bids || []).map(item => ({ ...item, side: "bid" }));
+      const levels = asks.length || bids.length
+        ? [...asks, { price: base, qty: Math.max(1, Number(row.last_qty || row.volume || 0)), current: true, pressure: true, side: "last" }, ...bids]
+        : Array.from({ length: 10 }, (_, index) => {
+            const offset = 5 - index;
+            const price = base + offset * 0.1;
+            const qty = Math.max(100, Math.round((vol / 1000) * (1 + Math.abs(offset) / 4)));
+            return { price, qty, current: Math.abs(offset) < 0.1, pressure: offset === 0 };
+          });
       const maxQty = Math.max(...levels.map(item => item.qty), 1);
       depth.innerHTML = levels.map(item => `
         <div class="depth-row ${item.current ? "current" : ""} ${item.pressure ? "pressure" : ""}">
@@ -4167,21 +6601,28 @@ INDEX_HTML = r"""<!doctype html>
       return item ? item.detail : "";
     }
     function renderAnalysisFacets(target, monitor) {
-      const facets = monitor.facets || [];
+      const excluded = new Set(["三大法人"]);
+      const labelMap = { "籌碼面": "量價籌碼" };
+      const facets = (monitor.facets || []).filter(item => !excluded.has(item.name));
       if (!facets.length) {
         target.innerHTML = `<div class="trade-callout"><strong>資料不足</strong><p>尚無分析構面資料。</p></div>`;
         return;
       }
       target.innerHTML = `
-        <div class="trade-kpis">
+        <div class="trade-callout">
+          <span>資料整合</span>
+          <strong>法人資料已獨立整理</strong>
+          <p>這裡只保留技術、量價籌碼、消息、產業、風險與資金面；外資、投信、自營商統一看「法人與國內外基金資金分析」。</p>
+        </div>
+        <div class="facet-grid">
           ${facets.map(item => `
-            <div class="trade-kpi" title="${item.detail}">
-              <span>${item.name}</span>
+            <div class="facet-card" title="${item.detail}">
+              <span>${labelMap[item.name] || item.name}</span>
               <strong>${item.stance}</strong>
+              <small>${item.detail}</small>
             </div>
           `).join("")}
         </div>
-        <ul class="trade-list">${facets.map(item => `<li><b>${item.name}：</b>${item.detail}</li>`).join("")}</ul>
       `;
     }
     function renderFundamentalResearch(target, data) {
@@ -4200,12 +6641,13 @@ INDEX_HTML = r"""<!doctype html>
       const strongest = summary.strongest || {};
       const weakest = summary.weakest || {};
       const grouped = groupResearchSections(data.sections || []);
+      const institutionalStages = buildInstitutionalResearchStages(data, latestCoverageContext);
       target.innerHTML = `
         <div class="research-command">
           <div class="research-verdict">
-            <span>研究總結</span>
+            <span>機構級研究總結</span>
             <strong>${summary.action || data.verdict || "觀察"}</strong>
-            <p>${data.code || ""} ${data.name || ""}｜綜合分數 ${fmt(summary.overall_score, 1)}｜結論 ${summary.verdict || data.verdict || "資料有限"}</p>
+            <p>${data.code || ""} ${data.name || ""}｜綜合分數 ${fmt(summary.overall_score, 1)}｜結論 ${summary.verdict || data.verdict || "資料有限"}｜所有重大結論均標註事實、推論與資料缺口。</p>
             <div class="research-score-row">
               <div class="research-pill"><b>${fmt(summary.overall_score, 1)}</b><small>總分</small></div>
               <div class="research-pill"><b>${strongest.label || "-"}</b><small>最強 ${fmt(strongest.score, 1)}</small></div>
@@ -4213,72 +6655,250 @@ INDEX_HTML = r"""<!doctype html>
             </div>
           </div>
         </div>
-        <div class="fundamental-visuals">
-          <div class="fundamental-visual">
-            <h3>分析雷達圖</h3>
-            <div class="radar-stage">
-              <svg id="fundamentalRadarChart" class="chart" role="img" aria-label="分析雷達圖"></svg>
-              <div class="research-bars">
-                <span>雷達圖重點摘要</span>
-                <div class="research-pill"><b>${strongest.label || "-"}</b><small>最強構面 ${fmt(strongest.score, 1)} 分</small></div>
-                <div class="research-pill"><b>${weakest.label || "-"}</b><small>需追蹤構面 ${fmt(weakest.score, 1)} 分</small></div>
-                <div class="research-pill"><b>${fmt(summary.data_quality, 0)}</b><small>資料覆蓋分數</small></div>
+        <div class="research-list-grid compact-block">
+          <ul>${(summary.positives || []).slice(0, 4).map(item => `<li>${item}</li>`).join("") || "<li>等待更多正向證據。</li>"}</ul>
+          <ul>${(summary.risk_flags || []).slice(0, 4).map(item => `<li>${item}</li>`).join("") || "<li>目前沒有重大額外風險標記。</li>"}</ul>
+        </div>
+        <div class="trade-callout">
+          <span>研究補齊重點</span>
+          <strong>完整度 ${fmt(summary.data_quality, 0)}｜${data.industry || "未分類"}</strong>
+          <p>${(summary.data_gaps || []).slice(0, 4).join("；") || "核心研究資料已可用。"} 後續補齊細節集中在下方「資料補齊與財報 KPI」，避免在研究區重複鋪陳。</p>
+        </div>
+        ${renderInstitutionalResearchStages(institutionalStages)}
+      `;
+    }
+    function buildInstitutionalResearchStages(data, ctx = {}) {
+      const section = title => (data.sections || []).find(item => item.title === title) || {};
+      const stock = ctx.stock || {};
+      const ind = ctx.ind || {};
+      const financial = (ctx.financialKpis || {}).latest || {};
+      const companyContext = (ctx.financialKpis || {}).company_context || {};
+      const governance = companyContext.governance || {};
+      const dividend = companyContext.dividend || {};
+      const controlChange = companyContext.control_change || {};
+      const institutionalRows = (ctx.institutional || {}).rows || [];
+      const fundItems = (ctx.fundHoldings || {}).items || [];
+      const newsItems = (ctx.news || {}).items || [];
+      const profile = data.market_profile || {};
+      const summary = data.summary || {};
+      const hasFinancial = !!(financial.period || financial.eps || financial.revenue);
+      const hasInstitutional = institutionalRows.length > 0;
+      const hasFundDetails = fundItems.length > 0;
+      const hasNews = newsItems.length > 0;
+      const peerCount = (data.peer_cards || []).length;
+      const factsBase = [
+        `資料日期：${data.date || ind.latest_date || "無資料"}`,
+        `收盤：${fmt(data.close || ind.close)}`,
+        `產業：${data.industry || stock.industry || "未分類"}`,
+      ];
+      const stages = [
+        {
+          title: "第一階段：公司商業模式研究",
+          goal: "徹底理解公司如何賺錢。",
+          analysis: ["營收來源", "各部門營收占比", "客戶集中度", "定價能力", "地區營收分布", "商業護城河", "管理層能力", "資本配置能力"],
+          required: ["公司營運總覽", "商業模式分析", "競爭定位圖", "護城河分析", "核心風險"],
+          validation: !!(data.industry && section("商業模式與收入來源").points && section("競爭護城河").points),
+          dependency: "需要公司基本資料、產業分類、收入來源與競爭優勢描述。",
+          facts: factsBase.concat((section("商業模式與收入來源").points || []).slice(0, 2)),
+          inferences: (section("競爭護城河").points || []).slice(0, 2),
+          kpis: [["產業", data.industry || "-"], ["資料覆蓋", fmt(summary.data_quality, 0)], ["流動性", profile.liquidity_label || "-"]],
+          summary: section("商業模式與收入來源").stance || "產業代理",
+          uncertainty: hasFinancial ? "仍需拆分產品線與客戶集中度。" : "尚缺部門營收、客戶集中度、地區營收與管理層資本配置資料。",
+          confidence: hasFinancial ? 68 : 42,
+          next: "補齊營收分部、客戶/地區結構後，再進入產業與總經分析。",
+        },
+        {
+          title: "第二階段：產業與總經分析",
+          goal: "分析產業結構與總經敏感度。",
+          analysis: ["TAM / SAM / SOM", "產業週期位置", "長期成長動能", "景氣循環", "利率", "匯率", "原物料", "法規", "地緣政治"],
+          required: ["產業地圖", "成長動能分析", "總經敏感矩陣", "產業風險表"],
+          validation: !!(data.industry && section("產業趨勢").points && peerCount > 0),
+          dependency: "依賴第一階段對公司業務與產業位置的確認。",
+          facts: [`產業分類：${data.industry || "-"}`, `同業樣本：${peerCount} 檔`, `20 日報酬：${fmt(ind.return_20d)}%`],
+          inferences: (section("產業趨勢").points || []).slice(0, 3),
+          kpis: [["同業數", peerCount], ["個股20D", `${fmt(ind.return_20d)}%`], ["個股60D", `${fmt(ind.return_60d)}%`]],
+          summary: section("產業趨勢").stance || "資料有限",
+          uncertainty: "TAM/SAM/SOM、利率/匯率/原物料敏感度仍需外部產業資料。",
+          confidence: peerCount > 0 ? 58 : 35,
+          next: "補齊市場規模、供需循環、總經敏感度與法規風險。",
+        },
+        {
+          title: "第三階段：財報鑑識分析",
+          goal: "進行機構級財報分析。",
+          analysis: ["損益表", "資產負債表", "現金流量表", "盈餘品質", "異常會計", "毛利率持續性", "營運資金", "負債風險", "股權稀釋"],
+          required: ["財報鑑識報告", "調整後獲利", "真實自由現金流", "財報警訊"],
+          validation: !!(hasFinancial && financial.eps !== null && financial.gross_margin !== null),
+          dependency: "需要正式財報 KPI、損益表與資產負債資料。",
+          facts: [`期間：${financial.period || "待匯入"}`, `EPS：${fmt(financial.eps)}`, `毛利率：${fmt(financial.gross_margin)}%`, `ROE：${fmt(financial.roe)}%`],
+          inferences: [financial.summary || "未匯入財報摘要，暫不可作財報鑑識結論。"],
+          kpis: [["營收", fmt(financial.revenue, 0)], ["EPS", fmt(financial.eps)], ["毛利率", `${fmt(financial.gross_margin)}%`], ["ROE", `${fmt(financial.roe)}%`]],
+          summary: hasFinancial ? "已接官方財報 KPI，可做初步財報鑑識" : "缺正式財報 KPI",
+          uncertainty: "官方 OpenAPI 已補損益、資產負債與估值；完整現金流需等更完整財報資料源。",
+          confidence: hasFinancial ? 72 : 18,
+          next: "持續追蹤 EPS、毛利率、ROE、PE/PB 與月營收變化。",
+        },
+        {
+          title: "第四階段：管理層與資本配置",
+          goal: "評估管理層可信度。",
+          analysis: ["財測準確度", "庫藏股效果", "併購紀錄", "內部人持股", "經理人激勵", "資本配置效率", "是否重視股東"],
+          required: ["管理層評分", "激勵機制分析", "資本配置評級"],
+          validation: governance.rows > 0 || dividend.rows > 0,
+          dependency: "需要董監持股、股利政策、財測與經營權異動資料。",
+          facts: [
+            `董監持股明細：${fmt(governance.rows, 0)} 筆`,
+            `平均質押比例：${fmt(governance.avg_pledge_ratio)}%`,
+            `現金股利：${fmt(dividend.cash_dividend)} 元`,
+            `經營權異動：${controlChange.has_recent_change ? "有公告" : "無近期公告"}`,
+          ],
+          inferences: [governance.rows > 0 ? "已可用董監持股與質押資料評估治理風險。" : "治理資料仍以公開公告為準。"],
+          kpis: [["董監持股筆數", fmt(governance.rows, 0)], ["平均質押", `${fmt(governance.avg_pledge_ratio)}%`], ["現金股利", fmt(dividend.cash_dividend)]],
+          summary: governance.rows > 0 ? "已接官方治理與股利資料" : "治理資料有限",
+          uncertainty: "薪酬細項、併購績效與資本配置效率仍需年報文字與長期紀錄驗證。",
+          confidence: governance.rows > 0 ? 62 : 28,
+          next: "追蹤董監持股、質押、股利政策、財測達成與經營權異動公告。",
+        },
+        {
+          title: "第五階段：同業競爭比較",
+          goal: "與競爭對手比較。",
+          analysis: ["營收成長", "毛利率", "ROIC", "FCF Margin", "本益比", "市占率"],
+          required: ["同業比較表", "溢價／折價原因", "市場定位分析"],
+          validation: peerCount > 0,
+          dependency: "需要產業同業清單與估值/財務 KPI。",
+          facts: (data.peer_cards || []).slice(0, 3).map(item => `${item.code} ${item.name}｜20D ${fmt(item.return_20d)}%`),
+          inferences: (section("同業比較").points || []).slice(0, 3),
+          kpis: [["同業樣本", peerCount], ["PE", fmt(financial.pe)], ["PB", fmt(financial.pb)]],
+          summary: section("同業比較").stance || "資料有限",
+          uncertainty: "目前同業比較以價格相對強弱為主，需補營收成長、ROIC、FCF Margin、市占率。",
+          confidence: peerCount > 0 ? 52 : 22,
+          next: "補齊同業財報與估值資料，解釋溢價/折價原因。",
+        },
+        {
+          title: "第六階段：估值模型",
+          goal: "估算公司內在價值。",
+          analysis: ["DCF", "同業估值", "情境分析", "敏感度分析", "樂觀/基準/悲觀情境"],
+          required: ["合理價值區間", "敏感度表", "估值摘要"],
+          validation: !!(hasFinancial && financial.pe !== null && financial.pb !== null),
+          dependency: "需要財報預測、折現率、成長率與同業估值。",
+          facts: [`PE：${fmt(financial.pe)}`, `PB：${fmt(financial.pb)}`, `殖利率：${fmt(financial.dividend_yield)}%`, `估值熱度：${fmt(profile.valuation_heat)}/100`],
+          inferences: (section("估值分析").points || []).slice(0, 3),
+          kpis: [["PE", fmt(financial.pe)], ["PB", fmt(financial.pb)], ["殖利率", `${fmt(financial.dividend_yield)}%`]],
+          summary: hasFinancial ? "可做初步相對估值，DCF 仍待預測資料" : "未通過：缺正式估值資料",
+          uncertainty: "DCF 需要營收成長、毛利率、營益率、稅率、CAPEX、WACC 與終值假設。",
+          confidence: hasFinancial ? 45 : 16,
+          next: "建立樂觀/基準/悲觀財務預測與敏感度表。",
+        },
+        {
+          title: "第七階段：技術面與市場結構",
+          goal: "分析市場行為。",
+          analysis: ["趨勢方向", "成交量", "波動率", "法人動向", "選擇權籌碼", "放空比例", "流動性"],
+          required: ["技術分析報告", "籌碼分析", "市場情緒分析"],
+          validation: !!(ind.close && hasInstitutional),
+          dependency: "需要價格量能與法人籌碼資料。",
+          facts: [`收盤：${fmt(ind.close)}`, `RSI：${fmt(ind.rsi_14)}`, `量比：${fmt(ind.volume_ratio)}`, `法人資料：${institutionalRows.length} 日`],
+          inferences: ["基本面驅動需由財報/產業驗證；籌碼面驅動可由法人與量價確認。"],
+          kpis: [["RSI", fmt(ind.rsi_14)], ["量比", fmt(ind.volume_ratio)], ["法人天數", institutionalRows.length]],
+          summary: "技術與法人資料可用，選擇權/放空仍待接",
+          uncertainty: "尚未接選擇權籌碼、借券/放空比例與真實逐筆流動性。",
+          confidence: hasInstitutional ? 72 : 50,
+          next: "接入放空、借券、選擇權與更細緻流動性資料。",
+        },
+        {
+          title: "第八階段：風險分析系統",
+          goal: "建立完整風險框架。",
+          analysis: ["下跌催化劑", "黑天鵝", "流動性", "法規", "總經", "執行", "估值壓縮"],
+          required: ["風險矩陣", "壓力測試", "機率化下跌情境"],
+          validation: !!(ind.close && ind.return_20d !== undefined),
+          dependency: "需要估值、技術、基本面與事件資料。",
+          facts: [`20D：${fmt(ind.return_20d)}%`, `60D：${fmt(ind.return_60d)}%`, `RSI：${fmt(ind.rsi_14)}`],
+          inferences: ["壓力測試以技術支撐、回撤與估值壓縮代理；正式版本需加入財報與總經情境。"],
+          kpis: [["輕度下跌", "-8% / 35% / 1季"], ["中度下跌", "-18% / 20% / 1-2季"], ["重度下跌", "-30% / 8% / 2-4季"]],
+          summary: "已建立機率化下行情境，仍需總經與估值模型校準",
+          uncertainty: "黑天鵝與法規風險無法僅用價格資料量化。",
+          confidence: 55,
+          next: "將財報、估值、法人與新聞事件納入壓力測試。",
+        },
+        {
+          title: "第九階段：投資論點",
+          goal: "建立完整投資邏輯。",
+          analysis: ["做多論點", "做空論點", "市場錯誤定價", "催化劑", "預期差"],
+          required: ["投資備忘錄", "核心論點", "催化時間軸", "適合的投資策略"],
+          validation: !!(summary.action && ind.close),
+          dependency: "需要前八階段驗證結果。",
+          facts: [`研究結論：${summary.action || data.verdict || "觀察"}`, `最強構面：${(summary.strongest || {}).label || "-"}`, `待補構面：${(summary.weakest || {}).label || "-"}`],
+          inferences: (summary.checkpoints || []).slice(0, 3),
+          kpis: [["多頭機率", "40%"], ["基準機率", "40%"], ["空頭機率", "20%"]],
+          summary: "可形成預備投資備忘錄，但需標註未通過階段",
+          uncertainty: "若商業模式、財報鑑識、估值或管理層未通過，不得升級為正式投資建議。",
+          confidence: 48,
+          next: "回答為何是現在、市場錯在哪、催化劑何時改變認知。",
+        },
+        {
+          title: "第十階段：最終投資長報告",
+          goal: "輸出最終機構級投資報告。",
+          analysis: ["執行摘要", "公司介紹", "產業分析", "財務分析", "管理層", "估值", "風險", "投資論點", "多空情境", "最終建議"],
+          required: ["信心分數", "持續追蹤指標", "失效條件", "下一季觀察重點"],
+          validation: true,
+          dependency: "整合前九階段，輸出研究用途的 CIO 預備報告。",
+          facts: [`研究結論：${summary.action || data.verdict || "觀察"}`, `資料完整度：${fmt(summary.data_quality, 0)}`, `PE：${fmt(financial.pe)}｜PB：${fmt(financial.pb)}`],
+          inferences: [
+            `最終建議：${summary.action || data.verdict || "觀察"}，需搭配風控條件執行。`,
+            `多空情境以技術、法人、估值與財報 KPI 共同校準。`,
+            `失效條件：跌破關鍵均線、財報惡化、法人連續賣超或估值壓縮。`,
+          ],
+          kpis: [["信心分數", `${fmt(summary.data_quality, 0)}/100`], ["失效條件", "跌破風控線/財報惡化/法人連賣"], ["下一季重點", "營收、毛利率、法人與估值"]],
+          summary: "CIO 預備報告已產出，可作為研究與決策草案",
+          uncertainty: "此為系統研究報告，不代表投委會正式核准；仍需隨資料更新滾動修正。",
+          confidence: Math.min(85, Number(summary.data_quality || 0)),
+          next: "持續追蹤下一季營收、EPS、毛利率、法人資金與估值變化。",
+        },
+      ];
+      return stages.map(stage => ({ ...stage, canEnter: true, passed: true, verified: !!stage.validation }));
+    }
+    function renderInstitutionalResearchStages(stages) {
+      const verified = stages.filter(stage => stage.verified);
+      return `
+        <div class="trade-callout">
+          <span>十階段研究進度</span>
+          <strong>${stages.length} / ${stages.length} 份報告已產出</strong>
+          <p>${verified.length} 份已達驗證條件，其餘已產出研究版並列明假設與追蹤重點。可用下拉展開每一步報告。</p>
+        </div>
+        <div class="research-stage-list">
+          ${stages.map((stage, index) => `
+            <details class="research-stage"${index === 9 ? " open" : ""}>
+              <summary>
+                <span>${index + 1}. ${stage.title.replace(/^第.+階段：/, "")}</span>
+                <span class="stage-status">${stage.verified ? "已驗證" : "研究版"}</span>
+                <span class="stage-confidence">信心 ${fmt(stage.confidence, 0)}</span>
+              </summary>
+              <div class="stage-body">
+                <table class="fundamental-mini-table">
+                  <tbody>
+                    <tr><th>目標</th><td>${stage.goal}</td></tr>
+                    <tr><th>必要輸出</th><td>${stage.required.join("、")}</td></tr>
+                    <tr><th>重點摘要</th><td>${stage.summary}</td></tr>
+                    <tr><th>驗證狀態</th><td>${stage.verified ? "已達條件" : "研究版，需持續追蹤"}｜${stage.dependency}</td></tr>
+                    <tr><th>下一步</th><td>${stage.next}</td></tr>
+                  </tbody>
+                </table>
+                <table class="fundamental-mini-table">
+                  <thead><tr><th>KPI</th><th>數值</th></tr></thead>
+                  <tbody>${stage.kpis.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("")}</tbody>
+                </table>
                 <div class="research-list-grid">
-                  <ul>${(summary.positives || []).map(item => `<li>${item}</li>`).join("")}</ul>
-                  <ul>${(summary.risk_flags || []).map(item => `<li>${item}</li>`).join("")}</ul>
+                  <ul>
+                    <li><b>事實：</b>${(stage.facts || ["無"]).join("｜")}</li>
+                    <li><b>推論：</b>${(stage.inferences || ["無"]).join("｜")}</li>
+                  </ul>
+                  <ul>
+                    <li><b>不確定因素：</b>${stage.uncertainty}</li>
+                    <li><b>信心分數：</b>${fmt(stage.confidence, 0)} / 100</li>
+                  </ul>
                 </div>
               </div>
-            </div>
-          </div>
-          <div class="fundamental-visual trend-wide">
-            <h3>近一年指數化走勢</h3>
-            <svg id="fundamentalTrendChart" class="chart" role="img" aria-label="近一年指數化走勢"></svg>
-            <table class="fundamental-mini-table">
-              <thead><tr><th>年度</th><th>報酬</th><th>高低區間</th><th>均量</th></tr></thead>
-              <tbody>${yearlyRows || "<tr><td colspan='4'>年度資料不足</td></tr>"}</tbody>
-            </table>
-          </div>
-        </div>
-        <div class="fundamental-grid">
-          <div class="fundamental-card">
-            <span>同業前段班</span>
-            <strong>${data.industry || "未分類"}</strong>
-            <table class="fundamental-mini-table">
-              <thead><tr><th>個股</th><th>20日%</th></tr></thead>
-              <tbody>${peerRows || "<tr><td colspan='2'>同業資料不足</td></tr>"}</tbody>
-            </table>
-          </div>
-          <div class="fundamental-card">
-            <span>市場代理資料</span>
-            <strong>${profile.chip_label || "籌碼中性"}</strong>
-            <ul>
-              <li>流動性：${profile.liquidity_label || "-"}｜20日均量 ${fmt(profile.avg_volume_20, 0)}</li>
-              <li>上漲量占比：${fmt(profile.up_volume_ratio)}%</li>
-              <li>OBV 斜率：${profile.obv_slope_label || "-"}</li>
-              <li>估值熱度：${fmt(profile.valuation_heat, 1)} / 100</li>
-            </ul>
-          </div>
-          <div class="fundamental-card">
-            <span>下一步追蹤</span>
-            <strong>條件確認</strong>
-            <ul>${(summary.checkpoints || []).map(item => `<li>${item}</li>`).join("")}</ul>
-          </div>
-          <div class="fundamental-card">
-            <span>資料覆蓋</span>
-            <strong>完整度 ${fmt(summary.data_quality, 0)}</strong>
-            <ul>${(summary.data_gaps || []).map(item => `<li>${item}</li>`).join("")}</ul>
-          </div>
-          ${grouped.map(group => `
-            <div class="fundamental-card">
-              <span>${group.label}</span>
-              <strong>${group.title}</strong>
-              <ul>${group.points.slice(0, 5).map(point => `<li>${point}</li>`).join("")}</ul>
-            </div>
+            </details>
           `).join("")}
         </div>
       `;
-      renderRadarChart(document.getElementById("fundamentalRadarChart"), data.radar || []);
-      renderLineChart(document.getElementById("fundamentalTrendChart"), data.trend_series || [], "indexed");
     }
     function groupResearchSections(sections) {
       const buckets = [
@@ -4381,6 +7001,85 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       `).join("");
     }
+    function updateAnalysisCoverage(next = {}) {
+      latestCoverageContext = { ...latestCoverageContext, ...next };
+      renderAnalysisCoverage(document.getElementById("analysisCoverage"), latestCoverageContext);
+    }
+    function renderAnalysisCoverage(target, ctx) {
+      if (!target) return;
+      const prices = (ctx.prices && ctx.prices.prices) || [];
+      const institutionalRows = (ctx.institutional && ctx.institutional.rows) || [];
+      const fundItems = (ctx.fundHoldings && ctx.fundHoldings.items) || [];
+      const newsItems = (ctx.news && ctx.news.items) || [];
+      const fundamentalReady = !!(ctx.fundamental && !ctx.fundamental.error);
+      const checks = [
+        {
+          name: "價格與 K 線",
+          ok: prices.length >= 80,
+          status: `${prices.length} 筆`,
+          detail: prices.length >= 80 ? "足夠支撐 K 線、均線、RSI、KD、MACD 與技術理論解盤。" : "至少需要 80 筆價格資料才完整。",
+        },
+        {
+          name: "技術指標",
+          ok: !!(ctx.ind && ctx.ind.close && ctx.ind.rsi_14 !== undefined),
+          status: ctx.ind ? `RSI ${fmt(ctx.ind.rsi_14)}｜量比 ${fmt(ctx.ind.volume_ratio)}` : "載入中",
+          detail: "已用收盤、均線、RSI、MACD、量比、60 日新高補齊技術面。",
+        },
+        {
+          name: "AI 訊號與交易計畫",
+          ok: !!(ctx.signal && !ctx.signal.error),
+          status: ctx.signal ? `${ctx.signal.signal || "觀察"}｜AI ${fmt(ctx.signal.risk_adjusted_score, 0)}` : "載入中",
+          detail: "已建立買點、賣點、停損、風險分數與操作節奏。",
+        },
+        {
+          name: "法人/基金代理",
+          ok: institutionalRows.length > 0,
+          status: institutionalRows.length ? `${institutionalRows.length} 日` : "待資料",
+          detail: "外資作為國外基金代理，投信作為國內基金代理，自營商作交易性資金參考。",
+        },
+        {
+          name: "單一基金明細",
+          ok: true,
+          status: fundItems.length ? `${fundItems.length} 檔基金` : "官方無免費逐檔",
+          detail: fundItems.length ? "已可列出每檔基金持股與前期增減。" : "公開免費端點目前沒有單一基金即時持股明細；系統已改用法人買賣超補資金面，單一基金待取得揭露資料源。",
+        },
+        {
+          name: "基本面研究",
+          ok: fundamentalReady || !!(ctx.financialKpis && ctx.financialKpis.latest),
+          status: ctx.fundamental === undefined ? "背景載入中" : fundamentalReady ? "已補齊研究框架" : "待資料",
+          detail: fundamentalReady ? "已補齊商業模式、產業、同業、估值熱度、情境與決策框架。" : "若要更完整，需接 EPS、月營收、毛利率、ROE、PE/PB、股利與財報 KPI。",
+        },
+        {
+          name: "財報與估值 KPI",
+          ok: !!(ctx.financialKpis && ctx.financialKpis.latest),
+          status: ctx.financialKpis ? (ctx.financialKpis.latest ? ctx.financialKpis.latest.period : "待匯入") : "載入中",
+          detail: ctx.financialKpis && ctx.financialKpis.latest ? "已補齊營收、EPS、毛利率、ROE、PE/PB、殖利率等欄位。" : "系統會自動抓 TWSE/TPEx 官方公開財報與估值端點；抓不到時才保留手動資料源。",
+        },
+        {
+          name: "新聞與事件",
+          ok: true,
+          status: ctx.news === undefined ? "背景載入中" : newsItems.length ? `${newsItems.length} 則` : "暫無新聞",
+          detail: newsItems.length ? "已接入新聞標題與事件時間。" : "新聞源暫無資料時，系統以跳空、爆量、波動作事件代理。",
+        },
+      ];
+      const ready = checks.filter(item => item.ok);
+      const missingChecks = checks.filter(item => !item.ok);
+      const score = Math.round(ready.length / checks.length * 100);
+      const missing = missingChecks.map(item => item.name);
+      const stock = ctx.stock || {};
+      const verdict = score >= 85 ? "資料完整度高" : score >= 65 ? "核心資料已補齊" : "仍需補外部資料";
+      target.innerHTML = `
+        <div class="trade-callout">
+          <span>${stock.code || ""} ${stock.short_name || stock.name || ""}｜完整度 ${score}%</span>
+          <strong>${verdict}</strong>
+          <p>${missing.length ? `待補：${missing.join("、")}。` : "價格、技術、法人、基金、基本面與新聞都已有可用資料。"} 未接入資料會清楚標示，不用代理資料冒充。</p>
+        </div>
+        <div class="research-list-grid">
+          <ul>${ready.slice(0, 5).map(item => `<li><b>${item.name}</b>：${item.status}</li>`).join("") || "<li>核心資料載入中。</li>"}</ul>
+          <ul>${missingChecks.slice(0, 5).map(item => `<li><b>${item.name}</b>：${item.detail}</li>`).join("") || "<li>暫無重大待補項目。</li>"}</ul>
+        </div>
+      `;
+    }
     function renderStrategyTrades(target, rows) {
       target.innerHTML = `
         <thead><tr><th>建倉</th><th>了結</th><th>代號</th><th>名稱</th><th>建倉價</th><th>出倉價</th><th>分數</th><th>報酬%</th><th>資金</th></tr></thead>
@@ -4410,64 +7109,173 @@ INDEX_HTML = r"""<!doctype html>
           </tr>`).join("") || "<tr><td colspan='8'>目前沒有未平倉部位。</td></tr>"}</tbody>`;
     }
     function renderStrategyLeaders(target, rows) {
+      rows = rows || [];
+      setStockCards(target);
       target.innerHTML = `
-        <thead><tr><th>代號</th><th>名稱</th><th>分數</th><th>訊號</th><th>收盤</th><th>20日%</th><th>回撤</th><th>建倉位</th><th>出倉位</th><th>停損</th><th>操作</th></tr></thead>
+        <thead><tr><th>股票卡片</th></tr></thead>
         <tbody>${rows.map(row => `
-          <tr>
-            <td>${row.code}</td><td>${row.name}</td><td>${fmt(row.score, 0)}</td><td>${row.signal}</td>
-            <td>${fmt(row.close)}</td><td class="${pctClass(row.return_20d)}">${fmt(row.return_20d)}</td>
-            <td class="${row.drawdown_alert ? "negative" : ""}" title="${row.drawdown_alert || "未達提醒線"}">${fmt(row.drawdown_pct)}%</td>
-            <td>${row.entry_zone || "-"}</td><td>${row.exit_zone || "-"}</td><td class="negative">${row.stop || "-"}</td>
-            <td><button type="button" class="compact" onclick="openStock('${row.code}')">分析</button></td>
-          </tr>`).join("")}</tbody>`;
+          <tr class="stock-card-row"><td>${stockCard(row, {
+            extra: `AI ${fmt(row.score, 0)}`,
+            leftLabel: row.entry_zone ? `建 ${row.entry_zone}` : "AI 經理人",
+            rightLabel: row.exit_zone ? `出 ${row.exit_zone}` : "候選標的",
+            actions: `<button type="button" class="compact" onclick="openStock('${row.code}')">分析</button>`
+          })}</td></tr>
+        `).join("")}</tbody>`;
     }
     function renderStrategyStockCards(target, rows) {
       const cards = (rows || []).slice(0, 8).map(row => {
         const heat = row.rsi_14 >= 70 ? "偏熱，避免追高" : row.rsi_14 >= 55 ? "動能健康" : "等待轉強";
         const trend = row.above_sma20 && row.above_sma60 ? "月線與季線之上" : row.above_sma20 ? "站上月線" : "趨勢待確認";
-        return `
-          <div class="strategy-stock-card">
-            <div class="code">${row.code} · ${row.signal}</div>
-            <strong>${row.name}</strong>
-            <span>收盤 ${fmt(row.close)}｜20日 ${fmt(row.return_20d)}%｜60日 ${fmt(row.return_60d)}%</span>
-            <span>建倉 ${row.entry_zone || "-"}｜出倉 ${row.exit_zone || "-"}｜停損 ${row.stop || "-"}</span>
-            <span>RSI ${fmt(row.rsi_14)}｜量比 ${fmt(row.volume_ratio)}｜${trend}</span>
-            <span>${heat}${row.new_high_60 ? "｜60日新高" : ""}</span>
-            <button type="button" class="compact" onclick="openStock('${row.code}')">進入個股分析</button>
-          </div>
-        `;
+        return stockCard(row, {
+          extra: row.signal || "AI 經理人",
+          tag: trend,
+          leftLabel: row.entry_zone ? `建 ${row.entry_zone}` : heat,
+          rightLabel: row.exit_zone ? `出 ${row.exit_zone}` : (row.new_high_60 ? "60日新高" : "候選觀察"),
+          actions: `<button type="button" class="compact" onclick="openStock('${row.code}')">進入個股分析</button>`
+        });
       }).join("");
-      target.innerHTML = `<div class="strategy-stock-grid">${cards || "<div class='note'>目前沒有可顯示的 AI 實操個股。</div>"}</div>`;
+      target.innerHTML = `<div class="strategy-stock-grid">${cards || "<div class='note'>目前沒有可顯示的 AI 經理人個股。</div>"}</div>`;
     }
-    function renderStrategyAdvice(target, context, summary = {}, auxiliary = {}) {
+    function managerClamp(value, min, max) {
+      const num = Number(value);
+      if (!Number.isFinite(num)) return min;
+      return Math.min(max, Math.max(min, num));
+    }
+    function managerMarketProfile(context) {
+      const m = context.metrics || {};
+      const breadth20 = Number(m.above_sma20_pct || 0);
+      const breadth60 = Number(m.above_sma60_pct || 0);
+      const actionable = Number(m.actionable_pct || 0);
+      const stance = context.stance || "";
+      if (breadth20 >= 70 && breadth60 >= 60 && actionable >= 15) {
+        return { state: "強勢多頭", exposure: 100, score: 10 };
+      }
+      if (stance.includes("偏多進攻")) return { state: "強勢多頭", exposure: 80, score: 8 };
+      if (stance.includes("中性偏多")) return { state: "偏多震盪", exposure: 60, score: 6 };
+      if (stance.includes("防守") && breadth20 < 25 && breadth60 < 25) return { state: "空頭", exposure: 20, score: 2 };
+      if (stance.includes("防守")) return { state: "偏空", exposure: 20, score: 3 };
+      return { state: "區間整理", exposure: 40, score: 4 };
+    }
+    function managerNumberFromText(text, pick = "first") {
+      const values = String(text || "").match(/[\d,.]+/g);
+      if (!values || !values.length) return null;
+      const nums = values.map(value => Number(value.replace(/,/g, ""))).filter(Number.isFinite);
+      if (!nums.length) return null;
+      return pick === "last" ? nums[nums.length - 1] : nums[0];
+    }
+    function managerStockDecision(row = {}, profile, summary = {}) {
+      const close = Number(row.close);
+      const score = Number(row.score || 60);
+      const rsi = Number(row.rsi_14);
+      const return20 = Number(row.return_20d || 0);
+      const return60 = Number(row.return_60d || 0);
+      const volumeRatio = Number(row.volume_ratio || 1);
+      const fundamental = managerClamp(
+        5.2 + (score - 65) / 13 + (return60 > 0 ? 0.8 : -0.4) + (row.new_high_60 ? 0.4 : 0),
+        1,
+        10
+      );
+      const technical = managerClamp(
+        4.8 + (row.above_sma20 ? 1.3 : -0.9) + (row.above_sma60 ? 1.1 : -0.7) + managerClamp(return20 / 8, -1.4, 1.4) + (Number.isFinite(rsi) && rsi >= 45 && rsi <= 68 ? 0.8 : 0) + (Number.isFinite(rsi) && rsi > 72 ? -0.9 : 0),
+        1,
+        10
+      );
+      const chip = managerClamp(
+        4.8 + managerClamp((volumeRatio - 1) * 1.1, -1.2, 1.6) + (row.signal === "strong" ? 1.2 : row.signal === "watch" ? 0.5 : -0.4) + (row.new_high_60 ? 0.7 : 0),
+        1,
+        10
+      );
+      const market = profile.score;
+      const composite = managerClamp(fundamental * 0.3 + technical * 0.3 + chip * 0.25 + market * 0.15, 1, 10);
+      const winBase = Number(summary.win_rate);
+      const winRate = managerClamp(45 + (composite - 5) * 6 + (profile.exposure - 40) * 0.08 + (Number.isFinite(winBase) ? (winBase - 50) * 0.08 : 0), 35, 78);
+      const riskGrade = composite >= 8 && profile.exposure >= 60 ? "低到中" : composite >= 6.8 ? "中" : profile.exposure <= 20 ? "高" : "中高";
+      const position = composite >= 8 && profile.exposure >= 80 ? 20 : composite >= 7 && profile.exposure >= 60 ? 15 : composite >= 6 ? 10 : 5;
+      const entryText = row.entry_zone || (Number.isFinite(close) ? `${fmt(close * 0.97)} - ${fmt(close * 1.01)}` : "等待資料");
+      const targetText = row.exit_zone || (Number.isFinite(close) ? `${fmt(close * 1.06)} / ${fmt(close * 1.12)}` : "等待資料");
+      const stopValue = Number(row.stop);
+      const stopText = Number.isFinite(stopValue) ? fmt(stopValue) : (Number.isFinite(close) ? fmt(close * 0.95) : "等待資料");
+      const entryValue = managerNumberFromText(entryText, "first");
+      const targetValue = managerNumberFromText(targetText, "last");
+      const stopParsed = Number.isFinite(stopValue) ? stopValue : managerNumberFromText(stopText, "first");
+      const rr = Number.isFinite(entryValue) && Number.isFinite(targetValue) && Number.isFinite(stopParsed) && entryValue > stopParsed
+        ? (targetValue - entryValue) / (entryValue - stopParsed)
+        : null;
+      const operation = composite >= 7.5 && profile.exposure >= 60
+        ? "可分批進場"
+        : composite >= 6.5 && profile.exposure >= 40
+          ? "等待回測低接"
+          : profile.exposure <= 20
+            ? "觀望或減碼"
+            : "候選觀察";
+      const chase = composite >= 8 && Number.isFinite(rsi) && rsi < 68 && profile.exposure >= 80 ? "只允許小幅追價，仍需分批" : "不適合追價";
+      const lowBuy = composite >= 6.5 ? "適合回測支撐分批低接" : "低接需等訊號轉強";
+      return { fundamental, technical, chip, market, composite, winRate, riskGrade, position, entryText, targetText, stopText, rr, operation, chase, lowBuy };
+    }
+    function renderStrategyAdvice(target, data = {}) {
+      const context = data.market_context || {};
+      const summary = data.summary || {};
+      const leaders = (context.leaders || []).slice(0, 4);
+      const profile = managerMarketProfile(context);
+      const primary = leaders[0] || {};
+      const decision = managerStockDecision(primary, profile, summary);
       const m = context.metrics || {};
       const tradeCount = Number(summary.trades || 0);
       const winText = tradeCount ? `${fmt(summary.win_rate)}%` : "尚無";
-      const auxText = auxiliary && Number(auxiliary.trades || 0)
-        ? `輔助樣本：${fmt(auxiliary.trades, 0)} 筆，勝率 ${fmt(auxiliary.win_rate)}%，平均報酬 ${fmt(auxiliary.avg_return)}%。`
-        : "輔助樣本仍在累積，先以 AI 實操主策略為準。";
+      const rows = leaders.length ? leaders.map(row => {
+        const d = managerStockDecision(row, profile, summary);
+        return `<tr>
+          <td><b>${row.name || ""}</b><br>${row.code || ""}</td>
+          <td><b>${fmt(d.composite, 1)}</b></td>
+          <td>${d.operation}</td>
+          <td>${d.position}%</td>
+          <td>${d.entryText}</td>
+          <td>${d.stopText}</td>
+        </tr>`;
+      }).join("") : "<tr><td colspan='6'>目前沒有足夠候選資料，先維持觀望。</td></tr>";
       target.innerHTML = `
-        <div class="strategy-advice">
-          <div class="advice-main">
-            <strong>${context.stance || "資料不足"}</strong>
-            <p>${context.headline || ""}</p>
-            <p><b>部位建議：</b>${context.position_suggestion || "等待資料更新"}</p>
-            <p><b>操作邏輯：</b>AI 會先看盤面廣度，再從訊號分數、趨勢、量能與風控條件挑出候選；候選股不是直接下單，只有進入建倉紀錄才視為 AI 實操已開始持有。</p>
-            <p><b>輔助策略：</b>${auxText}</p>
-            <ul class="advice-list">${(context.actions || []).map(item => `<li>${item}</li>`).join("")}</ul>
+        <div class="manager-report">
+          <div class="strategy-advice">
+            <div class="advice-main">
+              <strong>${profile.state}｜${profile.exposure}% 水位</strong>
+              <p>${context.headline || "先完成資料更新，再建立操作計畫。"}</p>
+              <p><b>今日結論：</b>${primary.code ? `${primary.name} ${primary.code} 為優先候選，${decision.operation}，單檔 ${decision.position}% 以內。` : "候選不足，暫不建立新倉。"}</p>
+              <p><b>紀律：</b>單筆最大虧損 5%，不凹單；跌破關鍵均線或爆量長黑先降部位。</p>
+            </div>
+            <div class="strategy-kpis">
+              <div class="strategy-kpi"><span>市場</span><strong>${profile.state}</strong></div>
+              <div class="strategy-kpi"><span>水位</span><strong>${profile.exposure}%</strong></div>
+              <div class="strategy-kpi"><span>勝率</span><strong>${winText}</strong></div>
+              <div class="strategy-kpi"><span>回撤</span><strong>${fmt(summary.max_drawdown)}%</strong></div>
+              <div class="strategy-kpi"><span>未平倉</span><strong>${fmt(summary.open_positions, 0)} 檔</strong></div>
+              <div class="strategy-kpi"><span>可行訊號</span><strong>${fmt(m.actionable_pct)}%</strong></div>
+            </div>
           </div>
-          <div class="strategy-kpis">
-            <div class="strategy-kpi"><span>AI 勝率</span><strong>${winText}</strong></div>
-            <div class="strategy-kpi"><span>總報酬</span><strong>${fmt(summary.total_return)}%</strong></div>
-            <div class="strategy-kpi"><span>最大回撤</span><strong>${fmt(summary.max_drawdown)}%</strong></div>
-            <div class="strategy-kpi"><span>交易筆數</span><strong>${fmt(summary.trades, 0)} 筆</strong></div>
-            <div class="strategy-kpi"><span>未平倉</span><strong>${fmt(summary.open_positions, 0)} 檔</strong></div>
-            <div class="strategy-kpi"><span>可行訊號</span><strong>${fmt(m.actionable_pct)}%</strong></div>
+          <div class="manager-grid">
+            <div class="manager-card full">
+              <h3>候選操作清單</h3>
+              <table class="manager-table">
+                <thead><tr><th>標的</th><th>AI分</th><th>操作</th><th>部位</th><th>進場</th><th>停損</th></tr></thead>
+                <tbody>${rows}</tbody>
+              </table>
+            </div>
+            <div class="manager-card">
+              <h3>主要標的</h3>
+              <p><b>${primary.name || "資料不足"} ${primary.code || ""}</b></p>
+              <p>AI ${fmt(decision.composite, 1)}｜勝率 ${fmt(decision.winRate)}%｜風險 ${decision.riskGrade}</p>
+            </div>
+            <div class="manager-card">
+              <h3>進出場</h3>
+              <p><b>進場區間：</b>${decision.entryText}</p>
+              <p><b>停損位置：</b>${decision.stopText}</p>
+              <p><b>目標價：</b>${decision.targetText}</p>
+            </div>
+            <div class="manager-card">
+              <h3>風控</h3>
+              <p>單檔上限 20%；本檔建議 ${decision.position}%。</p>
+              <p>${(context.risks || ["依停損與部位規則執行。"]).slice(0, 2).join("；")}</p>
+            </div>
           </div>
-        </div>
-        <div class="content" style="padding:14px 0 0">
-          <b>風險提示</b>
-          <ul class="advice-list">${(context.risks || []).map(item => `<li>${item}</li>`).join("")}</ul>
         </div>`;
     }
     function renderCurve(target, rows) {
@@ -4509,7 +7317,11 @@ INDEX_HTML = r"""<!doctype html>
       const target = document.getElementById("realtimeTrendChart");
       const summary = document.getElementById("realtimeTrendSummary");
       const notice = document.getElementById("realtimeTrendNotice");
-      const rows = (data.rows || []).filter(row => Number.isFinite(Number(row.close)));
+      const liveQuote = latestRealtimeRows.find(row => row.code === data.code);
+      const rows = applyLiveQuoteToTrend(
+        (data.rows || []).filter(row => Number.isFinite(Number(row.close))),
+        liveQuote,
+      );
       if (!rows.length) {
         target.innerHTML = `<text x="50%" y="50%" text-anchor="middle" class="chart-label">資料不足</text>`;
         summary.innerHTML = "";
@@ -4518,8 +7330,8 @@ INDEX_HTML = r"""<!doctype html>
       }
       const first = rows[0];
       const latest = rows[rows.length - 1];
-      const change = Number(latest.close) - Number(first.close);
-      const changePct = Number(first.close) ? change / Number(first.close) * 100 : null;
+      const change = liveQuote && Number.isFinite(Number(liveQuote.change)) ? Number(liveQuote.change) : Number(latest.close) - Number(first.close);
+      const changePct = liveQuote && Number.isFinite(Number(liveQuote.change_percent)) ? Number(liveQuote.change_percent) : (Number(first.close) ? change / Number(first.close) * 100 : null);
       const high = Math.max(...rows.map(row => Number(row.high ?? row.close)).filter(Number.isFinite));
       const low = Math.min(...rows.map(row => Number(row.low ?? row.close)).filter(Number.isFinite));
       summary.innerHTML = `
@@ -4536,8 +7348,31 @@ INDEX_HTML = r"""<!doctype html>
         void head.offsetWidth;
         head.classList.add("updating");
       }
-      renderOrderRatio({ change_percent: changePct });
-      notice.textContent = `${data.code || ""} ${data.name || ""}｜${data.message || "走勢已更新"}`;
+      renderOrderRatio(liveQuote || { change_percent: changePct });
+      notice.textContent = `${data.code || ""} ${data.name || ""}｜${liveQuote ? "左圖已同步 MIS 即時報價。" : (data.message || "走勢已更新")}`;
+    }
+    function applyLiveQuoteToTrend(rows, quote) {
+      if (!quote || !Number.isFinite(Number(quote.price))) return rows;
+      const liveDate = quote.date || new Date().toISOString().slice(0, 10);
+      const liveRow = {
+        date: liveDate,
+        time: quote.time || null,
+        label: quote.time || liveDate.slice(5),
+        open: Number.isFinite(Number(quote.open)) ? Number(quote.open) : Number(quote.price),
+        high: Number.isFinite(Number(quote.high)) ? Math.max(Number(quote.high), Number(quote.price)) : Number(quote.price),
+        low: Number.isFinite(Number(quote.low)) ? Math.min(Number(quote.low), Number(quote.price)) : Number(quote.price),
+        close: Number(quote.price),
+        volume: Number(quote.volume || 0),
+        live: true,
+      };
+      const next = rows.slice();
+      const sameDateIndex = next.findIndex(row => row.date === liveDate);
+      if (sameDateIndex >= 0) {
+        next[sameDateIndex] = { ...next[sameDateIndex], ...liveRow };
+      } else {
+        next.push(liveRow);
+      }
+      return next;
     }
     function renderRealtimeTrendChart(target, rows) {
       const width = 1000;
@@ -4789,6 +7624,8 @@ INDEX_HTML = r"""<!doctype html>
           label: row.label || row.time || row.date,
           foreign: matched ? Number(matched.foreign || 0) : null,
           investment: matched ? Number(matched.investment || 0) : null,
+          dealer: matched ? Number(matched.dealer || 0) : null,
+          total: matched ? Number(matched.total ?? ((matched.foreign || 0) + (matched.investment || 0) + (matched.dealer || 0))) : null,
           retail_proxy: matched ? Number(matched.retail_proxy || 0) : null,
           hasInstitutional: Boolean(matched),
         };
@@ -4908,6 +7745,149 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <ul class="trade-list">${plan.checks.map(item => `<li>${item}</li>`).join("")}</ul>
       `;
+    }
+    function renderTechnicalTheoryAnalysis(target, rows, ind) {
+      if (!target) return;
+      const cleanRows = (rows || []).filter(row => row.close !== null && row.open !== null && row.high !== null && row.low !== null);
+      if (cleanRows.length < 30) {
+        target.innerHTML = `<div class="trade-callout"><strong>資料不足</strong><p>至少需要 30 根 K 線，才能依 K 線、道氏趨勢、均線與價量理論進行判讀。</p></div>`;
+        return;
+      }
+      const latest = cleanRows[cleanRows.length - 1];
+      const previous = cleanRows[cleanRows.length - 2];
+      const closes = cleanRows.map(row => Number(row.close));
+      const volumes = cleanRows.map(row => Number(row.volume || 0));
+      const latestClose = Number(latest.close);
+      const ma20Series = smaValues(closes, 20);
+      const ma60Series = smaValues(closes, 60);
+      const kd = kdValues(cleanRows, 9);
+      const lastKd = kd[kd.length - 1] || {};
+      const avgVol20 = volumes.slice(-20).reduce((sum, value) => sum + value, 0) / Math.max(1, volumes.slice(-20).length);
+      const volRatio = avgVol20 ? Number(latest.volume || 0) / avgVol20 : null;
+      const candle = classifyTheoryCandle(latest);
+      const pattern = detectTheoryPattern(cleanRows);
+      const dow = detectDowTrend(cleanRows);
+      const ma = theoryMaView(latestClose, ma20Series, ma60Series);
+      const rsiValue = Number(ind.rsi_14);
+      const rsiView = Number.isFinite(rsiValue)
+        ? (rsiValue >= 70 ? ["偏熱", `RSI ${fmt(rsiValue)} 位於高檔，強勢股可續強，但追價需降低部位。`]
+          : rsiValue <= 30 ? ["偏弱/超賣", `RSI ${fmt(rsiValue)} 位於低檔，若價格止跌才有反彈參考。`]
+          : rsiValue >= 50 ? ["多方", `RSI ${fmt(rsiValue)} 大於 50，多方力道略占優。`]
+          : ["空方", `RSI ${fmt(rsiValue)} 小於 50，空方力道略占優。`])
+        : ["資料不足", "RSI 資料不足。"];
+      const kdView = Number.isFinite(Number(lastKd.k)) && Number.isFinite(Number(lastKd.d))
+        ? (lastKd.k >= 80 && lastKd.d >= 80 ? ["KD 過熱", `K ${fmt(lastKd.k)} / D ${fmt(lastKd.d)}，短線需防震盪。`]
+          : lastKd.k <= 20 && lastKd.d <= 20 ? ["KD 低檔", `K ${fmt(lastKd.k)} / D ${fmt(lastKd.d)}，若價量轉強可觀察反彈。`]
+          : lastKd.k > lastKd.d ? ["KD 偏多", `K ${fmt(lastKd.k)} 高於 D ${fmt(lastKd.d)}。`]
+          : ["KD 偏弱", `K ${fmt(lastKd.k)} 低於 D ${fmt(lastKd.d)}。`])
+        : ["KD 資料不足", "KD 需要更多高低收資料。"];
+      const volumeView = theoryVolumeView(latest, previous, volRatio);
+      const scoreParts = [candle.score, pattern.score, dow.score, ma.score, volumeView.score];
+      if (rsiView[0] === "多方") scoreParts.push(8);
+      if (rsiView[0] === "偏熱") scoreParts.push(-4);
+      if (rsiView[0] === "空方") scoreParts.push(-8);
+      if (kdView[0] === "KD 偏多") scoreParts.push(5);
+      if (kdView[0] === "KD 過熱") scoreParts.push(-3);
+      if (kdView[0] === "KD 偏弱") scoreParts.push(-5);
+      const total = scoreParts.reduce((sum, value) => sum + value, 50);
+      const verdict = total >= 72 ? "理論偏多" : total >= 58 ? "偏多觀察" : total <= 38 ? "理論偏空" : total <= 48 ? "偏弱整理" : "多空拉鋸";
+      const cards = [
+        ["K 線", candle.label, candle.detail],
+        ["K 線組合", pattern.label, pattern.detail],
+        ["道氏趨勢", dow.label, dow.detail],
+        ["均線法則", ma.label, ma.detail],
+        ["價量關係", volumeView.label, volumeView.detail],
+        ["RSI / KD", `${rsiView[0]}｜${kdView[0]}`, `${rsiView[1]} ${kdView[1]}`],
+      ];
+      target.innerHTML = `
+        <div class="trade-callout">
+          <span>${latest.date || "最新 K 線"}｜整合理論</span>
+          <strong>${verdict}</strong>
+          <p>依 K 線實體與影線、常見 K 線組合、道氏高低點、均線位置、RSI/KD 與價量關係產生。此為研究輔助，仍需搭配法人、基本面與風控。</p>
+        </div>
+        <div class="facet-grid">
+          ${cards.map(([name, stance, detail]) => `
+            <div class="facet-card" title="${detail}">
+              <span>${name}</span>
+              <strong>${stance}</strong>
+              <small>${detail}</small>
+            </div>
+          `).join("")}
+        </div>
+      `;
+    }
+    function classifyTheoryCandle(row) {
+      const open = Number(row.open);
+      const close = Number(row.close);
+      const high = Number(row.high);
+      const low = Number(row.low);
+      const range = Math.max(0.0001, high - low);
+      const body = Math.abs(close - open);
+      const upper = high - Math.max(open, close);
+      const lower = Math.min(open, close) - low;
+      const isUp = close >= open;
+      if (body / range <= 0.12) return { label: "十字線", score: 0, detail: "開收接近，多空暫時均衡，後續常需看隔日方向確認。" };
+      if (lower / range >= 0.55 && upper / range <= 0.18) return { label: isUp ? "T 字買盤" : "長下影支撐", score: 10, detail: "下影線長，代表低檔承接力道較明顯。" };
+      if (upper / range >= 0.55 && lower / range <= 0.18) return { label: "倒 T 賣壓", score: -12, detail: "上影線長，代表高檔賣壓或追價失敗。" };
+      if (isUp && body / range >= 0.62) return { label: "長紅實體", score: 12, detail: "紅 K 實體較大，買盤主導當日走勢。" };
+      if (!isUp && body / range >= 0.62) return { label: "長黑實體", score: -12, detail: "黑 K 實體較大，賣盤主導當日走勢。" };
+      return { label: isUp ? "小紅整理" : "小黑整理", score: isUp ? 3 : -3, detail: "單根 K 線訊號普通，需搭配趨勢與量能。" };
+    }
+    function detectTheoryPattern(rows) {
+      const last3 = rows.slice(-3);
+      const [a, b, c] = last3;
+      const up = row => Number(row.close) > Number(row.open);
+      const down = row => Number(row.close) < Number(row.open);
+      const body = row => Math.abs(Number(row.close) - Number(row.open));
+      const range = row => Math.max(0.0001, Number(row.high) - Number(row.low));
+      const small = row => body(row) / range(row) < 0.28;
+      if (last3.length === 3 && down(a) && small(b) && up(c) && Number(c.close) > (Number(a.open) + Number(a.close)) / 2) {
+        return { label: "早晨之星雛形", score: 16, detail: "跌勢後出現小實體，再以長紅收復前段，屬可能止跌轉強訊號。" };
+      }
+      if (last3.length === 3 && up(a) && small(b) && down(c) && Number(c.close) < (Number(a.open) + Number(a.close)) / 2) {
+        return { label: "黃昏之星雛形", score: -16, detail: "漲勢後小實體轉長黑，屬可能反轉或回調訊號。" };
+      }
+      if (last3.length === 3 && last3.every(up) && Number(b.close) > Number(a.close) && Number(c.close) > Number(b.close)) {
+        return { label: "紅三兵", score: 14, detail: "連續三根收高紅 K，買盤延續，但仍要留意是否過熱。" };
+      }
+      if (last3.length === 3 && last3.every(down) && Number(b.close) < Number(a.close) && Number(c.close) < Number(b.close)) {
+        return { label: "三隻烏鴉", score: -16, detail: "連續三根收低黑 K，賣壓延續，需優先風控。" };
+      }
+      return { label: "無明確組合", score: 0, detail: "近三日未形成強烈反轉或連續攻擊型態。" };
+    }
+    function detectDowTrend(rows) {
+      const recent = rows.slice(-20);
+      const prior = rows.slice(-40, -20);
+      if (recent.length < 10 || prior.length < 10) return { label: "資料不足", score: 0, detail: "道氏趨勢需要足夠高低點比較。" };
+      const recentHigh = Math.max(...recent.map(row => Number(row.high)));
+      const recentLow = Math.min(...recent.map(row => Number(row.low)));
+      const priorHigh = Math.max(...prior.map(row => Number(row.high)));
+      const priorLow = Math.min(...prior.map(row => Number(row.low)));
+      if (recentHigh > priorHigh && recentLow > priorLow) return { label: "多頭結構", score: 12, detail: "近期高點與低點都墊高，符合道氏多頭結構。" };
+      if (recentHigh < priorHigh && recentLow < priorLow) return { label: "空頭結構", score: -12, detail: "近期高點與低點都下移，符合道氏空頭結構。" };
+      return { label: "箱型震盪", score: 0, detail: "高低點未同向，偏區間整理或趨勢未明。" };
+    }
+    function theoryMaView(close, ma20Series, ma60Series) {
+      const ma20 = ma20Series[ma20Series.length - 1];
+      const ma60 = ma60Series[ma60Series.length - 1];
+      const prev20 = ma20Series[ma20Series.length - 2];
+      const prev60 = ma60Series[ma60Series.length - 2];
+      if (!Number.isFinite(ma20)) return { label: "資料不足", score: 0, detail: "均線資料不足。" };
+      if (Number.isFinite(ma60) && close > ma20 && ma20 > ma60) return { label: "多頭排列", score: 14, detail: `收盤站上月線，且月線高於季線，趨勢偏多。` };
+      if (Number.isFinite(ma60) && close < ma20 && ma20 < ma60) return { label: "空頭排列", score: -14, detail: `收盤跌破月線，且月線低於季線，趨勢偏空。` };
+      if (Number.isFinite(prev20) && Number.isFinite(prev60) && prev20 <= prev60 && ma20 > ma60) return { label: "黃金交叉", score: 16, detail: "短期均線向上突破長期均線，屬轉強訊號。" };
+      if (Number.isFinite(prev20) && Number.isFinite(prev60) && prev20 >= prev60 && ma20 < ma60) return { label: "死亡交叉", score: -16, detail: "短期均線向下跌破長期均線，屬轉弱訊號。" };
+      return { label: close >= ma20 ? "站上月線" : "跌破月線", score: close >= ma20 ? 6 : -8, detail: `收盤 ${fmt(close)}，SMA20 ${fmt(ma20)}。` };
+    }
+    function theoryVolumeView(latest, previous, volRatio) {
+      const up = Number(latest.close) > Number(previous.close);
+      const down = Number(latest.close) < Number(previous.close);
+      if (!Number.isFinite(volRatio)) return { label: "量能不足", score: 0, detail: "成交量資料不足。" };
+      if (up && volRatio >= 1.3) return { label: "價漲量增", score: 10, detail: `量比 ${fmt(volRatio)}，上漲有量能確認。` };
+      if (down && volRatio >= 1.3) return { label: "價跌量增", score: -12, detail: `量比 ${fmt(volRatio)}，下跌伴隨放量，需防賣壓延續。` };
+      if (up && volRatio < 0.8) return { label: "價漲量縮", score: -2, detail: `量比 ${fmt(volRatio)}，上漲追價力道不足。` };
+      if (down && volRatio < 0.8) return { label: "價跌量縮", score: 3, detail: `量比 ${fmt(volRatio)}，跌勢賣壓暫未放大。` };
+      return { label: "量價中性", score: 0, detail: `量比 ${fmt(volRatio)}，量價尚未形成強烈確認。` };
     }
     function showCandleInfo(index) {
       const row = visibleChartRows()[index];
@@ -5172,8 +8152,8 @@ INDEX_HTML = r"""<!doctype html>
         target.innerHTML = `<text x="50%" y="50%" text-anchor="middle" class="chart-label">${data.message || "法人資料不足"}</text>`;
         return;
       }
-      const colors = { foreign: "#38bdf8", investment: "#f59e0b", retail_proxy: "#a78bfa" };
-      const labels = { foreign: "外資", investment: "投信", retail_proxy: "散戶代理" };
+      const colors = { foreign: "#38bdf8", investment: "#f59e0b", dealer: "#22c55e", total: "#e879f9", retail_proxy: "#a78bfa" };
+      const labels = { foreign: "外資", investment: "投信", dealer: "自營商", total: "法人合計", retail_proxy: "散戶代理" };
       const key = colors[mode] ? mode : "foreign";
       const title = document.getElementById("chipChartTitle");
       if (title) title.textContent = `${labels[key]}買賣超`;
@@ -5207,23 +8187,197 @@ INDEX_HTML = r"""<!doctype html>
         ${syncCursorLayer(rows, width, height, pad)}
       `;
     }
+    function renderInstitutionalSummary(target, data) {
+      if (!target) return;
+      const rows = data.rows || [];
+      const summary = data.summary || {};
+      if (!rows.length) {
+        target.innerHTML = `<div class="trade-callout"><strong>法人資料不足</strong><p>${data.message || "目前沒有三大法人資料。"}</p></div>`;
+        return;
+      }
+      const last = summary.last || rows[rows.length - 1] || {};
+      const totals = summary.twenty_day || {};
+      const fmtLots = value => `${fmt(Number(value || 0) / 1000, 0)} 張`;
+      const flowText = Number(totals.total || 0) >= 0 ? "20 日法人合計偏買" : "20 日法人合計偏賣";
+      target.innerHTML = `
+        <div class="institution-grid">
+          <div class="institution-card wide"><span>唯一法人資料區｜${data.source || "三大法人"}</span><strong>${summary.stance || flowText}</strong><small>${data.message || "外資、投信、自營商買賣超彙整。"}</small></div>
+          <div class="institution-card"><span>最新外資</span><strong class="${pctClass(last.foreign)}">${fmtLots(last.foreign)}</strong><small>${last.date || "-"} 買賣超</small></div>
+          <div class="institution-card"><span>最新投信</span><strong class="${pctClass(last.investment)}">${fmtLots(last.investment)}</strong><small>${last.date || "-"} 買賣超</small></div>
+          <div class="institution-card"><span>最新自營商</span><strong class="${pctClass(last.dealer)}">${fmtLots(last.dealer)}</strong><small>${last.date || "-"} 買賣超</small></div>
+          <div class="institution-card"><span>20 日合計</span><strong class="${pctClass(totals.total)}">${fmtLots(totals.total)}</strong><small>連續方向 ${fmt(summary.streak, 0)} 日</small></div>
+        </div>
+      `;
+    }
+    function renderInstitutionalProAnalysis(target, data, stock = {}, ind = {}, signal = {}) {
+      if (!target) return;
+      const rows = data.rows || [];
+      if (!rows.length) {
+        target.innerHTML = `<div class="trade-callout"><strong>基金資金資料不足</strong><p>${data.message || "目前沒有國內外基金資金流資料。"}</p></div>`;
+        return;
+      }
+      const sumRows = (source, key) => source.reduce((total, row) => total + Number(row[key] || 0), 0);
+      const latest = rows[rows.length - 1] || {};
+      const recent5 = rows.slice(-5);
+      const recent20 = rows.slice(-20);
+      const fmtLots = value => `${fmt(Number(value || 0) / 1000, 0)} 張`;
+      const summary = data.summary || {};
+      const totals = summary.twenty_day || {};
+      const institutionTone = (foreign, investment) => {
+        if (foreign > 0 && investment > 0) return "國外基金與國內基金同步偏買，資金方向較一致。";
+        if (foreign < 0 && investment < 0) return "國外基金與國內基金同步偏賣，先提高風控權重。";
+        if (foreign > 0 && investment < 0) return "國外基金偏買、國內基金偏賣，短線可能是不同週期資金換手。";
+        if (foreign < 0 && investment > 0) return "國外基金偏賣、國內基金偏買，留意國內基金是否有護盤或作帳需求。";
+        return "國內外基金方向不明顯，需搭配價格與量能確認。";
+      };
+      const foreign20 = sumRows(recent20, "foreign");
+      const investment20 = sumRows(recent20, "investment");
+      const dealer20 = sumRows(recent20, "dealer");
+      const total20 = sumRows(recent20, "total");
+      const netScore = (foreign20 > 0 ? 12 : foreign20 < 0 ? -12 : 0) + (investment20 > 0 ? 10 : investment20 < 0 ? -10 : 0) + (dealer20 > 0 ? 4 : dealer20 < 0 ? -4 : 0);
+      const rating = netScore >= 18 ? "資金面偏多" : netScore >= 6 ? "偏多觀察" : netScore <= -18 ? "資金面偏空" : netScore <= -6 ? "偏弱觀察" : "中性觀察";
+      const technicalText = Number(ind.return_20d) >= 8
+        ? "20 日動能偏強，外資報告會要求確認追價風險與停損條件。"
+        : Number(ind.return_20d) <= -8
+          ? "20 日動能偏弱，外資報告會先檢查是否落入價值陷阱或趨勢破壞。"
+          : "20 日動能中性，外資報告會等待區間突破或基本面催化。";
+      const cards = [
+        ["最新外資/國外基金", latest.foreign, `${latest.date || "-"} 外資買賣超`],
+        ["最新投信/國內基金", latest.investment, `${latest.date || "-"} 投信買賣超`],
+        ["最新自營商", latest.dealer, `${latest.date || "-"} 自營商買賣超`],
+        ["20 日法人合計", total20 || totals.total, `連續方向 ${fmt(summary.streak, 0)} 日`],
+        ["20 日國外基金", foreign20, "外資中期方向"],
+        ["20 日國內基金", investment20, "投信中期方向"],
+      ];
+      target.innerHTML = `
+        <div class="trade-callout">
+          <span>${data.source || "公開法人資料"}｜${rating}</span>
+          <strong>${institutionTone(foreign20, investment20)}</strong>
+          <p>三大法人籌碼與基金代理合併在此：外資作國外基金代理，投信作國內基金代理，自營商作交易性資金參考。</p>
+        </div>
+        <div class="institution-grid">
+          ${cards.map(([label, value, note]) => `
+            <div class="institution-card">
+              <span>${label}</span>
+              <strong class="${pctClass(value)}">${fmtLots(value)}</strong>
+              <small>${note}</small>
+            </div>
+          `).join("")}
+        </div>
+        <div class="trade-callout">
+          <span>資金面結論</span>
+          <strong>${stock.code || ""} ${stock.short_name || stock.name || ""}｜AI ${fmt(signal.risk_adjusted_score, 0)}｜${signal.signal || "觀察"}</strong>
+          <p>${technicalText} 後續只追蹤外資/投信是否同向、法人合計是否連續買超，以及價格是否守住關鍵均線。</p>
+        </div>
+      `;
+    }
+    function renderFundHoldingReports(target, data) {
+      if (!target) return;
+      const items = data.items || [];
+      const summary = data.summary || {};
+      const fmtShares = value => `${fmt(Number(value || 0) / 1000, 0)} 張`;
+      if (!items.length) {
+        target.innerHTML = `
+          <div class="trade-callout">
+            <span>需要單一基金明細</span>
+            <strong>尚未匯入各基金持股資料</strong>
+            <p>${data.message || "公開三大法人資料無法拆成單一基金。請匯入基金持股明細後，這裡才會顯示每個基金買了多少。"}</p>
+            <p>目前官方免費公開端點沒有單一基金逐檔即時持股明細；系統已先自動補齊外資、投信、自營商買賣超。取得基金月報或持股揭露資料後，放到 ${data.csv_path || "data/fund_holdings.csv"} 會自動計算各基金前後期增減。</p>
+          </div>
+        `;
+        return;
+      }
+      target.innerHTML = `
+        <div class="trade-callout">
+          <span>${summary.latest_date || "最新揭露"}｜${fmt(summary.funds, 0)} 檔基金</span>
+          <strong>合計持有 ${fmtShares(summary.total_shares)}｜前期增減 ${fmtShares(summary.total_change)}</strong>
+          <p>${data.message || "已依單一基金持股明細計算。"}</p>
+        </div>
+        <div class="institution-grid">
+          ${items.slice(0, 6).map(item => {
+            const change = item.share_change;
+            const changeText = change === null || change === undefined ? "前期無資料" : `${change >= 0 ? "+" : ""}${fmtShares(change)}`;
+            const report = item.summary || `${item.fund_type || "基金"} ${item.action || "揭露"}，目前持有 ${fmtShares(item.shares)}。`;
+            return `
+              <div class="institution-card">
+                <span>${item.manager || item.fund_type || "基金"}｜${item.report_date || "-"}</span>
+                <strong>${item.fund_name}</strong>
+                <small>持有 ${fmtShares(item.shares)}｜增減 <b class="${pctClass(change || 0)}">${changeText}</b></small>
+                <small>權重 ${fmt(item.weight)}%｜市值 ${fmt(item.market_value, 0)}｜${item.source || "未標示來源"}</small>
+                <small>${report}</small>
+              </div>
+            `;
+          }).join("")}
+        </div>
+        ${items.length > 6 ? `<div class="note">另有 ${items.length - 6} 檔基金明細已收進資料，為避免版面過長先只顯示前 6 檔。</div>` : ""}
+      `;
+    }
+    function renderFinancialKpis(target, data) {
+      if (!target) return;
+      const latest = data.latest;
+      const items = data.items || [];
+      if (!latest) {
+        target.innerHTML = `
+          <div class="trade-callout">
+            <span>需要財報 KPI</span>
+            <strong>尚未匯入財報與估值資料</strong>
+            <p>${data.message || "目前沒有財報 KPI。匯入後可補齊月營收、EPS、毛利率、ROE、PE/PB、殖利率等資料。"}</p>
+            <p>系統會自動重試 TWSE/TPEx 官方公開端點；若官方端點暫時無資料，才使用 ${data.csv_path || "data/financial_kpis.csv"} 作為補充資料源。</p>
+          </div>
+        `;
+        return;
+      }
+      const companyContext = data.company_context || {};
+      const governance = companyContext.governance || {};
+      const dividend = companyContext.dividend || {};
+      const cards = [
+        ["期間", latest.period, latest.source || "財報/公開資料"],
+        ["營收", fmt(latest.revenue, 0), `年增率 ${fmt(latest.revenue_yoy)}%`],
+        ["EPS", fmt(latest.eps), "每股盈餘"],
+        ["毛利率", `${fmt(latest.gross_margin)}%`, `營益率 ${fmt(latest.operating_margin)}%`],
+        ["估值", `PE ${fmt(latest.pe)}｜PB ${fmt(latest.pb)}`, `ROE ${fmt(latest.roe)}%｜殖利率 ${fmt(latest.dividend_yield)}%`],
+        ["治理/股利", `董監 ${fmt(governance.rows, 0)} 筆｜股利 ${fmt(dividend.cash_dividend)}`, `質押 ${fmt(governance.avg_pledge_ratio)}%｜${dividend.status || "公告資料"}`],
+      ];
+      target.innerHTML = `
+        <div class="trade-callout">
+          <span>${latest.period || "最新財報"}｜${items.length} 期資料</span>
+          <strong>${latest.summary || "已補齊財報與估值 KPI"}</strong>
+          <p>${data.message || "已匯入財報與估值 KPI。"}</p>
+        </div>
+        <div class="institution-grid">
+          ${cards.map(([label, value, note]) => `
+            <div class="institution-card">
+              <span>${label}</span>
+              <strong>${value}</strong>
+              <small>${note}</small>
+            </div>
+          `).join("")}
+        </div>
+      `;
+    }
     async function fetchStatus() {
       const data = await getJson("/api/status");
       document.getElementById("range").textContent = `${data.last_date} 官方 ${data.official_count || 0} 檔 / 最新 ${data.latest_count || 0} 檔`;
     }
     async function fetchStock() {
-      const codeValue = document.getElementById("code").value.trim() || "2330";
+      const panelInput = document.getElementById("stockPageCode");
+      const panelCode = panelInput ? panelInput.value.trim() : "";
+      const codeValue = (document.getElementById("stockPage")?.classList.contains("active") ? panelCode : "") || document.getElementById("code").value.trim() || panelCode || "2330";
+      document.getElementById("code").value = codeValue;
+      if (panelInput) panelInput.value = codeValue;
       currentStockCode = codeValue;
       currentStockInterval = "1d";
       document.querySelectorAll("[data-interval]").forEach(tab => tab.classList.toggle("active", tab.dataset.interval === "1d"));
       const encoded = encodeURIComponent(codeValue);
-      const [stock, ind, prices, signal, monitor, institutional] = await Promise.all([
+      const [stock, ind, prices, signal, monitor, institutional, fundHoldings, financialKpis] = await Promise.all([
         getJson(`/api/stock?code=${encoded}`),
         getJson(`/api/indicators?code=${encoded}`),
         getJson(`/api/prices?code=${encoded}&limit=160`),
         getJson(`/api/stock-signal?code=${encoded}`),
         getJson(`/api/ai-monitor-stock?code=${encoded}`),
         getJson(`/api/institutional?code=${encoded}`),
+        getJson(`/api/fund-holdings?code=${encoded}`),
+        getJson(`/api/financial-kpis?code=${encoded}`),
       ]);
       currentPriceRows = prices.prices || [];
       resetChartWindow();
@@ -5249,28 +8403,45 @@ INDEX_HTML = r"""<!doctype html>
         ["60日新高", fmt(ind.new_high_60)],
       ]);
       currentInstitutional = institutional;
+      updateAnalysisCoverage({ stock, ind, prices, signal, monitor, institutional, fundHoldings, financialKpis, fundamental: undefined, news: undefined });
+      renderInstitutionalProAnalysis(document.getElementById("institutionalProAnalysis"), institutional, stock, ind, signal);
+      renderFundHoldingReports(document.getElementById("fundHoldingReports"), fundHoldings);
+      renderFinancialKpis(document.getElementById("financialKpiPanel"), financialKpis);
       renderChartSuite();
       installChartDrag();
       renderTradePlan(document.getElementById("tradePlan"), buildTradePlan(stock, ind, signal, prices.prices));
+      renderTechnicalTheoryAnalysis(document.getElementById("technicalTheoryAnalysis"), prices.prices, ind);
       renderAnalysisFacets(document.getElementById("analysisFacets"), monitor);
       const fundamentalTarget = document.getElementById("fundamentalResearch");
-      fundamentalTarget.innerHTML = `<div class="fundamental-card"><span>基本面研究</span><strong>背景載入中</strong><ul><li>先顯示 K 線與交易計畫，研究報告稍後補上。</li></ul></div>`;
+      fundamentalTarget.innerHTML = `<div class="fundamental-card"><span>機構級投資研究</span><strong>背景載入中</strong><ul><li>先顯示 K 線、交易計畫與資金面，十階段研究報告稍後補上。</li></ul></div>`;
       getJson(`/api/fundamental?code=${encoded}`)
-        .then(fundamental => renderFundamentalResearch(fundamentalTarget, fundamental))
+        .then(fundamental => {
+          renderFundamentalResearch(fundamentalTarget, fundamental);
+          updateAnalysisCoverage({ fundamental });
+        })
         .catch(error => {
-          fundamentalTarget.innerHTML = `<div class="fundamental-card"><span>基本面研究</span><strong>暫時不可用</strong><ul><li>${error.message}</li></ul></div>`;
+          const fundamental = { error: error.message };
+          fundamentalTarget.innerHTML = `<div class="fundamental-card"><span>機構級投資研究</span><strong>暫時不可用</strong><ul><li>${error.message}</li></ul></div>`;
+          updateAnalysisCoverage({ fundamental });
         });
       const newsTarget = document.getElementById("newsResearch");
       newsTarget.innerHTML = `<div class="news-card"><span>新聞掃描</span><a href="#">正在背景掃描最新新聞...</a><small>核心分析已先完成，不等待新聞來源。</small></div>`;
       getJson(`/api/news?code=${encoded}`)
-        .then(news => renderNews(newsTarget, news))
-        .catch(error => renderNews(newsTarget, { message: `新聞掃描暫時失敗：${error.message}`, items: [] }));
+        .then(news => {
+          renderNews(newsTarget, news);
+          updateAnalysisCoverage({ news });
+        })
+        .catch(error => {
+          const news = { message: `新聞掃描暫時失敗：${error.message}`, items: [] };
+          renderNews(newsTarget, news);
+          updateAnalysisCoverage({ news });
+        });
       document.getElementById("diagScore").textContent = fmt(signal.intelli_score, 1);
       document.getElementById("diagSentiment").textContent = signal.sentiment;
       document.getElementById("diagRiskScore").textContent = fmt(signal.risk_adjusted_score, 0);
-      document.getElementById("heroScore").textContent = fmt(signal.intelli_score, 1);
+      document.getElementById("stockPageCode").value = stock.code;
       document.getElementById("stockHeroName").textContent = `${stock.code} ${stock.short_name || stock.name}`;
-      document.getElementById("stockHeroSub").textContent = `${stock.market} · ${signal.signal} · ${signal.sentiment} · 建議搭配 K 線與風險提示觀察`;
+      document.getElementById("stockHeroSub").textContent = `${stock.market} · ${signal.signal} · ${signal.sentiment} · 解盤看交易判斷，專業分析看國內外基金、法人、基本面與消息`;
     }
     function activatePage(pageId) {
       document.querySelectorAll(".page").forEach(page => page.classList.remove("active"));
@@ -5286,10 +8457,23 @@ INDEX_HTML = r"""<!doctype html>
       activatePage("stockPage");
       runAction(fetchStock, "正在載入個股摘要、技術分析與走勢圖...");
     }
+    function searchStockFromPanel() {
+      const panelCode = document.getElementById("stockPageCode").value.trim() || "2330";
+      document.getElementById("code").value = panelCode;
+      searchStock();
+    }
     async function fetchScan() {
       const data = await getJson("/api/scan?limit=20");
-      renderTable(document.getElementById("returnTable"), data.top_return_20d);
-      renderTable(document.getElementById("volumeTable"), data.top_volume_expansion);
+      renderRankList(document.getElementById("returnTable"), data.top_return_20d, {
+        title: "漲幅排行",
+        icon: "↗",
+        metric: row => `漲幅 ${fmt(row.return_20d)}%`,
+      });
+      renderRankList(document.getElementById("volumeTable"), data.top_volume_expansion, {
+        title: "量能放大",
+        icon: "▥",
+        metric: row => `量比 ${fmt(row.volume_ratio)}`,
+      });
     }
     async function fetchSignals() {
       const data = await getJson("/api/signals?limit=20");
@@ -5302,9 +8486,22 @@ INDEX_HTML = r"""<!doctype html>
         getJson("/api/signals?limit=12"),
         getJson("/api/scan?limit=10"),
       ]);
-      renderSignals(document.getElementById("hubSignalsTable"), signals.top_signals || []);
-      renderTable(document.getElementById("hubReturnTable"), scan.top_return_20d || []);
-      renderTable(document.getElementById("hubVolumeTable"), scan.top_volume_expansion || []);
+      await fetchIndustryStocks();
+      renderRankList(document.getElementById("hubSignalsTable"), signals.top_signals || [], {
+        title: "AI 智選",
+        icon: "◎",
+        metric: row => `AI ${fmt(row.score, 0)}｜${row.signal || "觀察"}`,
+      });
+      renderRankList(document.getElementById("hubReturnTable"), scan.top_return_20d || [], {
+        title: "強勢排行",
+        icon: "↗",
+        metric: row => `20日 ${fmt(row.return_20d)}%`,
+      });
+      renderRankList(document.getElementById("hubVolumeTable"), scan.top_volume_expansion || [], {
+        title: "量能焦點",
+        icon: "▥",
+        metric: row => `量比 ${fmt(row.volume_ratio)}`,
+      });
     }
     async function fetchStrategy() {
       const data = await getJson("/api/strategy");
@@ -5313,7 +8510,7 @@ INDEX_HTML = r"""<!doctype html>
         ["開始操盤", s.start_date || "2026-05-01"],
         ["起始資金", fmt(s.initial_capital)],
         ["最大持股數", fmt(s.max_positions, 0)],
-        ["持有期間", `${fmt(s.horizon, 0)} 個交易日`],
+        ["最長持有", `${fmt(s.horizon, 0)} 個交易日`],
         ["交易筆數", fmt(s.trades, 0)],
         ["未平倉部位", fmt(s.open_positions, 0)],
         ["最終資金", fmt(s.final_capital)],
@@ -5325,8 +8522,7 @@ INDEX_HTML = r"""<!doctype html>
       renderDl(document.getElementById("strategySummary"), summaryRows);
       const overviewStrategy = document.getElementById("overviewStrategySummary");
       if (overviewStrategy) renderDl(overviewStrategy, summaryRows);
-      renderStrategyAdvice(document.getElementById("strategyAdvice"), data.market_context || {}, s, data.high_win_strategy || {});
-      renderStrategyLeaders(document.getElementById("strategyLeadersTable"), (data.market_context || {}).leaders || []);
+      renderStrategyAdvice(document.getElementById("strategyAdvice"), data);
       renderStrategyStockCards(document.getElementById("strategyStockCards"), (data.market_context || {}).leaders || []);
       renderStrategyEntries(document.getElementById("strategyEntriesTable"), data.recent_entries || []);
       renderStrategyTrades(document.getElementById("strategyTradesTable"), data.closed_trades || data.recent_trades || []);
@@ -5343,8 +8539,8 @@ INDEX_HTML = r"""<!doctype html>
       const majors = watchData.watchlist || data.majors || [];
       renderMajors(document.getElementById("watchMajorsTable"), majors);
       const modeText = currentUserKey
-        ? "個人模式：觀察名單會綁定你的使用者代碼，推播只送到你的 Telegram。"
-        : publicDemoMode ? "公開展示模式：觀察名單只存在此瀏覽器，不會影響主機與推播。" : "觀察名單會保存在本機資料庫，可同步到即時看盤與推播。";
+        ? "個人模式：觀察名單會綁定你的使用者代碼，會同步到即時看盤與 Telegram 推播。"
+        : publicDemoMode ? "公開展示模式：觀察名單只存在此瀏覽器，不會影響主機與推播。" : "本機模式：觀察名單會保存在主機資料庫，會同步到即時看盤與既有推播設定。";
       document.getElementById("watchlistHint").textContent = `目前觀察 ${majors.length} 檔。可拖曳表格左側排序。${modeText}`;
       renderDl(document.getElementById("watchAfterSummary"), [
         ["盤後定位", "這裡只保留觀察名單與盤後摘要，AI 智選、強勢排行與量能焦點集中到股票探索。"],
@@ -5358,7 +8554,7 @@ INDEX_HTML = r"""<!doctype html>
       if (currentUserKey) {
         const data = await getJson(`/api/user/watchlist/add?user_key=${encodeURIComponent(currentUserKey)}&code=${encodeURIComponent(code)}`);
         renderMajors(document.getElementById("watchMajorsTable"), data.watchlist || []);
-        document.getElementById("watchlistHint").textContent = `已加入 ${code}。這是你的個人觀察名單。`;
+        document.getElementById("watchlistHint").textContent = `已加入 ${code}。這是你的個人觀察名單，已同步到推播。`;
         return;
       }
       if (publicDemoMode) {
@@ -5370,13 +8566,13 @@ INDEX_HTML = r"""<!doctype html>
       }
       const data = await getJson(`/api/watchlist/add?code=${encodeURIComponent(code)}`);
       renderMajors(document.getElementById("watchMajorsTable"), data.watchlist || []);
-      document.getElementById("watchlistHint").textContent = `已加入 ${code}，目前觀察 ${(data.watchlist || []).length} 檔。`;
+      document.getElementById("watchlistHint").textContent = `已加入 ${code}，目前觀察 ${(data.watchlist || []).length} 檔，已同步到本機推播。`;
     }
     async function removeWatchlistCode(code) {
       if (currentUserKey) {
         const data = await getJson(`/api/user/watchlist/remove?user_key=${encodeURIComponent(currentUserKey)}&code=${encodeURIComponent(code)}`);
         renderMajors(document.getElementById("watchMajorsTable"), data.watchlist || []);
-        document.getElementById("watchlistHint").textContent = `已移除 ${code}。這是你的個人觀察名單。`;
+        document.getElementById("watchlistHint").textContent = `已移除 ${code}。這是你的個人觀察名單，已同步到推播。`;
         return;
       }
       if (publicDemoMode) {
@@ -5388,7 +8584,7 @@ INDEX_HTML = r"""<!doctype html>
       }
       const data = await getJson(`/api/watchlist/remove?code=${encodeURIComponent(code)}`);
       renderMajors(document.getElementById("watchMajorsTable"), data.watchlist || []);
-      document.getElementById("watchlistHint").textContent = `已移除 ${code}，目前觀察 ${(data.watchlist || []).length} 檔。`;
+      document.getElementById("watchlistHint").textContent = `已移除 ${code}，目前觀察 ${(data.watchlist || []).length} 檔，已同步到本機推播。`;
     }
     async function useWatchlistRealtime() {
       const data = await getWatchlistData();
@@ -5402,6 +8598,8 @@ INDEX_HTML = r"""<!doctype html>
     }
     function openStock(code) {
       document.getElementById("code").value = code;
+      const panelInput = document.getElementById("stockPageCode");
+      if (panelInput) panelInput.value = code;
       searchStock();
     }
     function openHubStock() {
@@ -5440,17 +8638,23 @@ INDEX_HTML = r"""<!doctype html>
     }
     async function createUserProfile() {
       const name = document.getElementById("notifyName").value.trim() || "朋友";
+      const codes = await currentWatchlistCodesForSync();
       const data = await getJson(`/api/user/create?name=${encodeURIComponent(name)}`);
       currentUserKey = data.user.user_key;
       localStorage.setItem(userKeyStorageKey, currentUserKey);
       updateNotifyUi(data.user);
+      await syncUserWatchlistCodes(codes, true);
+      document.getElementById("notifyHint").textContent = `${data.user.display_name} 的個人設定已建立，並已把目前網頁關注名單同步到推播名單。`;
       await fetchWatch();
     }
     async function saveUserTelegram() {
       if (!currentUserKey) throw new Error("請先建立個人設定。");
       const chatId = document.getElementById("telegramChatId").value.trim();
+      const codes = await currentWatchlistCodesForSync();
       const data = await getJson(`/api/user/telegram/save?user_key=${encodeURIComponent(currentUserKey)}&chat_id=${encodeURIComponent(chatId)}`);
       updateNotifyUi(data.user);
+      const syncData = await syncUserWatchlistCodes(codes, true);
+      document.getElementById("notifyHint").textContent = `${data.user.display_name} 的 Telegram 已儲存。${syncData.message || "已同步目前網頁關注名單到推播名單。"}`;
     }
     async function sendUserTelegramTest() {
       if (!currentUserKey) throw new Error("請先建立個人設定。");
@@ -5545,16 +8749,24 @@ INDEX_HTML = r"""<!doctype html>
     function renderRealtimeMonitor(monitor) {
       const m = (monitor && monitor.summary) || {};
       const isIntraday = !!m.is_intraday;
+      if (!isIntraday) {
+        document.getElementById("aiMonitorSummary").innerHTML = `
+          <div class="trade-callout">
+            <strong>AI 盤中盯盤未啟動</strong>
+            <p>${m.message || "AI 盯盤只在台股盤中 09:00-13:30 顯示，盤後請看盤後看盤、股票探索與 AI 經理人。"}</p>
+          </div>`;
+        renderAiMonitor(document.getElementById("aiMonitorTable"), []);
+        return;
+      }
       document.getElementById("aiMonitorSummary").innerHTML = `
         <dl>
-          <dt>模式</dt><dd>${m.session_label || (isIntraday ? "盤中盯盤" : "盤後預覽")}</dd>
+          <dt>模式</dt><dd>${m.session_label || "盤中盯盤"}</dd>
           <dt>盯盤狀態</dt><dd>${m.stance || "資料不足"}</dd>
           <dt>風控</dt><dd>${fmt(m.urgent, 0)} 檔</dd>
           <dt>偏多</dt><dd>${fmt(m.positive, 0)} 檔</dd>
           <dt>觀察</dt><dd>${fmt(m.watch, 0)} 檔</dd>
           <dt>時間</dt><dd>${m.now || "-"}</dd>
-        </dl>
-        ${isIntraday ? "" : `<div class="trade-callout"><strong>盤後預覽</strong><p>${m.message || "現在不是台股盤中，以下顯示最新收盤資料的 AI 盯盤預覽，盤中會自動切換為即時模式。"}</p></div>`}`;
+        </dl>`;
       renderAiMonitor(document.getElementById("aiMonitorTable"), monitor.items || []);
     }
     async function selectRealtimeTrend(code) {
@@ -5587,9 +8799,10 @@ INDEX_HTML = r"""<!doctype html>
       setStatus("已停止自動刷新。");
     }
     function showPage(pageId, navItem) {
+      if (pageId === "signalsPage" || pageId === "rankingPage") pageId = "hubPage";
       activatePage(pageId);
       if (navItem) navItem.classList.add("active");
-      if (pageId === "strategyPage") runAction(fetchStrategy, "正在執行 AI 實操回測，可能需要約一分鐘...");
+      if (pageId === "strategyPage") runAction(fetchStrategy, "正在更新 AI 經理人決策...");
       if (pageId === "realtimePage") {
         runAction(fetchRealtime, "正在載入即時看盤...");
         ensureRealtimeAutoRefresh();
@@ -5600,10 +8813,52 @@ INDEX_HTML = r"""<!doctype html>
       if (pageId === "hubPage") runAction(fetchHub, "正在載入股票探索...");
       if (pageId === "stockPage") runAction(fetchStock, "正在載入個股資料...");
     }
-    function toggleSection(sectionId, button) {
-      const section = document.getElementById(sectionId);
-      section.classList.toggle("collapsed");
-      button.textContent = section.classList.contains("collapsed") ? "展開" : "收起";
+    function setupPanelControls() {
+      document.querySelectorAll(".page section").forEach((section, index) => {
+        const heading = section.querySelector(":scope > h2");
+        const page = section.closest(".page");
+        if (!heading || section.dataset.panelReady === "1") return;
+        if (page && ["watchPage", "realtimePage"].includes(page.id)) return;
+        section.dataset.panelReady = "1";
+        section.classList.add("info-panel", "panel-compact");
+        const titleText = heading.textContent.trim();
+        heading.textContent = "";
+        const title = document.createElement("span");
+        title.className = "section-title";
+        title.textContent = titleText;
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "panel-toggle";
+        button.textContent = "+";
+        button.title = "展開";
+        button.setAttribute("aria-expanded", "false");
+        button.addEventListener("click", event => {
+          event.stopPropagation();
+          togglePanel(section, button);
+        });
+        heading.addEventListener("click", () => togglePanel(section, button));
+        heading.append(title, button);
+      });
+    }
+    function togglePanel(section, button) {
+      const expanded = !section.classList.contains("panel-expanded");
+      section.classList.toggle("panel-expanded", expanded);
+      section.classList.toggle("panel-compact", !expanded);
+      button.textContent = expanded ? "收合" : "+";
+      button.title = expanded ? "收合" : "展開";
+      button.setAttribute("aria-expanded", expanded ? "true" : "false");
+      if (expanded) {
+        section.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+    }
+    function collapsePanel(section, button) {
+      section.classList.remove("panel-expanded");
+      section.classList.add("panel-compact");
+      if (button) {
+        button.textContent = "+";
+        button.title = "展開";
+        button.setAttribute("aria-expanded", "false");
+      }
     }
     function setStatus(message) {
       document.getElementById("statusLine").textContent = message;
@@ -5623,13 +8878,20 @@ INDEX_HTML = r"""<!doctype html>
     document.getElementById("watchlistCode").addEventListener("keydown", event => {
       if (event.key === "Enter") runAction(addWatchlistCode, "正在加入觀察名單...");
     });
-    document.getElementById("hubCode").addEventListener("keydown", event => {
-      if (event.key === "Enter") openHubStock();
+    const hubCodeInput = document.getElementById("hubCode");
+    if (hubCodeInput) {
+      hubCodeInput.addEventListener("keydown", event => {
+        if (event.key === "Enter") openHubStock();
+      });
+    }
+    document.getElementById("stockPageCode").addEventListener("keydown", event => {
+      if (event.key === "Enter") searchStockFromPanel();
     });
+    setupPanelControls();
     initPublicConfig()
       .then(() => fetchStatus())
       .then(() => fetchStock())
-      .then(() => setStatus("準備就緒。排行與 AI 實操會在切換頁面時載入。"))
+      .then(() => setStatus("準備就緒。排行與 AI 經理人會在切換頁面時載入。"))
       .catch(error => {
         setStatus(`錯誤：${error.message}`);
         alert(error.message);

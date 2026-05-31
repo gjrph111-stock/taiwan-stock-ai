@@ -5,7 +5,6 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from .ai_monitor import build_ai_monitor, format_monitor_message
 from .config import DEFAULT_DB_PATH
 from .indicators import macd, pct_change, rsi, sma, volume_ratio
 from .names import short_name
@@ -21,7 +20,6 @@ def build_daily_message(db_path: Path = DEFAULT_DB_PATH, limit: int = 5) -> str:
     scan = api_scan(db_path, limit)
     strategy = api_strategy(db_path).get("market_context", {})
     watch_items = build_watchlist_advice(db_path, limit=limit)
-    monitor = build_ai_monitor(db_path)
 
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
@@ -42,8 +40,6 @@ def build_daily_message(db_path: Path = DEFAULT_DB_PATH, limit: int = 5) -> str:
             lines.extend(_format_watch_advice(item))
     else:
         lines.append("目前觀察名單沒有可分析標的，請先在網頁加入股票。")
-
-    lines.extend(format_monitor_message(monitor, limit=limit))
 
     lines.extend(["", f"AI 訊號備選 Top {limit}"])
     for item in signals["top_signals"]:
@@ -74,7 +70,7 @@ def build_watchlist_advice(db_path: Path = DEFAULT_DB_PATH, limit: int | None = 
             SELECT w.code, s.name, s.market
             FROM watchlist w
             JOIN stocks s ON s.code = w.code
-            ORDER BY w.created_at, w.code
+            ORDER BY COALESCE(w.sort_order, 999999), w.created_at, w.code
             """
         ).fetchall()
         if limit:
@@ -217,6 +213,10 @@ def _ensure_watchlist(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(watchlist)").fetchall()}
+    if "sort_order" not in existing_columns:
+        conn.execute("ALTER TABLE watchlist ADD COLUMN sort_order INTEGER")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_notify_watchlist_order ON watchlist(sort_order, created_at)")
     existing = conn.execute("SELECT COUNT(*) AS n FROM watchlist").fetchone()["n"]
     if existing == 0:
         conn.executemany(

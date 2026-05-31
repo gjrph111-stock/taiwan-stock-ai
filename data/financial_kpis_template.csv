@@ -1,0 +1,2 @@
+period,stock_code,revenue,revenue_yoy,eps,gross_margin,operating_margin,roe,pe,pb,dividend_yield,source,summary
+2026Q1,2330,839254000000,16.5,12.50,58.8,48.2,8.9,22.1,5.8,1.9,公開財報與估值資料,範例：請改成實際財報 KPI。匯入後會補齊個股分析的財報與估值欄位。

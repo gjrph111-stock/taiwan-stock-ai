@@ -37,6 +37,7 @@ from .web import (
     poll_telegram_updates,
     run as run_web,
     send_enabled_user_intraday_telegrams,
+    send_enabled_user_premarket_telegrams,
     send_enabled_user_telegrams,
     set_telegram_webhook,
 )
@@ -130,6 +131,10 @@ def main() -> None:
     user_intraday_parser = subparsers.add_parser("notify-users-intraday", help="Send personal intraday Telegram reports to enabled users")
     user_intraday_parser.add_argument("--limit", type=int, default=5, help="Rows per user watchlist")
     user_intraday_parser.add_argument("--force", action="store_true", help="Send even outside weekday 09:00-14:00")
+
+    user_premarket_parser = subparsers.add_parser("notify-users-premarket", help="Send personal premarket night-session reports to enabled users")
+    user_premarket_parser.add_argument("--limit", type=int, default=5, help="Rows per user watchlist")
+    user_premarket_parser.add_argument("--force", action="store_true", help="Send even outside weekday 08:20-08:50")
 
     intraday_parser = subparsers.add_parser("notify-intraday", help="Send owner AI monitor only during market hours")
     intraday_parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Notification config path")
@@ -319,6 +324,17 @@ def main() -> None:
             print(f"Skipped: user intraday push is only allowed Mon-Fri 09:00-14:00 Asia/Taipei. Now={now:%Y-%m-%d %H:%M:%S}")
             return
         result = send_enabled_user_intraday_telegrams(Path(args.db), args.limit)
+        print(result)
+        return
+
+    if args.command == "notify-users-premarket":
+        conn.close()
+        now = datetime.now(ZoneInfo("Asia/Taipei"))
+        allowed = now.weekday() < 5 and time(8, 20) <= now.time() <= time(8, 50)
+        if not allowed and not args.force:
+            print(f"Skipped: user premarket push is only allowed Mon-Fri 08:20-08:50 Asia/Taipei. Now={now:%Y-%m-%d %H:%M:%S}")
+            return
+        result = send_enabled_user_premarket_telegrams(Path(args.db), args.limit)
         print(result)
         return
 
