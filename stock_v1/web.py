@@ -209,6 +209,13 @@ def _public_demo_mode() -> bool:
     return os.environ.get("STOCK_V1_PUBLIC_DEMO", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _cloud_web_mode() -> bool:
+    explicit = os.environ.get("STOCK_V1_CLOUD_WEB", "").strip().lower()
+    if explicit:
+        return explicit in {"1", "true", "yes", "on"}
+    return DEFAULT_DB_PATH.name == "tw_stocks_deploy.sqlite"
+
+
 def api_status(db_path: Path) -> dict:
     with _connect(db_path) as conn:
         stocks = conn.execute("SELECT COUNT(*) AS n FROM stocks").fetchone()["n"]
@@ -731,7 +738,7 @@ def _market_session() -> dict:
 
 
 def api_public_config() -> dict:
-    return {"public_demo": _public_demo_mode()}
+    return {"public_demo": _public_demo_mode(), "cloud_web": _cloud_web_mode()}
 
 
 def api_watchlist(db_path: Path, raw_codes: str = "") -> dict:
@@ -5624,7 +5631,7 @@ INDEX_HTML = r"""<!doctype html>
       <h1>台股智研 Pro</h1>
       <div class="subtitle">專業台股智能分析平台 · 訊號排行 · AI 經理人 · 風控紀律</div>
     </div>
-    <div class="version"><span id="range">載入中...</span> · UI v50</div>
+    <div class="version"><span id="range">載入中...</span> · UI v51</div>
   </header>
   <div class="app-shell">
     <aside class="sidebar">
@@ -6108,6 +6115,7 @@ INDEX_HTML = r"""<!doctype html>
     const publicWatchlistKey = "stock_v1_public_watchlist";
     const userKeyStorageKey = "stock_v1_user_key";
     let currentUserKey = localStorage.getItem(userKeyStorageKey) || "";
+    let cloudWebMode = false;
     const rankListState = {};
     let latestCoverageContext = {};
     async function getJson(url) {
@@ -6129,10 +6137,36 @@ INDEX_HTML = r"""<!doctype html>
       try {
         const config = await getJson("/api/public-config");
         publicDemoMode = !!config.public_demo;
+        cloudWebMode = !!config.cloud_web;
       } catch (error) {
         publicDemoMode = false;
+        cloudWebMode = false;
       }
+      applyCloudWebMode();
       await loadUserProfile();
+    }
+    function applyCloudWebMode() {
+      if (!cloudWebMode) return;
+      document.body.classList.add("cloud-web-mode");
+      document.querySelectorAll('[data-page="notifyPage"]').forEach(item => item.remove());
+      const notifyPage = document.getElementById("notifyPage");
+      if (notifyPage) notifyPage.remove();
+      const syncPushButton = Array.from(document.querySelectorAll("button")).find(button => button.textContent.trim() === "同步到推播");
+      if (syncPushButton) syncPushButton.remove();
+      replaceText("AI 經理人", "AI 回測");
+      replaceText("Telegram 盤中/盤後推播", "雲端資料查詢");
+      replaceText("提醒管道", "雲端模式");
+      replaceText("Telegram", "網頁查詢");
+      const subtitle = document.querySelector(".subtitle");
+      if (subtitle) subtitle.textContent = "專業台股智能分析平台 · 訊號排行 · AI 回測 · 風控紀律";
+    }
+    function replaceText(from, to) {
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      const nodes = [];
+      while (walker.nextNode()) nodes.push(walker.currentNode);
+      nodes.forEach(node => {
+        if (node.nodeValue.includes(from)) node.nodeValue = node.nodeValue.split(from).join(to);
+      });
     }
     function localWatchlistCodes() {
       try {
@@ -7223,6 +7257,10 @@ INDEX_HTML = r"""<!doctype html>
       return { fundamental, technical, chip, market, composite, winRate, riskGrade, position, entryText, targetText, stopText, rr, operation, chase, lowBuy };
     }
     function renderStrategyAdvice(target, data = {}) {
+      if (cloudWebMode) {
+        renderBacktestAdvice(target, data);
+        return;
+      }
       const context = data.market_context || {};
       const summary = data.summary || {};
       const leaders = (context.leaders || []).slice(0, 4);
@@ -7284,6 +7322,65 @@ INDEX_HTML = r"""<!doctype html>
               <h3>風控</h3>
               <p>單檔上限 20%；本檔建議 ${decision.position}%。</p>
               <p>${(context.risks || ["依停損與部位規則執行。"]).slice(0, 2).join("；")}</p>
+            </div>
+          </div>
+        </div>`;
+    }
+    function renderBacktestAdvice(target, data = {}) {
+      const context = data.market_context || {};
+      const summary = data.summary || {};
+      const leaders = (context.leaders || []).slice(0, 8);
+      const m = context.metrics || {};
+      const rows = leaders.length ? leaders.map(row => `
+        <tr>
+          <td><b>${row.name || ""}</b><br>${row.code || ""}</td>
+          <td><b>${fmt(row.score, 0)}</b></td>
+          <td>${fmt(row.return_20d)}%</td>
+          <td>${fmt(row.return_60d)}%</td>
+          <td>${fmt(row.rsi_14)}</td>
+          <td>${fmt(row.volume_ratio)}</td>
+          <td>${row.signal || "觀察"}</td>
+        </tr>
+      `).join("") : "<tr><td colspan='7'>目前沒有足夠回測樣本。</td></tr>";
+      const totalReturn = Number(summary.total_return || 0);
+      const returnLabel = totalReturn >= 0 ? "正報酬" : "負報酬";
+      target.innerHTML = `
+        <div class="manager-report">
+          <div class="strategy-advice">
+            <div class="advice-main">
+              <strong>AI 回測｜${context.stance || "市場樣本"}｜${returnLabel}</strong>
+              <p>此頁改為歷史回測與訊號驗證，只呈現模型在既有資料上的模擬結果，不做即時操盤或推播設定。</p>
+              <p><b>回測結論：</b>期間 ${summary.start_date || "-"} 起，總報酬 ${fmt(summary.total_return)}%，勝率 ${fmt(summary.win_rate)}%，最大回撤 ${fmt(summary.max_drawdown)}%。</p>
+              <p><b>使用方式：</b>先看報酬與回撤，再查看候選樣本是否符合趨勢、量能與風險條件。</p>
+            </div>
+            <div class="strategy-kpis">
+              <div class="strategy-kpi"><span>交易筆數</span><strong>${fmt(summary.trades, 0)}</strong></div>
+              <div class="strategy-kpi"><span>總報酬</span><strong>${fmt(summary.total_return)}%</strong></div>
+              <div class="strategy-kpi"><span>勝率</span><strong>${fmt(summary.win_rate)}%</strong></div>
+              <div class="strategy-kpi"><span>最大回撤</span><strong>${fmt(summary.max_drawdown)}%</strong></div>
+              <div class="strategy-kpi"><span>期末資金</span><strong>${fmt(summary.final_capital)}</strong></div>
+              <div class="strategy-kpi"><span>可行訊號</span><strong>${fmt(m.actionable_pct)}%</strong></div>
+            </div>
+          </div>
+          <div class="manager-grid">
+            <div class="manager-card full">
+              <h3>回測訊號樣本</h3>
+              <table class="manager-table">
+                <thead><tr><th>標的</th><th>AI分</th><th>20D</th><th>60D</th><th>RSI</th><th>量比</th><th>訊號</th></tr></thead>
+                <tbody>${rows}</tbody>
+              </table>
+            </div>
+            <div class="manager-card">
+              <h3>回測設定</h3>
+              <p>初始資金 ${fmt(summary.initial_capital)}；最多 ${fmt(summary.max_positions, 0)} 檔；最長持有 ${fmt(summary.horizon, 0)} 個交易日。</p>
+            </div>
+            <div class="manager-card">
+              <h3>風險解讀</h3>
+              <p>最大回撤 ${fmt(summary.max_drawdown)}%；中位數單筆 ${fmt(summary.median_trade_return)}%。</p>
+            </div>
+            <div class="manager-card">
+              <h3>限制</h3>
+              <p>回測只反映歷史資料，不代表未來績效；網頁版不提供 Telegram 推播設定。</p>
             </div>
           </div>
         </div>`;
@@ -8516,7 +8613,18 @@ INDEX_HTML = r"""<!doctype html>
     async function fetchStrategy() {
       const data = await getJson("/api/strategy");
       const s = data.summary;
-      const summaryRows = [
+      const summaryRows = cloudWebMode ? [
+        ["回測起始", s.start_date || "2026-05-01"],
+        ["初始資金", fmt(s.initial_capital)],
+        ["最大持股數", fmt(s.max_positions, 0)],
+        ["最長持有", `${fmt(s.horizon, 0)} 個交易日`],
+        ["交易樣本", fmt(s.trades, 0)],
+        ["期末資金", fmt(s.final_capital)],
+        ["總報酬", `${fmt(s.total_return)}%`],
+        ["勝率", `${fmt(s.win_rate)}%`],
+        ["中位數交易", `${fmt(s.median_trade_return)}%`],
+        ["最大回撤", `${fmt(s.max_drawdown)}%`],
+      ] : [
         ["開始操盤", s.start_date || "2026-05-01"],
         ["起始資金", fmt(s.initial_capital)],
         ["最大持股數", fmt(s.max_positions, 0)],
@@ -8550,7 +8658,7 @@ INDEX_HTML = r"""<!doctype html>
       renderMajors(document.getElementById("watchMajorsTable"), majors);
       const modeText = currentUserKey
         ? "個人模式：觀察名單會綁定你的使用者代碼，會同步到即時看盤與 Telegram 推播。"
-        : publicDemoMode ? "公開展示模式：觀察名單只存在此瀏覽器，不會影響主機與推播。" : "本機模式：觀察名單會保存在主機資料庫，會同步到即時看盤與既有推播設定。";
+        : cloudWebMode ? "網頁版：觀察名單用於畫面與即時看盤，不提供 Telegram 推播設定。" : publicDemoMode ? "公開展示模式：觀察名單只存在此瀏覽器，不會影響主機與推播。" : "本機模式：觀察名單會保存在主機資料庫，會同步到即時看盤與既有推播設定。";
       document.getElementById("watchlistHint").textContent = `目前觀察 ${majors.length} 檔。可拖曳表格左側排序。${modeText}`;
       renderDl(document.getElementById("watchAfterSummary"), [
         ["盤後定位", "這裡只保留觀察名單與盤後摘要，AI 智選、強勢排行與量能焦點集中到股票探索。"],
@@ -8812,7 +8920,7 @@ INDEX_HTML = r"""<!doctype html>
       if (pageId === "signalsPage" || pageId === "rankingPage") pageId = "hubPage";
       activatePage(pageId);
       if (navItem) navItem.classList.add("active");
-      if (pageId === "strategyPage") runAction(fetchStrategy, "正在更新 AI 經理人決策...");
+      if (pageId === "strategyPage") runAction(fetchStrategy, cloudWebMode ? "正在載入 AI 回測..." : "正在更新 AI 經理人決策...");
       if (pageId === "realtimePage") {
         runAction(fetchRealtime, "正在載入即時看盤...");
         ensureRealtimeAutoRefresh();
@@ -8901,7 +9009,7 @@ INDEX_HTML = r"""<!doctype html>
     initPublicConfig()
       .then(() => fetchStatus())
       .then(() => fetchStock())
-      .then(() => setStatus("準備就緒。排行與 AI 經理人會在切換頁面時載入。"))
+      .then(() => setStatus(cloudWebMode ? "準備就緒。排行與 AI 回測會在切換頁面時載入。" : "準備就緒。排行與 AI 經理人會在切換頁面時載入。"))
       .catch(error => {
         setStatus(`錯誤：${error.message}`);
         alert(error.message);
