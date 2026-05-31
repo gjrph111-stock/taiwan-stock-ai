@@ -5442,6 +5442,32 @@ INDEX_HTML = r"""<!doctype html>
       gap: 10px;
       margin-top: 10px;
     }
+    .research-stage-picker {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+      padding: 12px;
+      border: 1px solid rgba(56,189,248,.22);
+      border-radius: 8px;
+      background: linear-gradient(180deg, rgba(15, 26, 42, .96), rgba(8, 17, 31, .96));
+    }
+    .research-stage-picker select {
+      flex: 1 1 320px;
+      min-width: 260px;
+    }
+    .research-stage-current {
+      color: #a7f3d0;
+      font-weight: 900;
+      font-size: 13px;
+      white-space: nowrap;
+    }
+    .research-stage-detail {
+      display: none;
+    }
+    .research-stage-detail.active {
+      display: block;
+    }
     .research-stage {
       border: 1px solid rgba(56,189,248,.22);
       border-radius: 8px;
@@ -6287,7 +6313,7 @@ INDEX_HTML = r"""<!doctype html>
       <h1>台股智研 Pro</h1>
       <div class="subtitle">專業台股智能分析平台 · 訊號排行 · AI 經理人 · 風控紀律</div>
     </div>
-    <div class="version"><span id="range">載入中...</span> · UI v56</div>
+    <div class="version"><span id="range">載入中...</span> · UI v57</div>
   </header>
   <div class="app-shell">
     <aside class="sidebar">
@@ -6595,6 +6621,10 @@ INDEX_HTML = r"""<!doctype html>
           </section>
         </div>
         <div class="desk-side">
+          <section class="desk-panel panel-summary">
+            <h2>個股資料</h2>
+            <div class="content"><dl id="stockSummary"></dl></div>
+          </section>
           <section class="desk-panel panel-diagnosis">
             <h2>AI 個股診斷</h2>
             <div class="content">
@@ -6605,25 +6635,21 @@ INDEX_HTML = r"""<!doctype html>
               </div>
             </div>
           </section>
-          <section class="desk-panel panel-trade">
-            <h2>交易計畫</h2>
-            <div id="tradePlan" class="trade-plan"></div>
+          <section class="desk-panel panel-facets">
+            <h2>AI 構面總覽</h2>
+            <div id="analysisFacets" class="trade-plan"></div>
+          </section>
+          <section class="desk-panel panel-indicators">
+            <h2>技術指標</h2>
+            <div class="content"><dl id="indicators"></dl></div>
           </section>
           <section class="desk-panel panel-theory">
             <h2>技術理論解盤</h2>
             <div id="technicalTheoryAnalysis" class="trade-plan"></div>
           </section>
-          <section class="desk-panel panel-facets">
-            <h2>AI 構面總覽</h2>
-            <div id="analysisFacets" class="trade-plan"></div>
-          </section>
-          <section class="desk-panel panel-summary">
-            <h2>個股資料</h2>
-            <div class="content"><dl id="stockSummary"></dl></div>
-          </section>
-          <section class="desk-panel panel-indicators">
-            <h2>技術指標</h2>
-            <div class="content"><dl id="indicators"></dl></div>
+          <section class="desk-panel panel-trade">
+            <h2>交易計畫</h2>
+            <div id="tradePlan" class="trade-plan"></div>
           </section>
         </div>
         <div class="stock-part-title">
@@ -7598,23 +7624,22 @@ INDEX_HTML = r"""<!doctype html>
           <p>${verified.length} 份已達驗證條件，其餘已產出研究版並列明假設與追蹤重點。可用下拉展開每一步報告。</p>
         </div>
         <div class="research-stage-list">
+          <div class="research-stage-picker">
+            <select aria-label="選擇研究階段" onchange="switchResearchStage(this)">
+              ${stages.map((stage, index) => `
+                <option value="${index}"${index === 9 ? " selected" : ""}>${index + 1}. ${stage.title.replace(/^第.+階段：/, "")}</option>
+              `).join("")}
+            </select>
+            <span class="research-stage-current">${verified.length} / ${stages.length} 已驗證</span>
+          </div>
           ${stages.map((stage, index) => `
-            <details class="research-stage"${index === 9 ? " open" : ""}>
-              <summary>
-                <span>${index + 1}. ${stage.title.replace(/^第.+階段：/, "")}</span>
-                <span class="stage-status">${stage.verified ? "已驗證" : "研究版"}</span>
-                <span class="stage-confidence">信心 ${fmt(stage.confidence, 0)}</span>
-              </summary>
+            <div class="research-stage research-stage-detail${index === 9 ? " active" : ""}" data-stage-index="${index}">
               <div class="stage-body">
-                <table class="fundamental-mini-table">
-                  <tbody>
-                    <tr><th>目標</th><td>${stage.goal}</td></tr>
-                    <tr><th>必要輸出</th><td>${stage.required.join("、")}</td></tr>
-                    <tr><th>重點摘要</th><td>${stage.summary}</td></tr>
-                    <tr><th>驗證狀態</th><td>${stage.verified ? "已達條件" : "研究版，需持續追蹤"}｜${stage.dependency}</td></tr>
-                    <tr><th>下一步</th><td>${stage.next}</td></tr>
-                  </tbody>
-                </table>
+                <div class="research-stage-picker">
+                  <strong>${index + 1}. ${stage.title.replace(/^第.+階段：/, "")}</strong>
+                  <span class="stage-status">${stage.verified ? "已驗證" : "研究版"}</span>
+                  <span class="stage-confidence">信心 ${fmt(stage.confidence, 0)}</span>
+                </div>
                 <table class="fundamental-mini-table">
                   <thead><tr><th>KPI</th><th>數值</th></tr></thead>
                   <tbody>${stage.kpis.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("")}</tbody>
@@ -7630,10 +7655,18 @@ INDEX_HTML = r"""<!doctype html>
                   </ul>
                 </div>
               </div>
-            </details>
+            </div>
           `).join("")}
         </div>
       `;
+    }
+    function switchResearchStage(select) {
+      const list = select.closest(".research-stage-list");
+      if (!list) return;
+      const index = String(select.value);
+      list.querySelectorAll(".research-stage-detail").forEach(panel => {
+        panel.classList.toggle("active", panel.dataset.stageIndex === index);
+      });
     }
     function groupResearchSections(sections) {
       const buckets = [
