@@ -1,5 +1,6 @@
 import argparse
 import os
+import time as time_module
 from datetime import datetime, time
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -33,9 +34,14 @@ from .reports import (
 )
 from .update import update_prices, update_universe
 from .web import (
+    api_realtime,
+    api_watchlist,
+    build_news_alert_message,
+    build_owner_premarket_message,
     delete_telegram_webhook,
     poll_telegram_updates,
     run as run_web,
+    scan_breaking_news,
     send_enabled_user_intraday_telegrams,
     send_enabled_user_premarket_telegrams,
     send_enabled_user_telegrams,
@@ -132,9 +138,24 @@ def main() -> None:
     user_intraday_parser.add_argument("--limit", type=int, default=5, help="Rows per user watchlist")
     user_intraday_parser.add_argument("--force", action="store_true", help="Send even outside weekday 09:00-14:00")
 
+    large_order_parser = subparsers.add_parser("large-order-watch", help="Scan realtime watchlist quotes and push large order alerts")
+    large_order_parser.add_argument("--codes", help="Comma-separated stock codes. Defaults to local watchlist")
+    large_order_parser.add_argument("--force", action="store_true", help="Run even outside weekday 09:00-13:35")
+
     user_premarket_parser = subparsers.add_parser("notify-users-premarket", help="Send personal premarket night-session reports to enabled users")
     user_premarket_parser.add_argument("--limit", type=int, default=5, help="Rows per user watchlist")
     user_premarket_parser.add_argument("--force", action="store_true", help="Send even outside weekday 08:20-08:50")
+
+    owner_premarket_parser = subparsers.add_parser("notify-premarket", help="Send owner 08:30 premarket report to Telegram")
+    owner_premarket_parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Notification config path")
+    owner_premarket_parser.add_argument("--limit", type=int, default=8, help="Rows per watchlist")
+    owner_premarket_parser.add_argument("--force", action="store_true", help="Send even outside weekday 08:20-08:50")
+
+    news_watch_parser = subparsers.add_parser("news-watch", help="Monitor 24H market news and push new high-impact alerts")
+    news_watch_parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Notification config path")
+    news_watch_parser.add_argument("--limit", type=int, default=8, help="Maximum alerts per push")
+    news_watch_parser.add_argument("--interval-minutes", type=int, default=10, help="Polling interval for continuous mode")
+    news_watch_parser.add_argument("--once", action="store_true", help="Run one scan and exit")
 
     intraday_parser = subparsers.add_parser("notify-intraday", help="Send owner AI monitor only during market hours")
     intraday_parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Notification config path")
@@ -327,6 +348,18 @@ def main() -> None:
         print(result)
         return
 
+    if args.command == "large-order-watch":
+        conn.close()
+        now = datetime.now(ZoneInfo("Asia/Taipei"))
+        allowed = now.weekday() < 5 and time(9, 0) <= now.time() <= time(13, 35)
+        if not allowed and not args.force:
+            print(f"Skipped: large order watch is only allowed Mon-Fri 09:00-13:35 Asia/Taipei. Now={now:%Y-%m-%d %H:%M:%S}")
+            return
+        codes = args.codes or ",".join(api_watchlist(Path(args.db)).get("codes") or [])
+        result = api_realtime(Path(args.db), codes)
+        print({"quotes": len(result.get("quotes") or []), "large_order_alerts": result.get("large_order_alerts") or []})
+        return
+
     if args.command == "notify-users-premarket":
         conn.close()
         now = datetime.now(ZoneInfo("Asia/Taipei"))
@@ -337,6 +370,33 @@ def main() -> None:
         result = send_enabled_user_premarket_telegrams(Path(args.db), args.limit)
         print(result)
         return
+
+    if args.command == "notify-premarket":
+        conn.close()
+        now = datetime.now(ZoneInfo("Asia/Taipei"))
+        allowed = now.weekday() < 5 and time(8, 20) <= now.time() <= time(8, 50)
+        if not allowed and not args.force:
+            print(f"Skipped: owner premarket push is only allowed Mon-Fri 08:20-08:50 Asia/Taipei. Now={now:%Y-%m-%d %H:%M:%S}")
+            return
+        message = build_owner_premarket_message(Path(args.db), args.limit)
+        result = send_telegram(message, load_config(Path(args.config)) if Path(args.config).exists() else {})
+        print(result)
+        return
+
+    if args.command == "news-watch":
+        conn.close()
+        config = load_config(Path(args.config)) if Path(args.config).exists() else {}
+        while True:
+            result = scan_breaking_news(Path(args.db), limit=args.limit)
+            items = result.get("new_items") or []
+            if items:
+                send_result = send_telegram(build_news_alert_message(items), config)
+                print({"scan": result, "telegram": send_result})
+            else:
+                print({"scan": result, "telegram": "no new high-impact news"})
+            if args.once:
+                return
+            time_module.sleep(max(1, args.interval_minutes) * 60)
 
     if args.command == "notify-intraday":
         conn.close()

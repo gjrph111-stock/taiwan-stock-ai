@@ -11,11 +11,6 @@ PUBLIC_TABLES = [
     "watchlist",
     "financial_kpis",
     "fund_holdings",
-    "ai_ops_account",
-    "ai_ops_runs",
-    "ai_ops_positions",
-    "ai_ops_trades",
-    "ai_ops_equity",
 ]
 
 

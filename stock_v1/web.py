@@ -21,7 +21,7 @@ from .fundamental import build_fundamental_analysis
 from .indicators import is_new_high, macd, pct_change, rsi, sma, volume_ratio
 from .industry import industry_profile
 from .names import short_name
-from .news import fetch_stock_news
+from .news import fetch_market_news, fetch_stock_news, headline_id
 from .signals import load_signal_rows, rank_signals, risk_adjusted_score, score_stock
 
 
@@ -29,6 +29,7 @@ _FUNDAMENTAL_CACHE: dict[tuple[str, str | None], dict] = {}
 _STRATEGY_CACHE: dict[str | None, dict] = {}
 _AI_MONITOR_CACHE: dict[str, object] = {"expires_at": datetime.min, "data": None}
 _PREMARKET_CACHE: dict[str, object] = {"expires_at": datetime.min, "data": None}
+_LARGE_ORDER_CACHE: dict[str, object] = {"expires_at": datetime.min, "observed": {}}
 _PUBLIC_FINANCIAL_CACHE: dict[str, object] = {}
 _FUND_HOLDINGS_CSV = DEFAULT_DB_PATH.parent / "fund_holdings.csv"
 _FINANCIAL_KPIS_CSV = DEFAULT_DB_PATH.parent / "financial_kpis.csv"
@@ -82,6 +83,8 @@ def _make_handler(db_path: Path):
                     self._send_json(api_strategy(db_path))
                 elif parsed.path == "/api/watch":
                     self._send_json(api_watch(db_path))
+                elif parsed.path == "/api/premarket":
+                    self._send_json(api_premarket(db_path, int(_param(params, "limit", "8"))))
                 elif parsed.path == "/api/ai-monitor":
                     self._send_json(api_ai_monitor(db_path))
                 elif parsed.path == "/api/ai-monitor-stock":
@@ -137,6 +140,8 @@ def _make_handler(db_path: Path):
                     self._send_json(api_job_premarket_prepare(db_path, _param(params, "token", ""), int(_param(params, "limit", "5"))))
                 elif parsed.path == "/api/jobs/notify-users-premarket":
                     self._send_json(api_job_notify_users_premarket(db_path, _param(params, "token", ""), int(_param(params, "limit", "5"))))
+                elif parsed.path == "/api/jobs/news-watch":
+                    self._send_json(api_job_news_watch(db_path, _param(params, "token", ""), int(_param(params, "limit", "8"))))
                 elif parsed.path == "/api/admin/users":
                     self._send_json(api_admin_users(db_path, _param(params, "token", "")))
                 elif parsed.path == "/api/admin/telegram-webhook":
@@ -706,6 +711,112 @@ def _strategy_market_context(conn: sqlite3.Connection, result: dict) -> dict:
     }
 
 
+def _after_hours_industry_report(db_path: Path) -> dict:
+    with _connect(db_path) as conn:
+        raw_industry = {row["code"]: row["industry"] for row in conn.execute("SELECT code, industry FROM stocks").fetchall()}
+        groups: dict[str, dict] = {}
+        latest_date = None
+        for stock, rows in load_signal_rows(conn):
+            clean = [row for row in rows if row["close"] is not None]
+            if len(clean) < 2:
+                continue
+            latest = clean[-1]
+            previous = clean[-2]
+            latest_date = max(latest_date or latest["date"], latest["date"])
+            close = float(latest["close"])
+            prev_close = float(previous["close"]) if previous["close"] not in (None, 0) else None
+            change_percent = (close - prev_close) / prev_close * 100 if prev_close else 0
+            closes = [float(row["close"]) for row in clean]
+            volumes = [row["volume"] or 0 for row in clean]
+            ret20 = pct_change(closes, 20) or 0
+            volx = volume_ratio(volumes) or 0
+            profile = industry_profile(stock["code"], stock["name"], raw_industry.get(stock["code"]))
+            group_names = [profile["category"], *profile.get("themes", [])]
+            for group_name in dict.fromkeys(group_names):
+                group = groups.setdefault(
+                    group_name,
+                    {
+                        "name": group_name,
+                        "count": 0,
+                        "advancers": 0,
+                        "decliners": 0,
+                        "sum_change": 0.0,
+                        "sum_return_20d": 0.0,
+                        "sum_volume_ratio": 0.0,
+                        "items": [],
+                    },
+                )
+                item = {
+                    "code": stock["code"],
+                    "name": short_name(stock["name"]),
+                    "change_percent": change_percent,
+                    "return_20d": ret20,
+                    "volume_ratio": volx,
+                    "close": close,
+                    "leader_score": close * float(latest["volume"] or 0),
+                }
+                group["count"] += 1
+                group["advancers"] += 1 if change_percent > 0 else 0
+                group["decliners"] += 1 if change_percent < 0 else 0
+                group["sum_change"] += change_percent
+                group["sum_return_20d"] += ret20
+                group["sum_volume_ratio"] += volx
+                group["items"].append(item)
+
+    reports = []
+    for group in groups.values():
+        count = max(1, group["count"])
+        items = group["items"]
+        leader = max(items, key=lambda row: row["leader_score"]) if items else {}
+        strongest = max(items, key=lambda row: row["change_percent"]) if items else {}
+        weakest = min(items, key=lambda row: row["change_percent"]) if items else {}
+        avg_change = group["sum_change"] / count
+        avg_return_20d = group["sum_return_20d"] / count
+        avg_volume_ratio = group["sum_volume_ratio"] / count
+        breadth = group["advancers"] / count * 100
+        if avg_change >= 1.2 and breadth >= 60:
+            stance = "類股強勢"
+            action = "盤後列入明日優先觀察，開盤仍等量價確認。"
+        elif avg_change <= -1.0 and breadth <= 40:
+            stance = "類股轉弱"
+            action = "降低追價，先檢查支撐、停損與是否有新聞利空。"
+        elif avg_volume_ratio >= 1.8:
+            stance = "量能異動"
+            action = "資金正在集中，挑龍頭與最強個股，不追落後補漲。"
+        else:
+            stance = "中性整理"
+            action = "觀察族群內強弱分化，等待隔日量能方向。"
+        reports.append(
+            {
+                "name": group["name"],
+                "count": group["count"],
+                "advancers": group["advancers"],
+                "decliners": group["decliners"],
+                "breadth": breadth,
+                "avg_change_percent": avg_change,
+                "avg_return_20d": avg_return_20d,
+                "avg_volume_ratio": avg_volume_ratio,
+                "leader": leader,
+                "strongest": strongest,
+                "weakest": weakest,
+                "stance": stance,
+                "action": action,
+            }
+        )
+    reports.sort(key=lambda row: (row["avg_change_percent"], row["avg_volume_ratio"], row["count"]), reverse=True)
+    return {
+        "date": latest_date,
+        "top_groups": reports[:10],
+        "volume_focus": sorted(reports, key=lambda row: row["avg_volume_ratio"], reverse=True)[:8],
+        "weak_groups": sorted(reports, key=lambda row: row["avg_change_percent"])[:6],
+        "summary": {
+            "groups": len(reports),
+            "strong_groups": sum(1 for row in reports if row["avg_change_percent"] >= 1),
+            "weak_groups": sum(1 for row in reports if row["avg_change_percent"] <= -1),
+        },
+    }
+
+
 def api_watch(db_path: Path) -> dict:
     scan = api_scan(db_path, 8)
     signals = api_signals(db_path, 8)
@@ -717,6 +828,27 @@ def api_watch(db_path: Path) -> dict:
         "top_return_20d": scan["top_return_20d"],
         "top_volume_expansion": scan["top_volume_expansion"],
         "majors": majors,
+        "industry_after_report": _after_hours_industry_report(db_path),
+    }
+
+
+def api_premarket(db_path: Path, limit: int = 8) -> dict:
+    snapshot = _premarket_snapshot()
+    codes = _watchlist_codes(db_path)
+    rows = api_watchlist(db_path, ",".join(codes)).get("watchlist", [])[:limit]
+    news = fetch_market_news(max_items=12)
+    return {
+        "snapshot": snapshot,
+        "watchlist": [
+            {
+                **row,
+                "premarket_bias": _premarket_watch_bias(row, snapshot),
+                "premarket_action": _premarket_watch_action(row, snapshot),
+            }
+            for row in rows
+        ],
+        "news": news,
+        "report": _build_premarket_report_text(db_path, "本機使用者", limit=limit),
     }
 
 
@@ -1069,6 +1201,13 @@ def api_job_notify_users_premarket(db_path: Path, token: str, limit: int = 5) ->
     return send_enabled_user_premarket_telegrams(db_path, limit=limit)
 
 
+def api_job_news_watch(db_path: Path, token: str, limit: int = 8) -> dict:
+    ok, error = _job_authorized(token)
+    if not ok:
+        return {"error": error}
+    return scan_breaking_news(db_path, limit=limit)
+
+
 def api_admin_users(db_path: Path, token: str) -> dict:
     ok, error = _admin_authorized(token)
     if not ok:
@@ -1293,10 +1432,12 @@ def api_realtime(db_path: Path, raw_codes: str) -> dict:
         with _connect(db_path) as conn:
             quotes = [twse_by_code[stock["code"]] for stock in stocks if stock["code"] in twse_by_code]
             _attach_sparklines(conn, quotes, append_live=True)
+        large_order_alerts = _detect_and_push_large_order_alerts(db_path, quotes)
         return {
             "quotes": quotes,
             "message": twse_result["message"],
             "source": "TWSE MIS",
+            "large_order_alerts": large_order_alerts,
         }
 
     quotes = []
@@ -1342,10 +1483,11 @@ def api_realtime(db_path: Path, raw_codes: str) -> dict:
                 quotes.append(local)
         _attach_sparklines(conn, quotes, append_live=True)
 
+    large_order_alerts = _detect_and_push_large_order_alerts(db_path, quotes)
     message = twse_result["message"] if twse_quotes else "證交所 MIS 即時報價暫不可用，已改用 FinMind TaiwanStockPrice。"
     if failures:
         message += " 部分股票已切回本機資料：" + "；".join(failures[:3])
-    return {"quotes": quotes, "message": message, "source": "TWSE MIS + FinMind"}
+    return {"quotes": quotes, "message": message, "source": "TWSE MIS + FinMind", "large_order_alerts": large_order_alerts}
 
 
 def api_realtime_trend(db_path: Path, code: str, interval: str = "1d") -> dict:
@@ -1531,6 +1673,7 @@ def _parse_twse_mis_quote(item: dict, stock: sqlite3.Row) -> dict | None:
         "high": _num(item.get("h")),
         "low": _num(item.get("l")),
         "previous_close": previous,
+        "last_qty": _num(item.get("tv")) or _num(item.get("q")),
         "bids": bids,
         "asks": asks,
         "source": "證交所 MIS",
@@ -2309,6 +2452,260 @@ def _local_quote(conn: sqlite3.Connection, stock: sqlite3.Row) -> dict | None:
     }
 
 
+def _detect_and_push_large_order_alerts(db_path: Path, quotes: list[dict]) -> list[dict]:
+    session = _market_session()
+    now = datetime.now(ZoneInfo("Asia/Taipei"))
+    if not (session["is_intraday"] or (now.weekday() < 5 and time(9, 0) <= now.time() <= time(13, 35))):
+        return []
+    try:
+        alerts = _detect_large_order_alerts(db_path, quotes)
+    except Exception:
+        return []
+    if not alerts:
+        return []
+    try:
+        _push_owner_large_order_alerts(alerts)
+    except Exception as exc:
+        for alert in alerts:
+            alert["push_error"] = str(exc)
+    return alerts
+
+
+def _detect_large_order_alerts(db_path: Path, quotes: list[dict]) -> list[dict]:
+    now = datetime.now(ZoneInfo("Asia/Taipei"))
+    observed_cache = _large_order_observed_cache()
+    alerts = []
+    with _connect(db_path) as conn:
+        _ensure_large_order_tables(conn)
+        avg_lots = _avg_daily_lots(conn, [str(row.get("code")) for row in quotes if row.get("code")])
+        for quote in quotes:
+            code = str(quote.get("code") or "")
+            if not code:
+                continue
+            threshold = _large_order_threshold_lots(float(quote.get("price") or 0), avg_lots.get(code, 0))
+            levels = []
+            for level in quote.get("bids") or []:
+                levels.append(("買方大單", "bid", level))
+            for level in quote.get("asks") or []:
+                levels.append(("賣方大單", "ask", level))
+            for label, side, level in levels:
+                price = level.get("price")
+                qty = float(level.get("qty") or 0)
+                if price is None or qty <= 0:
+                    continue
+                key = f"{code}:{side}:{price}"
+                previous_qty = float(observed_cache.get(key, 0) or 0)
+                if previous_qty <= 0:
+                    row = conn.execute(
+                        """
+                        SELECT qty
+                        FROM large_order_observations
+                        WHERE code = ? AND side = ? AND price = ?
+                        """,
+                        (code, side, float(price)),
+                    ).fetchone()
+                    previous_qty = float(row["qty"] or 0) if row else 0
+                observed_cache[key] = qty
+                conn.execute(
+                    """
+                    INSERT INTO large_order_observations (code, side, price, qty, observed_at)
+                    VALUES (?, ?, ?, ?, datetime('now'))
+                    ON CONFLICT(code, side, price) DO UPDATE SET
+                        qty = excluded.qty,
+                        observed_at = excluded.observed_at
+                    """,
+                    (code, side, float(price), qty),
+                )
+                is_large = qty >= threshold
+                is_sudden = previous_qty <= 0 and qty >= threshold * 1.5
+                if previous_qty > 0:
+                    is_sudden = qty >= threshold and qty >= max(previous_qty * 2.0, previous_qty + max(50, threshold * 0.3))
+                if not (is_large and is_sudden):
+                    continue
+                last_alert = conn.execute(
+                    """
+                    SELECT alerted_at
+                    FROM large_order_alerts
+                    WHERE code = ? AND side = ? AND price = ?
+                    ORDER BY alerted_at DESC
+                    LIMIT 1
+                    """,
+                    (code, side, float(price)),
+                ).fetchone()
+                if last_alert and _minutes_since(last_alert["alerted_at"], now) < 10:
+                    continue
+                alert = {
+                    "code": code,
+                    "name": quote.get("name") or code,
+                    "side": side,
+                    "label": label,
+                    "price": float(price),
+                    "qty": qty,
+                    "previous_qty": previous_qty,
+                    "threshold": threshold,
+                    "last_price": quote.get("price"),
+                    "change_percent": quote.get("change_percent"),
+                    "time": quote.get("time") or now.strftime("%H:%M:%S"),
+                    "source": quote.get("source") or "",
+                    "detected_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                conn.execute(
+                    """
+                    INSERT INTO large_order_alerts (
+                        code, name, side, price, qty, previous_qty, threshold_lots, last_price,
+                        change_percent, source, alerted_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                    """,
+                    (
+                        alert["code"],
+                        alert["name"],
+                        alert["side"],
+                        alert["price"],
+                        alert["qty"],
+                        alert["previous_qty"],
+                        alert["threshold"],
+                        alert["last_price"],
+                        alert["change_percent"],
+                        alert["source"],
+                    ),
+                )
+                alerts.append(alert)
+        conn.commit()
+    return alerts
+
+
+def _large_order_observed_cache() -> dict:
+    now = datetime.now()
+    if not isinstance(_LARGE_ORDER_CACHE.get("expires_at"), datetime) or now >= _LARGE_ORDER_CACHE["expires_at"]:
+        _LARGE_ORDER_CACHE["observed"] = {}
+        _LARGE_ORDER_CACHE["expires_at"] = now + timedelta(minutes=45)
+    return _LARGE_ORDER_CACHE["observed"]  # type: ignore[return-value]
+
+
+def _large_order_threshold_lots(price: float, avg_daily_lots: float) -> float:
+    manual = os.environ.get("STOCK_V1_LARGE_ORDER_LOTS", "").strip()
+    if manual:
+        try:
+            return max(1, float(manual))
+        except ValueError:
+            pass
+    if price >= 500:
+        floor = 50
+    elif price >= 100:
+        floor = 100
+    else:
+        floor = 300
+    dynamic = avg_daily_lots * 0.015 if avg_daily_lots else 0
+    return round(max(floor, dynamic), 0)
+
+
+def _avg_daily_lots(conn: sqlite3.Connection, codes: list[str]) -> dict[str, float]:
+    if not codes:
+        return {}
+    placeholders = ",".join("?" for _ in codes)
+    rows = conn.execute(
+        f"""
+        SELECT stock_code, AVG(volume) AS avg_volume
+        FROM (
+            SELECT stock_code, volume
+            FROM prices
+            WHERE stock_code IN ({placeholders}) AND volume IS NOT NULL
+            ORDER BY stock_code, date DESC
+        )
+        GROUP BY stock_code
+        """,
+        codes,
+    ).fetchall()
+    return {row["stock_code"]: float(row["avg_volume"] or 0) / 1000 for row in rows}
+
+
+def _minutes_since(timestamp: str, now: datetime) -> float:
+    try:
+        parsed = datetime.fromisoformat(str(timestamp).replace(" ", "T"))
+    except ValueError:
+        return 9999
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=ZoneInfo("Asia/Taipei"))
+    return (now - parsed.astimezone(ZoneInfo("Asia/Taipei"))).total_seconds() / 60
+
+
+def _push_owner_large_order_alerts(alerts: list[dict]) -> None:
+    chat_ids = _owner_telegram_chat_ids()
+    if not chat_ids:
+        return
+    now = datetime.now(ZoneInfo("Asia/Taipei"))
+    lines = [
+        f"台股智研｜即時大單警報 {now:%H:%M:%S}",
+        f"偵測到 {len(alerts)} 筆買/賣方大單突然放大，請回即時看盤確認成交明細與五檔是否延續。",
+    ]
+    for alert in alerts[:8]:
+        side_note = "買盤加大" if alert.get("side") == "bid" else "賣盤加大"
+        lines.extend(
+            [
+                "",
+                f"{alert.get('code')} {alert.get('name')}｜{alert.get('label')}｜{side_note}",
+                f"掛價 {fmt_value(alert.get('price'))}｜張數 {fmt_value(alert.get('qty'), 0)}｜前次 {fmt_value(alert.get('previous_qty'), 0)}｜門檻 {fmt_value(alert.get('threshold'), 0)}",
+                f"現價 {fmt_value(alert.get('last_price'))}｜漲跌幅 {fmt_value(alert.get('change_percent'))}%｜資料時間 {alert.get('time', '-')}",
+            ]
+        )
+    if len(alerts) > 8:
+        lines.append(f"\n另有 {len(alerts) - 8} 筆大單先省略，請回即時看盤查看。")
+    lines.append("\n提醒：大單可能撤單，不是直接下單指令；需搭配實際成交、量能與支撐壓力確認。")
+    message = "\n".join(lines)
+    for chat_id in chat_ids:
+        _send_telegram_to_chat(chat_id, message)
+
+
+def _owner_telegram_chat_ids() -> list[str]:
+    chat_id = os.environ.get("STOCK_V1_TELEGRAM_CHAT_ID", "").strip()
+    if not chat_id:
+        config_path = Path(__file__).resolve().parents[1] / "config" / "notify.json"
+        if config_path.exists():
+            try:
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+                chat_id = str((config.get("telegram") or {}).get("chat_id") or "").strip()
+            except Exception:
+                chat_id = ""
+    if not chat_id or "PASTE_" in chat_id:
+        return []
+    return [chat_id]
+
+
+def _ensure_large_order_tables(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS large_order_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL,
+            name TEXT,
+            side TEXT NOT NULL,
+            price REAL NOT NULL,
+            qty REAL NOT NULL,
+            previous_qty REAL,
+            threshold_lots REAL,
+            last_price REAL,
+            change_percent REAL,
+            source TEXT,
+            alerted_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_large_order_alerts_key ON large_order_alerts(code, side, price, alerted_at)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS large_order_observations (
+            code TEXT NOT NULL,
+            side TEXT NOT NULL,
+            price REAL NOT NULL,
+            qty REAL NOT NULL,
+            observed_at TEXT NOT NULL,
+            PRIMARY KEY (code, side, price)
+        )
+        """
+    )
+
+
 def _sparkline_values(values: list[float], points: int = 22) -> list[float]:
     clean = [round(float(value), 4) for value in values if value is not None]
     return clean[-points:]
@@ -2705,36 +3102,65 @@ def _build_user_intraday_message(db_path: Path, user_key: str, display_name: str
 
 
 def _build_user_premarket_message(db_path: Path, user_key: str, display_name: str, limit: int = 5) -> str:
-    now = datetime.now(ZoneInfo("Asia/Taipei"))
-    snapshot = _premarket_snapshot()
     codes = _user_watchlist_codes(db_path, user_key)
     rows = api_watchlist(db_path, ",".join(codes)).get("watchlist", [])[:limit]
+    return _format_premarket_message(display_name, rows, limit=limit)
+
+
+def build_owner_premarket_message(db_path: Path, limit: int = 8) -> str:
+    rows = api_watchlist(db_path, ",".join(_watchlist_codes(db_path))).get("watchlist", [])[:limit]
+    return _format_premarket_message("本機使用者", rows, limit=limit)
+
+
+def _build_premarket_report_text(db_path: Path, display_name: str, limit: int = 8) -> str:
+    rows = api_watchlist(db_path, ",".join(_watchlist_codes(db_path))).get("watchlist", [])[:limit]
+    return _format_premarket_message(display_name, rows, limit=limit)
+
+
+def _format_premarket_message(display_name: str, rows: list[dict], limit: int = 8) -> str:
+    now = datetime.now(ZoneInfo("Asia/Taipei"))
+    snapshot = _premarket_snapshot()
+    news = fetch_market_news(max_items=8)
     lines = [
-        f"台股智研｜{display_name} 早盤夜盤分析",
+        f"台股智研｜{display_name} 08:30 盤前分析",
         f"時間：{now:%Y-%m-%d %H:%M}",
         "",
-        f"夜盤結論：{snapshot.get('stance', '資料不足')}｜分數 {snapshot.get('score', 50)}",
-        snapshot.get("summary", "夜盤資料不足，早盤以風控與分批為主。"),
+        f"早盤預估：{snapshot.get('stance', '資料不足')}｜分數 {snapshot.get('score', 50)}",
+        snapshot.get("summary", "海外與夜盤資料不足，早盤以風控與分批為主。"),
         "",
-        "夜盤觀察",
+        "海外/夜盤連動",
     ]
     items = snapshot.get("items") or []
     if items:
-        for item in items[:6]:
-            lines.append(f"- {item['name']}：{fmt_value(item.get('change_percent'))}%｜{item.get('last_time', '無時間')}")
+        for item in items[:10]:
+            lines.append(
+                f"- {item['name']}：{fmt_value(item.get('change_percent'))}%｜"
+                f"{item.get('category', '連動')}｜{item.get('last_time', '無時間')}"
+            )
     else:
-        lines.append("- 目前抓不到免費夜盤資料，請以開盤後即時看盤確認。")
+        lines.append("- 目前抓不到免費海外/夜盤資料，請以開盤後即時看盤確認。")
+
+    news_items = news.get("items") or []
+    lines.extend(["", "24H 新聞風險"])
+    if news_items:
+        for item in news_items[:5]:
+            lines.append(
+                f"- [{item.get('impact', '中')}] {item.get('title', '')}｜"
+                f"{item.get('category', '新聞')}｜{item.get('source', '')}"
+            )
+    else:
+        lines.append("- 暫無重大新聞；若新聞源失敗，請以盤中異動與公告補驗。")
 
     lines.extend(["", "觀察名單早盤計畫"])
     if not rows:
         lines.append("目前尚未加入觀察股票。")
-    for item in rows:
+    for item in rows[:limit]:
         bias = _premarket_watch_bias(item, snapshot)
         lines.extend([
             "",
             f"{item['code']} {item['name']}｜{bias}",
             f"昨收/最新資料：{fmt_value(item.get('close'))}｜20D {fmt_value(item.get('return_20d'))}%｜RSI {fmt_value(item.get('rsi_14'))}",
-            f"開盤觀察：若高開不追價，等回測買點 {item.get('buy_zone', '無資料')}；若低開跌破停損 {item.get('stop', '無資料')} 先風控。",
+            f"開盤策略：{_premarket_watch_action(item, snapshot)}",
             f"賣壓區：{item.get('sell_zone', '無資料')}｜量能需搭配即時看盤確認。",
         ])
     lines.extend([
@@ -2758,46 +3184,86 @@ def _premarket_watch_bias(item: dict, snapshot: dict) -> str:
     return f"中性觀察，{signal}"
 
 
+def _premarket_watch_action(item: dict, snapshot: dict) -> str:
+    score = int(snapshot.get("score") or 50)
+    buy_zone = item.get("buy_zone", "無資料")
+    stop = item.get("stop", "無資料")
+    sell_zone = item.get("sell_zone", "無資料")
+    rsi14 = item.get("rsi_14")
+    if score <= 40:
+        return f"先守停損 {stop}，低開不急著攤平，等 09:15 後量價止穩再評估。"
+    if rsi14 is not None and rsi14 >= 75:
+        return f"偏熱不追高，若開高靠近賣壓 {sell_zone} 先分批停利或等待拉回。"
+    if score >= 62:
+        return f"偏多但不開盤追價，優先等回測買點 {buy_zone} 或突破後回測站穩。"
+    return f"先看開盤 15 分鐘量價，靠近買點 {buy_zone} 才分批，跌破 {stop} 降低風險。"
+
+
 def _premarket_snapshot(force: bool = False) -> dict:
     cached_until = _PREMARKET_CACHE.get("expires_at")
     if not force and isinstance(cached_until, datetime) and datetime.now() < cached_until and _PREMARKET_CACHE.get("data"):
         return dict(_PREMARKET_CACHE["data"])  # type: ignore[arg-type]
     symbols = [
-        ("道瓊期/ETF", "DIA"),
-        ("S&P 500 ETF", "SPY"),
-        ("Nasdaq 100 ETF", "QQQ"),
-        ("費半 ETF", "SOXX"),
-        ("半導體 ETF", "SMH"),
-        ("台積電 ADR", "TSM"),
-        ("美元指數 ETF", "UUP"),
+        ("S&P 500 期貨", "ES=F", "美股期貨", 1.2, 1),
+        ("Nasdaq 100 期貨", "NQ=F", "科技期貨", 1.8, 1),
+        ("道瓊期貨", "YM=F", "美股期貨", 0.8, 1),
+        ("費半指數", "^SOX", "半導體", 2.0, 1),
+        ("Nasdaq 指數", "^IXIC", "科技股", 1.5, 1),
+        ("S&P 500 指數", "^GSPC", "美股", 1.0, 1),
+        ("VIX 恐慌指數", "^VIX", "風險", 1.8, -1),
+        ("台積電 ADR", "TSM", "台股連動", 2.2, 1),
+        ("NVIDIA", "NVDA", "AI 權值", 1.5, 1),
+        ("AMD", "AMD", "AI/半導體", 1.0, 1),
+        ("Broadcom", "AVGO", "AI/半導體", 1.0, 1),
+        ("Micron", "MU", "記憶體", 1.1, 1),
+        ("ASML", "ASML", "半導體設備", 0.9, 1),
+        ("費半 ETF", "SOXX", "半導體 ETF", 1.4, 1),
+        ("半導體 ETF", "SMH", "半導體 ETF", 1.4, 1),
+        ("iShares Taiwan ETF", "EWT", "台股 ETF", 1.6, 1),
+        ("台股加權指數", "^TWII", "台股前日", 0.4, 1),
+        ("美元/台幣", "TWD=X", "匯率", 1.1, -1),
+        ("美元指數 ETF", "UUP", "匯率", 0.8, -1),
+        ("台指期夜盤候選", "TXF=F", "台股夜盤", 2.0, 1),
     ]
     items = []
     failures = []
-    for name, symbol in symbols:
+    score = 50.0
+    factors = []
+    for name, symbol, category, weight, direction in symbols:
         try:
             item = _fetch_yahoo_snapshot(symbol)
             if item:
-                items.append({"name": name, "symbol": symbol, **item})
+                change = item.get("change_percent") or 0
+                contribution = max(-9, min(9, change * 1.75)) * weight * direction
+                score += contribution
+                rows_item = {
+                    "name": name,
+                    "symbol": symbol,
+                    "category": category,
+                    "weight": weight,
+                    "direction": direction,
+                    "contribution": round(contribution, 2),
+                    **item,
+                }
+                items.append(rows_item)
+                if abs(contribution) >= 2.5:
+                    factors.append(rows_item)
         except Exception as exc:
             failures.append(f"{symbol}: {exc}")
-    score = 50
-    for item in items:
-        change = item.get("change_percent") or 0
-        weight = 2 if item["symbol"] in {"QQQ", "SOXX", "SMH", "TSM"} else 1
-        score += max(-8, min(8, change * 1.8)) * weight
     score = max(0, min(100, round(score)))
     if score >= 62:
         stance = "偏多開盤"
-        summary = "夜盤科技與半導體偏強，早盤可優先觀察強勢股回測承接，但不建議開盤直接追高。"
+        summary = "海外科技、半導體或台股連動資產偏強，早盤可優先觀察強勢股回測承接，但不建議開盤直接追高。"
     elif score <= 42:
         stance = "偏空防守"
-        summary = "夜盤風險偏弱，早盤先看支撐與停損，避免把資金一次投入。"
+        summary = "海外風險或匯率壓力偏弱，早盤先看支撐與停損，避免把資金一次投入。"
     else:
         stance = "中性觀察"
-        summary = "夜盤訊號沒有明顯單邊，早盤以觀察開盤溢價、量能與個股支撐為主。"
+        summary = "海外與台股連動訊號沒有明顯單邊，早盤以開盤溢價、量能與個股支撐為主。"
     result = {
         "prepared_at": datetime.now(ZoneInfo("Asia/Taipei")).strftime("%Y-%m-%d %H:%M:%S"),
         "items": items,
+        "factors": sorted(factors, key=lambda row: abs(row.get("contribution") or 0), reverse=True)[:8],
         "failures": failures[:5],
         "score": score,
         "stance": stance,
@@ -2839,6 +3305,140 @@ def _fetch_yahoo_snapshot(symbol: str) -> dict | None:
         "change_percent": change_percent,
         "last_time": last_time,
     }
+
+
+def scan_breaking_news(db_path: Path, limit: int = 8) -> dict:
+    market_news = fetch_market_news(limit_per_keyword=6, max_items=24)
+    watch_items = _watchlist_news_items(db_path, limit=limit)
+    candidates = []
+    for item in (market_news.get("items") or []) + watch_items:
+        identity = item.get("id") or headline_id(item)
+        enriched = {**item, "id": identity}
+        if (enriched.get("impact_score") or 0) >= 55:
+            candidates.append(enriched)
+    with _connect(db_path) as conn:
+        _ensure_news_alert_tables(conn)
+        new_items = []
+        for item in candidates:
+            exists = conn.execute(
+                "SELECT id FROM news_alert_state WHERE id = ?",
+                (item["id"],),
+            ).fetchone()
+            if exists:
+                continue
+            conn.execute(
+                """
+                INSERT INTO news_alert_state (
+                    id, title, link, source, published, impact, impact_score, category, sentiment, seen_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                """,
+                (
+                    item["id"],
+                    str(item.get("title") or "")[:500],
+                    str(item.get("link") or "")[:1000],
+                    str(item.get("source") or "")[:120],
+                    str(item.get("published") or "")[:120],
+                    str(item.get("impact") or "中"),
+                    int(item.get("impact_score") or 0),
+                    str(item.get("category") or "")[:120],
+                    str(item.get("sentiment") or "")[:40],
+                ),
+            )
+            new_items.append(item)
+        conn.commit()
+    new_items.sort(key=lambda row: row.get("impact_score") or 0, reverse=True)
+    return {
+        "checked_at": datetime.now(ZoneInfo("Asia/Taipei")).strftime("%Y-%m-%d %H:%M:%S"),
+        "candidates": len(candidates),
+        "new_items": new_items[:limit],
+        "market_failures": market_news.get("failures") or [],
+    }
+
+
+def build_news_alert_message(items: list[dict]) -> str:
+    now = datetime.now(ZoneInfo("Asia/Taipei"))
+    lines = [
+        f"台股智研｜24H 突發新聞盯盤 {now:%Y-%m-%d %H:%M}",
+        "以下為新出現且影響分數較高的新聞，請用於進出台股前的風險確認。",
+    ]
+    for item in items[:8]:
+        lines.extend(
+            [
+                "",
+                f"[{item.get('impact', '中')}] {item.get('category', '新聞')}｜{item.get('sentiment', '中性')}｜分數 {item.get('impact_score', '-')}",
+                str(item.get("title") or ""),
+                f"來源：{item.get('source', 'Google News')}｜{item.get('published', '-')}",
+                f"操作提醒：{item.get('action', '等待價格與量能確認。')}",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "提醒：新聞推播是風險雷達，不是直接下單指令；仍需搭配即時報價、成交量、停損與部位控管。",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _watchlist_news_items(db_path: Path, limit: int = 8) -> list[dict]:
+    items = []
+    with _connect(db_path) as conn:
+        stocks = conn.execute(
+            """
+            SELECT w.code, s.name
+            FROM watchlist w
+            JOIN stocks s ON s.code = w.code
+            ORDER BY COALESCE(w.sort_order, 999999), w.created_at, w.code
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    for stock in stocks:
+        news = fetch_stock_news(stock["code"], short_name(stock["name"]), limit=3)
+        for item in news.get("items") or []:
+            impact = item.get("impact_score")
+            if impact is None:
+                title = item.get("title", "")
+                market_item = next(
+                    (
+                        row
+                        for row in fetch_market_news([f"{stock['code']} {short_name(stock['name'])} 台股"], 3, 3).get("items", [])
+                        if row.get("title") == title
+                    ),
+                    None,
+                )
+                if not market_item:
+                    continue
+                item.update(market_item)
+            item.setdefault("id", headline_id(item))
+            item.setdefault("category", f"觀察股 {stock['code']}")
+            item.setdefault("impact", "中")
+            item.setdefault("impact_score", 60 if item.get("sentiment") != "中性" else 50)
+            item.setdefault("action", "檢查觀察名單持股與開盤量價。")
+            items.append(item)
+    return items
+
+
+def _ensure_news_alert_tables(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS news_alert_state (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            link TEXT,
+            source TEXT,
+            published TEXT,
+            impact TEXT,
+            impact_score INTEGER,
+            category TEXT,
+            sentiment TEXT,
+            seen_at TEXT NOT NULL,
+            sent_at TEXT
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_news_alert_seen_at ON news_alert_state(seen_at)")
 
 
 def _send_telegram_to_chat(chat_id: str, message: str) -> dict:
@@ -5687,13 +6287,14 @@ INDEX_HTML = r"""<!doctype html>
       <h1>台股智研 Pro</h1>
       <div class="subtitle">專業台股智能分析平台 · 訊號排行 · AI 經理人 · 風控紀律</div>
     </div>
-    <div class="version"><span id="range">載入中...</span> · UI v52</div>
+    <div class="version"><span id="range">載入中...</span> · UI v55</div>
   </header>
   <div class="app-shell">
     <aside class="sidebar">
       <div class="sidebar-title">功能導覽</div>
       <nav class="nav-list">
         <a class="nav-item active" data-page="overview" href="#" onclick="showPage('overview', this); return false;"><span class="nav-icon">OV</span><span>總覽</span></a>
+        <a class="nav-item" data-page="premarketPage" href="#" onclick="showPage('premarketPage', this); return false;"><span class="nav-icon">AM</span><span>盤前分析</span></a>
         <a class="nav-item" data-page="realtimePage" href="#" onclick="showPage('realtimePage', this); return false;"><span class="nav-icon">RT</span><span>即時看盤</span></a>
         <a class="nav-item" data-page="watchPage" href="#" onclick="showPage('watchPage', this); return false;"><span class="nav-icon">MK</span><span>盤後看盤</span></a>
         <a class="nav-item" data-page="strategyPage" href="#" onclick="showPage('strategyPage', this); return false;"><span class="nav-icon">PM</span><span>AI 經理人</span></a>
@@ -5729,6 +6330,7 @@ INDEX_HTML = r"""<!doctype html>
           <div class="hero-actions">
             <button type="button" class="primary" onclick="showPage('hubPage')">股票探索</button>
             <button type="button" onclick="showPage('watchPage')">打開觀察名單</button>
+            <button type="button" onclick="showPage('premarketPage')">盤前分析</button>
             <button type="button" onclick="showPage('realtimePage')">即時看盤</button>
             <button type="button" onclick="showPage('strategyPage')">AI 經理人中心</button>
           </div>
@@ -5760,6 +6362,7 @@ INDEX_HTML = r"""<!doctype html>
           <div class="content"><dl>
             <dt>股票探索</dt><dd>集中查看 AI 智選、強勢股票與量能焦點</dd>
             <dt>盤後看盤</dt><dd>只保留觀察名單與盤後摘要，避免資訊重複</dd>
+            <dt>盤前分析</dt><dd>早上 08:30 整合美股期貨、半導體權值、台積 ADR、台股連動 ETF、匯率與 24H 新聞風險</dd>
             <dt>即時看盤</dt><dd>盤中報價、即時走勢與 AI 盤中盯盤</dd>
             <dt>AI 經理人</dt><dd>查看每日 AI 建倉、減碼、停損、未平倉與資金曲線</dd>
           </dl></div>
@@ -5826,8 +6429,37 @@ INDEX_HTML = r"""<!doctype html>
           <div class="table-wrap"><table id="watchMajorsTable"></table></div>
         </section>
         <section class="wide">
-          <h2>盤後觀察重點</h2>
-          <div class="content"><dl id="watchAfterSummary"></dl></div>
+          <h2>各大類股盤後分析</h2>
+          <div class="content" id="watchAfterSummary"></div>
+        </section>
+      </div>
+    </div>
+
+    <div class="page" id="premarketPage">
+      <div class="dashboard-note realtime-board">
+        <div>
+          <strong>盤前分析工作台</strong><br>
+          <span>整合美股期貨、費半、AI/半導體權值、台積 ADR、台股 ETF、匯率與 24H 新聞，預估早盤節奏。</span>
+        </div>
+        <div class="realtime-actions">
+          <button type="button" onclick="runAction(fetchPremarket, '正在更新盤前分析...')">刷新盤前分析</button>
+          <button type="button" onclick="showPage('realtimePage')">前往即時看盤</button>
+        </div>
+      </div>
+      <div class="status" id="premarketNotice">尚未載入盤前分析。</div>
+      <div class="module-grid" id="premarketKpis"></div>
+      <div class="grid">
+        <section class="wide">
+          <h2>海外與夜盤連動</h2>
+          <div class="table-wrap"><table id="premarketFactorsTable"></table></div>
+        </section>
+        <section class="wide">
+          <h2>觀察名單早盤計畫</h2>
+          <div class="table-wrap"><table id="premarketWatchTable"></table></div>
+        </section>
+        <section class="wide">
+          <h2>24H 新聞風險</h2>
+          <div id="premarketNews" class="news-grid"></div>
         </section>
       </div>
     </div>
@@ -6152,7 +6784,7 @@ INDEX_HTML = r"""<!doctype html>
             <dt>快速入門</dt><dd>先看總覽，再用智能搜尋查個股，最後檢查 AI 訊號與 AI 經理人。</dd>
             <dt>AI 智能分析</dt><dd>智研評分綜合技術面、量價籌碼、消息面、產業面、風險面與資金面；三大法人集中在法人籌碼面板。</dd>
             <dt>AI 經理人</dt><dd>每日依最新資料建立基金經理人式決策，包含建倉、出場、持倉、風控與資金曲線。</dd>
-            <dt>推播設定</dt><dd>每天 15:30 盤後更新資料並推播 Telegram 摘要。</dd>
+            <dt>推播設定</dt><dd>08:30 盤前分析、盤中盯盤、盤後摘要與 24H 突發新聞都可透過本機 Telegram 推播。</dd>
           </dl></div>
         </section>
       </div>
@@ -8672,6 +9304,58 @@ INDEX_HTML = r"""<!doctype html>
         metric: row => `量比 ${fmt(row.volume_ratio)}`,
       });
     }
+    async function fetchPremarket() {
+      const data = await getJson("/api/premarket?limit=8");
+      const snapshot = data.snapshot || {};
+      document.getElementById("premarketNotice").textContent =
+        `${snapshot.prepared_at || "已更新"}｜${snapshot.stance || "資料不足"}｜${snapshot.summary || ""}`;
+      renderPremarketKpis(snapshot, data.news || {});
+      renderPremarketFactors(document.getElementById("premarketFactorsTable"), snapshot.items || []);
+      renderPremarketWatch(document.getElementById("premarketWatchTable"), data.watchlist || []);
+      renderNews(document.getElementById("premarketNews"), data.news || {});
+    }
+    function renderPremarketKpis(snapshot, news) {
+      const factors = snapshot.factors || [];
+      const highNews = (news.items || []).filter(item => item.impact === "高").length;
+      document.getElementById("premarketKpis").innerHTML = [
+        ["早盤預估", snapshot.stance || "資料不足", `分數 ${fmt(snapshot.score, 0)}`],
+        ["主要因子", `${fmt(factors.length, 0)} 項`, factors.slice(0, 2).map(item => item.name).join("、") || "暫無"],
+        ["新聞風險", `${fmt(highNews, 0)} 則高影響`, `${fmt((news.items || []).length, 0)} 則已掃描`],
+        ["推播節奏", "08:30", cloudWebMode ? "網頁盤前分析，不提供推播設定" : "本機 Telegram 盤前報告"],
+      ].map(([label, value, note]) => `
+        <div class="module-card"><strong>${value}</strong><span>${label}｜${note}</span></div>
+      `).join("");
+    }
+    function renderPremarketFactors(target, rows) {
+      target.innerHTML = `
+        <thead><tr><th>項目</th><th>分類</th><th>最新</th><th>漲跌幅</th><th>分數影響</th><th>時間</th></tr></thead>
+        <tbody>${rows.map(row => `
+          <tr>
+            <td><strong>${row.name}</strong><br><span>${row.symbol || ""}</span></td>
+            <td>${row.category || "-"}</td>
+            <td>${fmt(row.price)}</td>
+            <td class="${pctClass(row.change_percent)}">${fmt(row.change_percent)}%</td>
+            <td class="${pctClass(row.contribution)}">${fmt(row.contribution)}</td>
+            <td>${row.last_time || "-"}</td>
+          </tr>
+        `).join("") || "<tr><td colspan='6'>目前抓不到海外/夜盤資料。</td></tr>"}</tbody>
+      `;
+    }
+    function renderPremarketWatch(target, rows) {
+      target.innerHTML = `
+        <thead><tr><th>股票</th><th>早盤定位</th><th>昨收</th><th>20D</th><th>RSI</th><th>開盤策略</th></tr></thead>
+        <tbody>${rows.map(row => `
+          <tr onclick="openStock('${row.code}')" style="cursor:pointer">
+            <td><strong>${row.name}</strong><br><span>${row.code}</span></td>
+            <td>${row.premarket_bias || row.signal || "觀察"}</td>
+            <td>${fmt(row.close)}</td>
+            <td class="${pctClass(row.return_20d)}">${fmt(row.return_20d)}%</td>
+            <td>${fmt(row.rsi_14)}</td>
+            <td>${row.premarket_action || "先看開盤量價，再決定是否分批。"}</td>
+          </tr>
+        `).join("") || "<tr><td colspan='6'>觀察名單尚未加入股票。</td></tr>"}</tbody>
+      `;
+    }
     async function fetchStrategy() {
       const data = await getJson("/api/strategy");
       const s = data.summary;
@@ -8725,12 +9409,46 @@ INDEX_HTML = r"""<!doctype html>
         ? "個人模式：觀察名單會綁定你的使用者代碼，會同步到即時看盤與 Telegram 推播。"
         : cloudWebMode ? "網頁版：觀察名單用於畫面與即時看盤，不提供 Telegram 推播設定。" : publicDemoMode ? "公開展示模式：觀察名單只存在此瀏覽器，不會影響主機與推播。" : "本機模式：觀察名單會保存在主機資料庫，會同步到即時看盤與既有推播設定。";
       document.getElementById("watchlistHint").textContent = `目前觀察 ${majors.length} 檔。可拖曳表格左側排序。${modeText}`;
-      renderDl(document.getElementById("watchAfterSummary"), [
-        ["盤後定位", "這裡只保留觀察名單與盤後摘要，AI 智選、強勢排行與量能焦點集中到股票探索。"],
-        ["60 日新高", `${fmt(data.summary.new_high_60, 0)} 檔`],
-        ["站上月線", `${fmt(data.summary.above_sma20, 0)} 檔`],
-        ["站上季線", `${fmt(data.summary.above_sma60, 0)} 檔`],
-      ]);
+      renderAfterHoursIndustryReport(document.getElementById("watchAfterSummary"), data.industry_after_report || {});
+    }
+    function renderAfterHoursIndustryReport(target, report) {
+      if (!target) return;
+      const summary = report.summary || {};
+      const top = report.top_groups || [];
+      const volume = report.volume_focus || [];
+      const weak = report.weak_groups || [];
+      const rowHtml = rows => rows.map(row => {
+        const leader = row.leader || {};
+        const strongest = row.strongest || {};
+        return `
+          <tr>
+            <td><strong>${row.name}</strong><br><span>${fmt(row.count, 0)} 檔｜漲 ${fmt(row.advancers, 0)} / 跌 ${fmt(row.decliners, 0)}</span></td>
+            <td class="${pctClass(row.avg_change_percent)}">${fmt(row.avg_change_percent)}%</td>
+            <td>${fmt(row.breadth, 0)}%</td>
+            <td>${fmt(row.avg_volume_ratio)}</td>
+            <td>${leader.name || "-"} ${leader.code || ""}</td>
+            <td>${strongest.name || "-"} ${strongest.code || ""} ${strongest.change_percent === undefined ? "" : fmt(strongest.change_percent) + "%"}</td>
+            <td>${row.stance}<br><span>${row.action}</span></td>
+          </tr>
+        `;
+      }).join("");
+      target.innerHTML = `
+        <div class="trade-callout">
+          <span>${report.date || "最新資料"}｜共 ${fmt(summary.groups, 0)} 個類股/主題</span>
+          <strong>盤後類股報告｜強勢 ${fmt(summary.strong_groups, 0)} 組｜轉弱 ${fmt(summary.weak_groups, 0)} 組</strong>
+          <p>依各產業當日平均漲跌、上漲家數占比、20 日動能、量比與龍頭股整理，作為隔日早盤觀察順序。</p>
+        </div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>類股</th><th>均漲跌</th><th>上漲占比</th><th>量比</th><th>龍頭</th><th>最強股</th><th>盤後判讀</th></tr></thead>
+          <tbody>${rowHtml(top) || "<tr><td colspan='7'>目前沒有類股資料。</td></tr>"}</tbody>
+        </table></div>
+        <div class="strategy-guide" style="margin-top:12px">
+          <div><strong>量能焦點</strong><span>${volume.slice(0, 4).map(row => `${row.name} ${fmt(row.avg_volume_ratio)}`).join("｜") || "無資料"}</span></div>
+          <div><strong>弱勢警戒</strong><span>${weak.slice(0, 4).map(row => `${row.name} ${fmt(row.avg_change_percent)}%`).join("｜") || "無資料"}</span></div>
+          <div><strong>隔日策略</strong><span>強勢類股等回測，不追開盤急拉；弱勢類股先檢查是否跌破支撐與停損。</span></div>
+          <div><strong>資料定位</strong><span>這裡改為類股報告；AI 智選、強勢排行與量能焦點仍集中在股票探索。</span></div>
+        </div>
+      `;
     }
     async function addWatchlistCode() {
       const code = document.getElementById("watchlistCode").value.trim();
@@ -8919,7 +9637,9 @@ INDEX_HTML = r"""<!doctype html>
       const quotes = data.quotes || [];
       renderRealtime(document.getElementById("realtimeTable"), quotes);
       renderRealtimeMonitor(monitor);
-      document.getElementById("realtimeNotice").textContent = `${data.message || "即時看盤資料已更新。"} 顯示 ${quotes.length} 檔。`;
+      const alerts = data.large_order_alerts || [];
+      const alertText = alerts.length ? ` 已推播 ${alerts.length} 筆即時大單警報。` : "";
+      document.getElementById("realtimeNotice").textContent = `${data.message || "即時看盤資料已更新。"} 顯示 ${quotes.length} 檔。${alertText}`;
       if (quotes.length) {
         const nextCode = quotes.some(row => row.code === selectedRealtimeCode) ? selectedRealtimeCode : quotes[0].code;
         await selectRealtimeTrend(nextCode);
@@ -8986,6 +9706,7 @@ INDEX_HTML = r"""<!doctype html>
       activatePage(pageId);
       if (navItem) navItem.classList.add("active");
       if (pageId === "strategyPage") runAction(fetchStrategy, cloudWebMode ? "正在載入 AI 回測..." : "正在更新 AI 經理人決策...");
+      if (pageId === "premarketPage") runAction(fetchPremarket, "正在載入盤前分析...");
       if (pageId === "realtimePage") {
         runAction(fetchRealtime, "正在載入即時看盤...");
         ensureRealtimeAutoRefresh();
@@ -9001,7 +9722,7 @@ INDEX_HTML = r"""<!doctype html>
         const heading = section.querySelector(":scope > h2");
         const page = section.closest(".page");
         if (!heading || section.dataset.panelReady === "1") return;
-        if (page && ["watchPage", "realtimePage"].includes(page.id)) return;
+        if (page && ["watchPage", "premarketPage", "realtimePage"].includes(page.id)) return;
         section.dataset.panelReady = "1";
         section.classList.add("info-panel", "panel-compact");
         const titleText = heading.textContent.trim();
