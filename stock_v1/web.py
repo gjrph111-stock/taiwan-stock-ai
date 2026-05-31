@@ -12,7 +12,8 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 from .ai_monitor import analyze_stock, build_ai_monitor
-from .ai_ops import INITIAL_CAPITAL, build_ai_ops_payload, run_daily_ai_ops
+from .ai_ops import INITIAL_CAPITAL, run_daily_ai_ops
+from .backtest import realistic_strategy_backtest
 from . import db
 from .config import DEFAULT_DB_PATH
 from .finmind import fetch_finmind_institutional, fetch_finmind_kbar, fetch_recent_finmind_prices
@@ -491,17 +492,19 @@ def api_strategy(db_path: Path) -> dict:
     with _connect(db_path) as conn:
         row = conn.execute("SELECT MAX(date) AS latest FROM prices").fetchone()
         latest = row["latest"] if row else None
-    cache_key = f"{latest}|daily-ai-ops-v1|{INITIAL_CAPITAL}"
+    strategy_mode = "cloud-backtest-v1" if _cloud_web_mode() else "daily-ai-ops-v1"
+    cache_key = f"{latest}|{strategy_mode}|{INITIAL_CAPITAL}"
     if cache_key in _STRATEGY_CACHE:
         return _STRATEGY_CACHE[cache_key]
     with _connect(db_path) as conn:
-        if _public_demo_mode() or db_path.name == "tw_stocks_deploy.sqlite":
-            result = build_ai_ops_payload(conn, INITIAL_CAPITAL)
+        if _cloud_web_mode():
+            result = _cloud_strategy_backtest(conn)
         else:
             result = run_daily_ai_ops(conn, INITIAL_CAPITAL)
         context = _strategy_market_context(conn, {"max_drawdown": result["summary"].get("max_drawdown")})
     payload = {
         "summary": result["summary"],
+        "strategy": result.get("strategy", {}),
         "market_context": context,
         "curve": result["curve"],
         "recent_entries": result.get("recent_entries", [])[-10:],
@@ -515,6 +518,59 @@ def api_strategy(db_path: Path) -> dict:
         _STRATEGY_CACHE.clear()
     _STRATEGY_CACHE[cache_key] = payload
     return payload
+
+
+def _cloud_strategy_backtest(conn: sqlite3.Connection) -> dict:
+    result = realistic_strategy_backtest(
+        conn,
+        max_positions=5,
+        horizon=10,
+        step=5,
+        max_days=None,
+        initial_capital=100.0,
+        cost_bps=20,
+        start_date=None,
+    )
+    summary = {
+        "max_positions": result["max_positions"],
+        "horizon": result["horizon"],
+        "step": result["step"],
+        "cost_bps": result["cost_bps"],
+        "start_date": result["curve"][0]["date"] if result.get("curve") else result.get("start_date"),
+        "tested_dates": result.get("tested_dates"),
+        "trades": result["trades"],
+        "open_positions": result["open_positions"],
+        "initial_capital": result["initial_capital"],
+        "final_capital": result["final_capital"],
+        "total_return": result["total_return"],
+        "win_rate": result["win_rate"],
+        "avg_trade_return": result.get("avg_trade_return"),
+        "median_trade_return": result["median_trade_return"],
+        "max_drawdown": result["max_drawdown"],
+        "best_trade": result.get("best_trade"),
+        "worst_trade": result.get("worst_trade"),
+    }
+    return {
+        "summary": summary,
+        "strategy": {
+            "name": "AI 風險調整動能策略",
+            "description": "每日依 AI 訊號分數、趨勢、量能、RSI 與風險濾網排序，挑選分數最高且通過風控的股票建立等權組合。",
+            "rules": [
+                "股票池：上市櫃且至少具備 80 筆日線資料。",
+                "進場：每 5 個交易日重新排序，最多持有 5 檔。",
+                "排名：使用風險調整後 AI 分數，並參考原始分數與 20 日動能。",
+                "風控：排除未通過風險濾網的標的，交易成本以單邊 20 bps 估算。",
+                "出場：持有 10 個交易日後依回測價格出場，再重新分配資金。",
+            ],
+            "benchmark_note": "資金以 100 為基準指數化，不代表固定投入 20 萬。",
+        },
+        "curve": result["curve"],
+        "recent_entries": result.get("recent_entries", []),
+        "closed_trades": result.get("recent_trades", []),
+        "recent_trades": result.get("recent_trades", []),
+        "open_positions": result.get("open_position_details", []),
+        "today_actions": [],
+    }
 
 
 def _strategy_market_context(conn: sqlite3.Connection, result: dict) -> dict:
@@ -5631,7 +5687,7 @@ INDEX_HTML = r"""<!doctype html>
       <h1>台股智研 Pro</h1>
       <div class="subtitle">專業台股智能分析平台 · 訊號排行 · AI 經理人 · 風控紀律</div>
     </div>
-    <div class="version"><span id="range">載入中...</span> · UI v51</div>
+    <div class="version"><span id="range">載入中...</span> · UI v52</div>
   </header>
   <div class="app-shell">
     <aside class="sidebar">
@@ -7329,8 +7385,10 @@ INDEX_HTML = r"""<!doctype html>
     function renderBacktestAdvice(target, data = {}) {
       const context = data.market_context || {};
       const summary = data.summary || {};
+      const strategy = data.strategy || {};
       const leaders = (context.leaders || []).slice(0, 8);
       const m = context.metrics || {};
+      const rules = (strategy.rules || []).map(rule => `<li>${rule}</li>`).join("");
       const rows = leaders.length ? leaders.map(row => `
         <tr>
           <td><b>${row.name || ""}</b><br>${row.code || ""}</td>
@@ -7348,21 +7406,25 @@ INDEX_HTML = r"""<!doctype html>
         <div class="manager-report">
           <div class="strategy-advice">
             <div class="advice-main">
-              <strong>AI 回測｜${context.stance || "市場樣本"}｜${returnLabel}</strong>
-              <p>此頁改為歷史回測與訊號驗證，只呈現模型在既有資料上的模擬結果，不做即時操盤或推播設定。</p>
-              <p><b>回測結論：</b>期間 ${summary.start_date || "-"} 起，總報酬 ${fmt(summary.total_return)}%，勝率 ${fmt(summary.win_rate)}%，最大回撤 ${fmt(summary.max_drawdown)}%。</p>
-              <p><b>使用方式：</b>先看報酬與回撤，再查看候選樣本是否符合趨勢、量能與風險條件。</p>
+              <strong>${strategy.name || "AI 風險調整動能策略"}｜${context.stance || "市場樣本"}｜${returnLabel}</strong>
+              <p>${strategy.description || "此頁呈現 AI 訊號策略的歷史回測，不做即時操盤或推播設定。"}</p>
+              <p><b>回測結論：</b>自 ${summary.start_date || "-"} 起，總報酬 ${fmt(summary.total_return)}%，勝率 ${fmt(summary.win_rate)}%，交易 ${fmt(summary.trades, 0)} 筆，最大回撤 ${fmt(summary.max_drawdown)}%。</p>
+              <p><b>基準：</b>${strategy.benchmark_note || "資金以 100 為基準指數化。"}</p>
             </div>
             <div class="strategy-kpis">
               <div class="strategy-kpi"><span>交易筆數</span><strong>${fmt(summary.trades, 0)}</strong></div>
               <div class="strategy-kpi"><span>總報酬</span><strong>${fmt(summary.total_return)}%</strong></div>
               <div class="strategy-kpi"><span>勝率</span><strong>${fmt(summary.win_rate)}%</strong></div>
               <div class="strategy-kpi"><span>最大回撤</span><strong>${fmt(summary.max_drawdown)}%</strong></div>
-              <div class="strategy-kpi"><span>期末資金</span><strong>${fmt(summary.final_capital)}</strong></div>
-              <div class="strategy-kpi"><span>可行訊號</span><strong>${fmt(m.actionable_pct)}%</strong></div>
+              <div class="strategy-kpi"><span>平均單筆</span><strong>${fmt(summary.avg_trade_return)}%</strong></div>
+              <div class="strategy-kpi"><span>最差單筆</span><strong>${fmt(summary.worst_trade)}%</strong></div>
             </div>
           </div>
           <div class="manager-grid">
+            <div class="manager-card full">
+              <h3>AI 策略規則</h3>
+              <ul class="advice-list">${rules}</ul>
+            </div>
             <div class="manager-card full">
               <h3>回測訊號樣本</h3>
               <table class="manager-table">
@@ -7372,11 +7434,11 @@ INDEX_HTML = r"""<!doctype html>
             </div>
             <div class="manager-card">
               <h3>回測設定</h3>
-              <p>初始資金 ${fmt(summary.initial_capital)}；最多 ${fmt(summary.max_positions, 0)} 檔；最長持有 ${fmt(summary.horizon, 0)} 個交易日。</p>
+              <p>基準資金 ${fmt(summary.initial_capital)}；最多 ${fmt(summary.max_positions, 0)} 檔；每 ${fmt(summary.step, 0)} 個交易日檢查，最長持有 ${fmt(summary.horizon, 0)} 個交易日。</p>
             </div>
             <div class="manager-card">
               <h3>風險解讀</h3>
-              <p>最大回撤 ${fmt(summary.max_drawdown)}%；中位數單筆 ${fmt(summary.median_trade_return)}%。</p>
+              <p>最大回撤 ${fmt(summary.max_drawdown)}%；中位數單筆 ${fmt(summary.median_trade_return)}%；最佳單筆 ${fmt(summary.best_trade)}%。</p>
             </div>
             <div class="manager-card">
               <h3>限制</h3>
@@ -8615,14 +8677,17 @@ INDEX_HTML = r"""<!doctype html>
       const s = data.summary;
       const summaryRows = cloudWebMode ? [
         ["回測起始", s.start_date || "2026-05-01"],
-        ["初始資金", fmt(s.initial_capital)],
+        ["基準資金", fmt(s.initial_capital)],
         ["最大持股數", fmt(s.max_positions, 0)],
         ["最長持有", `${fmt(s.horizon, 0)} 個交易日`],
-        ["交易樣本", fmt(s.trades, 0)],
-        ["期末資金", fmt(s.final_capital)],
+        ["檢查週期", `${fmt(s.step, 0)} 個交易日`],
+        ["測試期數", fmt(s.tested_dates, 0)],
+        ["交易筆數", fmt(s.trades, 0)],
+        ["期末指數", fmt(s.final_capital)],
         ["總報酬", `${fmt(s.total_return)}%`],
         ["勝率", `${fmt(s.win_rate)}%`],
-        ["中位數交易", `${fmt(s.median_trade_return)}%`],
+        ["平均單筆", `${fmt(s.avg_trade_return)}%`],
+        ["中位數單筆", `${fmt(s.median_trade_return)}%`],
         ["最大回撤", `${fmt(s.max_drawdown)}%`],
       ] : [
         ["開始操盤", s.start_date || "2026-05-01"],
