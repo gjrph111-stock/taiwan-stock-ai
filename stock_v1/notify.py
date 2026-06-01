@@ -139,7 +139,7 @@ def _format_index_line(name: str, snapshot: dict | None, fallback_date: str | No
     pct = _num(snapshot.get("change_percent"))
     price = _num(snapshot.get("price"))
     direction = "上漲" if change and change > 0 else "下跌" if change and change < 0 else "持平"
-    return f"{name}：{direction}{abs(change or 0):,.2f} 點（{pct:+.2f}%），收在 {price:,.2f} 點。"
+    return f"{name}：{direction}{abs(change or 0):,.2f}點（{pct:+.2f}%），收在{price:,.2f}點。"
 
 
 def _after_hours_market_tone(twii: dict | None, scan: dict, groups: list[dict]) -> str:

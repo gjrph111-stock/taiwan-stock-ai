@@ -3374,10 +3374,40 @@ def split_premarket_message(message: str) -> list[str]:
     return parts
 
 
+def split_after_hours_message(message: str) -> list[str]:
+    """Split the after-hours brief by major report sections."""
+    lines = message.splitlines()
+    if not lines:
+        return [message]
+    title = lines[0].strip()
+    sections: list[list[str]] = []
+    current: list[str] = []
+    for line in lines[1:]:
+        stripped = line.strip()
+        if stripped.startswith("【") and stripped.endswith("】"):
+            if any(item.strip() for item in current):
+                sections.append(_trim_blank_lines(current))
+            current = [line]
+        else:
+            current.append(line)
+    if any(item.strip() for item in current):
+        sections.append(_trim_blank_lines(current))
+    if not sections:
+        return _chunk_message(message)
+    parts = ["\n".join(_trim_blank_lines([title, "", *sections[0]])).strip()]
+    parts.extend("\n".join(_trim_blank_lines(section)).strip() for section in sections[1:])
+    final_parts: list[str] = []
+    for part in parts:
+        final_parts.extend(_chunk_message(part))
+    return final_parts
+
+
 def split_telegram_message(message: str) -> list[str]:
     first_line = message.splitlines()[0] if message.splitlines() else ""
     if "台股早訊" in first_line:
         return split_premarket_message(message)
+    if "台股收盤訊息" in first_line:
+        return split_after_hours_message(message)
     blocks = [block.strip() for block in message.split("\n\n") if block.strip()]
     if len(blocks) <= 1:
         return _chunk_message(message)
