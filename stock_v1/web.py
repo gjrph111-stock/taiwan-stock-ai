@@ -6721,6 +6721,138 @@ INDEX_HTML = r"""<!doctype html>
       background: #22c55e;
       box-shadow: 0 0 14px rgba(34, 197, 94, .88);
     }
+    /* Eye-comfort pass: raise dense dashboard text without changing data layout. */
+    body {
+      font-size: 18px;
+      line-height: 1.65;
+    }
+    h1 { font-size: 28px; }
+    .subtitle,
+    .version,
+    .sidebar-title,
+    .note,
+    .status,
+    .dashboard-note span,
+    .market-tile span,
+    .module-card span,
+    .watch-card span,
+    .diagnosis-card span,
+    dt {
+      font-size: 15px;
+    }
+    .app-shell {
+      grid-template-columns: 278px minmax(0, 1fr);
+    }
+    .nav-item {
+      font-size: 18px;
+      grid-template-columns: 34px 1fr;
+      gap: 10px;
+    }
+    .nav-icon {
+      width: 34px;
+      height: 34px;
+      font-size: 15px;
+    }
+    input,
+    button,
+    select {
+      min-height: 46px;
+      font-size: 18px;
+    }
+    button.compact,
+    .chart-tab,
+    .zoom-btn,
+    .panel-toggle,
+    .rank-more,
+    .stock-card button.compact {
+      min-height: 36px;
+      font-size: 15px;
+    }
+    section h2 {
+      font-size: 22px;
+      line-height: 1.3;
+    }
+    .content,
+    dl,
+    table,
+    .manager-card p,
+    .advice-list,
+    .fundamental-card ul,
+    .strategy-guide span,
+    .news-card,
+    .research-list-grid ul {
+      font-size: 17px;
+      line-height: 1.68;
+    }
+    thead th,
+    .manager-table th,
+    .stock-tag,
+    .stock-change,
+    .stock-ohlc,
+    .rank-name span,
+    .rank-metric,
+    .rank-price span,
+    .realtime-list-name span,
+    .realtime-list-meta,
+    .realtime-list-price span,
+    .stage-status,
+    .stage-confidence,
+    .research-stage-current,
+    .fundamental-mini-table,
+    .research-pill small,
+    .research-bars span,
+    .research-verdict span {
+      font-size: 15px;
+    }
+    .metric span,
+    .hero-stat span,
+    .market-tile span,
+    .module-card span,
+    .strategy-kpi span,
+    .stock-card small,
+    .stock-card-foot,
+    .trade-kpi span,
+    .facet-card span,
+    .institution-card span {
+      font-size: 15px;
+    }
+    .metric strong { font-size: 30px; }
+    .hero-panel h2 { font-size: 34px; }
+    .hero-stat strong,
+    .strategy-kpi strong,
+    .stock-card.compact-stock-card .stock-price {
+      font-size: 24px;
+    }
+    .market-tile strong,
+    .module-card strong,
+    .manager-card h3,
+    .strategy-stock-card strong,
+    .fundamental-card strong,
+    .rank-title,
+    .stock-card h3,
+    .realtime-list-name strong {
+      font-size: 21px;
+    }
+    .stock-price,
+    .rank-price strong {
+      font-size: 28px;
+    }
+    .realtime-rank,
+    .rank-index {
+      font-size: 18px;
+    }
+    .realtime-list-price strong {
+      font-size: 23px;
+    }
+    .research-verdict strong {
+      font-size: 32px;
+    }
+    .research-pill b {
+      font-size: 17px;
+    }
+    .fundamental-visual h3 {
+      font-size: 17px;
+    }
     @media (max-width: 1180px) {
       .desk-side {
         grid-template-columns: repeat(6, minmax(0, 1fr));
@@ -6740,7 +6872,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     @media (max-width: 820px) {
       header { display: block; }
-      body { font-size: 14px; }
+      body { font-size: 16px; }
       .app-shell { grid-template-columns: 1fr; padding: 8px; }
       .sidebar {
         position: sticky;
@@ -6756,10 +6888,24 @@ INDEX_HTML = r"""<!doctype html>
         padding-bottom: 2px;
       }
       .nav-item {
-        min-width: 96px;
-        grid-template-columns: 24px auto;
+        min-width: 122px;
+        grid-template-columns: 30px auto;
         padding: 8px;
         white-space: nowrap;
+        font-size: 16px;
+      }
+      .nav-icon { width: 30px; height: 30px; }
+      input,
+      button,
+      select {
+        font-size: 16px;
+      }
+      section h2 { font-size: 19px; }
+      .content,
+      dl,
+      table,
+      .research-list-grid ul {
+        font-size: 16px;
       }
       .sidebar-title { display: none; }
       .hero-panel, .hero-stat-grid, .market-strip, .module-grid, .diagnosis, .watch-grid, .strategy-advice, .strategy-kpis, .manager-grid, .manager-scenario-grid, .strategy-stock-grid, .strategy-guide, .trading-desk, .desk-side, .professional-grid, .trade-kpis, .technical-strip, .fundamental-grid, .fundamental-visuals, .research-command, .research-score-row, .research-list-grid, .news-grid, .inner-grid, .explore-hero, .trend-summary, .realtime-terminal, .facet-grid, .institution-grid, .realtime-list-table tbody { grid-template-columns: 1fr; }
