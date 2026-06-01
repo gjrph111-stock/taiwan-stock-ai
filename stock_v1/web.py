@@ -3104,70 +3104,283 @@ def _build_user_intraday_message(db_path: Path, user_key: str, display_name: str
 def _build_user_premarket_message(db_path: Path, user_key: str, display_name: str, limit: int = 5) -> str:
     codes = _user_watchlist_codes(db_path, user_key)
     rows = api_watchlist(db_path, ",".join(codes)).get("watchlist", [])[:limit]
-    return _format_premarket_message(display_name, rows, limit=limit)
+    return _format_premarket_message(db_path, display_name, rows, limit=limit)
 
 
 def build_owner_premarket_message(db_path: Path, limit: int = 8) -> str:
     rows = api_watchlist(db_path, ",".join(_watchlist_codes(db_path))).get("watchlist", [])[:limit]
-    return _format_premarket_message("本機使用者", rows, limit=limit)
+    return _format_premarket_message(db_path, "本機使用者", rows, limit=limit)
 
 
 def _build_premarket_report_text(db_path: Path, display_name: str, limit: int = 8) -> str:
     rows = api_watchlist(db_path, ",".join(_watchlist_codes(db_path))).get("watchlist", [])[:limit]
-    return _format_premarket_message(display_name, rows, limit=limit)
+    return _format_premarket_message(db_path, display_name, rows, limit=limit)
 
 
-def _format_premarket_message(display_name: str, rows: list[dict], limit: int = 8) -> str:
+def _format_premarket_message(db_path: Path, display_name: str, rows: list[dict], limit: int = 8) -> str:
     now = datetime.now(ZoneInfo("Asia/Taipei"))
     snapshot = _premarket_snapshot()
-    news = fetch_market_news(max_items=8)
+    news = fetch_market_news(max_items=10)
+    scan = api_scan(db_path, 8)
+    industry_report = _after_hours_industry_report(db_path)
+    status = api_status(db_path)
+    twii = _premarket_item(snapshot, symbol="^TWII") or _premarket_item(snapshot, name="台股加權指數")
+    opening_range = _premarket_opening_range(twii, snapshot.get("score"))
+    top_groups = industry_report.get("top_groups") or []
+    volume_groups = industry_report.get("volume_focus") or []
+    watch_focus = _premarket_watch_focus(rows[:limit], snapshot)
+    top_news = (news.get("items") or [])[:3]
+    high_news = [item for item in (news.get("items") or []) if item.get("impact") == "高"]
     lines = [
-        f"台股智研｜{display_name} 08:30 盤前分析",
-        f"時間：{now:%Y-%m-%d %H:%M}",
+        f"{now.year}年{now.month}月{now.day}日（{_weekday_zh(now)}）台股早訊",
+        f"時間：{now:%H:%M}｜{display_name}",
         "",
-        f"早盤預估：{snapshot.get('stance', '資料不足')}｜分數 {snapshot.get('score', 50)}",
-        snapshot.get("summary", "海外與夜盤資料不足，早盤以風控與分批為主。"),
+        f"1. {_previous_session_label(status.get('last_date'), now)}台股回顧",
+        _premarket_recap_text(twii, scan, top_groups),
         "",
-        "海外/夜盤連動",
+        f"2. 今日早盤重點觀察（{now.month}月{now.day}日）",
+        f"期貨與海外連動：{_premarket_overseas_text(snapshot)}",
+        f"國際情勢與新聞：{_premarket_news_text(top_news)}",
+        f"開盤預期：{snapshot.get('stance', '資料不足')}，{opening_range}",
+        f"盤前分數：{snapshot.get('score', 50)} / 100。{snapshot.get('summary', '海外與夜盤資料不足，早盤以風控與分批為主。')}",
+        "",
+        "3. 技術面與籌碼面",
+        f"技術面：{_premarket_technical_text(scan, twii)}",
+        f"籌碼面：{_premarket_chip_text(scan, rows)}",
+        "",
+        "4. 本週重點族群與事件",
+        f"事件焦點：{_premarket_event_text(top_news, high_news)}",
+        f"強勢族群：{_premarket_group_text(top_groups)}",
+        f"量能焦點：{_premarket_group_text(volume_groups)}",
+        "防禦選擇：若高檔震盪放大，可把金融、高股息與低波動傳產作為避險觀察。",
+        "",
+        "5. 操作策略建議",
+        f"• 短線操作：{_premarket_trade_tone(snapshot, high_news)}",
+        f"• 持股建議：總部位建議 {_premarket_position_level(snapshot, high_news)}；{watch_focus}",
+        f"• 風險提醒：{_premarket_risk_text(snapshot, scan, high_news)}",
+        "",
+        "總結：",
+        _premarket_conclusion(snapshot, twii, top_groups, top_news),
     ]
-    items = snapshot.get("items") or []
-    if items:
-        for item in items[:10]:
-            lines.append(
-                f"- {item['name']}：{fmt_value(item.get('change_percent'))}%｜"
-                f"{item.get('category', '連動')}｜{item.get('last_time', '無時間')}"
-            )
-    else:
-        lines.append("- 目前抓不到免費海外/夜盤資料，請以開盤後即時看盤確認。")
-
-    news_items = news.get("items") or []
-    lines.extend(["", "24H 新聞風險"])
-    if news_items:
-        for item in news_items[:5]:
-            lines.append(
-                f"- [{item.get('impact', '中')}] {item.get('title', '')}｜"
-                f"{item.get('category', '新聞')}｜{item.get('source', '')}"
-            )
-    else:
-        lines.append("- 暫無重大新聞；若新聞源失敗，請以盤中異動與公告補驗。")
-
-    lines.extend(["", "觀察名單早盤計畫"])
-    if not rows:
-        lines.append("目前尚未加入觀察股票。")
-    for item in rows[:limit]:
-        bias = _premarket_watch_bias(item, snapshot)
-        lines.extend([
-            "",
-            f"{item['code']} {item['name']}｜{bias}",
-            f"昨收/最新資料：{fmt_value(item.get('close'))}｜20D {fmt_value(item.get('return_20d'))}%｜RSI {fmt_value(item.get('rsi_14'))}",
-            f"開盤策略：{_premarket_watch_action(item, snapshot)}",
-            f"賣壓區：{item.get('sell_zone', '無資料')}｜量能需搭配即時看盤確認。",
-        ])
-    lines.extend([
-        "",
-        "提醒：08:30 報告是開盤前情境推演，真正進出場仍以 09:00 後即時價格、量能與停損紀律為準。",
-    ])
+    if rows:
+        lines.extend(["", "關注名單早盤提醒："])
+        for item in rows[: min(4, limit)]:
+            lines.append(f"• {item['code']} {item['name']}：{_premarket_watch_bias(item, snapshot)}；{_premarket_watch_action(item, snapshot)}")
+    lines.extend(["", "提醒：盤前早訊是開盤前情境推演，真正進出場仍以 09:00 後即時價格、成交量、支撐壓力與停損紀律為準。"])
     return "\n".join(lines)
+
+
+def _weekday_zh(value: datetime) -> str:
+    return ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"][value.weekday()]
+
+
+def _short_date(value: str | None) -> str:
+    if not value:
+        return "最新資料日"
+    try:
+        parsed = date.fromisoformat(value)
+        return f"{parsed.month}/{parsed.day}"
+    except ValueError:
+        return value
+
+
+def _previous_session_label(value: str | None, now: datetime) -> str:
+    if not value:
+        return "前一交易日"
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        return f"前一交易日（{value}）"
+    if now.weekday() == 0 and parsed.weekday() == 4:
+        return f"上週五（{parsed.month}/{parsed.day}）"
+    return f"前一交易日（{parsed.month}/{parsed.day}）"
+
+
+def _premarket_item(snapshot: dict, symbol: str | None = None, name: str | None = None) -> dict | None:
+    for item in snapshot.get("items") or []:
+        if symbol and item.get("symbol") == symbol:
+            return item
+        if name and item.get("name") == name:
+            return item
+    return None
+
+
+def _signed_percent(value: object) -> str:
+    num = _to_float(value)
+    if num is None:
+        return "無資料"
+    return f"{num:+.2f}%"
+
+
+def _fmt_number(value: object, digits: int = 2) -> str:
+    num = _to_float(value)
+    if num is None:
+        return "無資料"
+    return f"{num:,.{digits}f}"
+
+
+def _signed_points(value: object) -> str:
+    num = _to_float(value)
+    if num is None:
+        return "無資料"
+    return f"{abs(num):,.2f} 點"
+
+
+def _to_float(value: object) -> float | None:
+    try:
+        num = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return num if num == num else None
+
+
+def _premarket_recap_text(twii: dict | None, scan: dict, groups: list[dict]) -> str:
+    parts = []
+    if twii:
+        change = _to_float(twii.get("change"))
+        direction = "上漲" if change and change > 0 else "下跌" if change and change < 0 else "持平"
+        parts.append(
+            f"加權指數前一交易日收在 {_fmt_number(twii.get('price'))} 點，{direction} {_signed_points(change)}（{_signed_percent(twii.get('change_percent'))}）。"
+        )
+    else:
+        parts.append("加權指數前一交易日資料暫缺，先以本機股票廣度與類股強弱判斷。")
+    summary = scan.get("summary") or {}
+    count = scan.get("count") or 0
+    parts.append(
+        f"本機股票廣度顯示，{fmt_value(summary.get('above_sma20'), 0)} / {fmt_value(count, 0)} 檔站上20日線，"
+        f"{fmt_value(summary.get('above_sma60'), 0)} 檔站上60日線，{fmt_value(summary.get('new_high_60'), 0)} 檔創60日新高。"
+    )
+    if groups:
+        parts.append(f"類股表現以 {_premarket_group_text(groups[:3])} 較強。")
+    return " ".join(parts)
+
+
+def _premarket_overseas_text(snapshot: dict) -> str:
+    preferred = ["NQ=F", "ES=F", "^SOX", "TSM", "NVDA", "EWT", "TWD=X"]
+    rows = [_premarket_item(snapshot, symbol=symbol) for symbol in preferred]
+    text = [f"{row['name']} {_signed_percent(row.get('change_percent'))}" for row in rows if row]
+    if text:
+        return "、".join(text[:5]) + "。"
+    return "海外期貨、ADR 與台股 ETF 暫無完整資料，開盤後以即時看盤確認。"
+
+
+def _premarket_news_text(items: list[dict]) -> str:
+    if not items:
+        return "24H 新聞源暫無重大標題，留意開盤後異常跳空與爆量。"
+    return "；".join(f"{item.get('title', '')}（{item.get('impact', '中')}影響）" for item in items[:2])
+
+
+def _premarket_opening_range(twii: dict | None, score: object) -> str:
+    close = _to_float((twii or {}).get("price"))
+    score_num = _to_float(score) or 50
+    if close is None:
+        return "預估以小幅震盪開出，等待 09:00 後量價確認。"
+    center_bias = max(-0.006, min(0.006, (score_num - 50) / 10000))
+    low = close * (1 + center_bias - 0.0025)
+    high = close * (1 + center_bias + 0.0025)
+    support = close * (0.995 if score_num >= 55 else 0.99)
+    return f"預估開盤區間約 {low:,.0f}～{high:,.0f} 點；若守住 {support:,.0f} 點，多頭格局較容易延續。"
+
+
+def _premarket_technical_text(scan: dict, twii: dict | None) -> str:
+    summary = scan.get("summary") or {}
+    count = max(1, int(scan.get("count") or 1))
+    above20_pct = (summary.get("above_sma20") or 0) / count * 100
+    above60_pct = (summary.get("above_sma60") or 0) / count * 100
+    if above20_pct >= 60 and above60_pct >= 50:
+        tone = "短中期均線廣度偏多"
+    elif above20_pct <= 35:
+        tone = "短線廣度偏弱，反彈需看量能是否跟上"
+    else:
+        tone = "短線呈區間震盪"
+    twii_text = f"加權指數 {_signed_percent((twii or {}).get('change_percent'))}" if twii else "指數資料待補"
+    return f"{tone}，{twii_text}；站上20日線占比 {above20_pct:.0f}%、站上60日線占比 {above60_pct:.0f}%。"
+
+
+def _premarket_chip_text(scan: dict, rows: list[dict]) -> str:
+    volume_rows = scan.get("top_volume_expansion") or []
+    focus = "、".join(f"{row.get('short_name') or row.get('name')} 量比 {fmt_value(row.get('volume_ratio'))}" for row in volume_rows[:3])
+    watch = "、".join(f"{row.get('name')} AI {fmt_value(row.get('score'), 0)}" for row in rows[:3] if row.get("score") is not None)
+    if focus and watch:
+        return f"量能集中在 {focus}；關注名單以 {watch} 優先追蹤。"
+    if focus:
+        return f"量能集中在 {focus}，需觀察是否延續到開盤後前 30 分鐘。"
+    return "法人逐筆資料不足時，以量能擴張、AI 分數與關注名單強弱作資金面代理。"
+
+
+def _premarket_event_text(items: list[dict], high_items: list[dict]) -> str:
+    if high_items:
+        return f"24H 偵測到 {len(high_items)} 則高影響新聞，優先看是否牽動半導體、AI、匯率或政策風險。"
+    if items:
+        return f"新聞面以 {items[0].get('category', '市場')} 為主，尚未形成明顯系統性風險。"
+    return "目前無重大事件訊號，仍需留意盤前突發新聞。"
+
+
+def _premarket_group_text(groups: list[dict]) -> str:
+    if not groups:
+        return "暫無明確族群"
+    return "、".join(
+        f"{row.get('name')}（均漲跌 {fmt_value(row.get('avg_change_percent'))}%）"
+        for row in groups[:4]
+    )
+
+
+def _premarket_trade_tone(snapshot: dict, high_news: list[dict]) -> str:
+    score = int(snapshot.get("score") or 50)
+    if high_news and score < 60:
+        return "先觀望突發新聞反應，避免開盤追價，等第一段量價方向出來再分批。"
+    if score >= 62:
+        return "偏多但不追開盤急拉，採回測承接與突破後回測站穩再加碼。"
+    if score <= 42:
+        return "先防守，降低追價與攤平，等支撐止穩再評估低接。"
+    return "採區間策略，開盤前 15～30 分鐘先看量價與族群輪動。"
+
+
+def _premarket_position_level(snapshot: dict, high_news: list[dict]) -> str:
+    score = int(snapshot.get("score") or 50)
+    if high_news and score < 58:
+        return "4～5 成"
+    if score >= 68:
+        return "6～7 成"
+    if score >= 58:
+        return "5～6 成"
+    if score <= 42:
+        return "3～4 成"
+    return "4～5 成"
+
+
+def _premarket_watch_focus(rows: list[dict], snapshot: dict) -> str:
+    if not rows:
+        return "尚未建立關注名單，先以類股與大盤方向為主。"
+    ranked = sorted(rows, key=lambda row: row.get("score") or 0, reverse=True)[:3]
+    names = "、".join(f"{row.get('name')}（{row.get('code')}）" for row in ranked)
+    return f"關注名單優先看 {names}，但仍需等開盤量價確認。"
+
+
+def _premarket_risk_text(snapshot: dict, scan: dict, high_news: list[dict]) -> str:
+    score = int(snapshot.get("score") or 50)
+    summary = scan.get("summary") or {}
+    if high_news:
+        return "有高影響新聞時，先確認跳空方向與成交量，不把盤前結論當作直接下單依據。"
+    if score >= 65 and (summary.get("new_high_60") or 0) > 80:
+        return "強勢盤容易伴隨高檔獲利了結，需嚴守停利停損，避免利多出盡。"
+    if score <= 42:
+        return "若開低跌破前低或關鍵均線，先減碼而不是攤平。"
+    return "若開盤量能不足或族群輪動失敗，先降低部位，等待第二次訊號。"
+
+
+def _premarket_conclusion(snapshot: dict, twii: dict | None, groups: list[dict], news_items: list[dict]) -> str:
+    score = int(snapshot.get("score") or 50)
+    group_text = _premarket_group_text(groups[:2])
+    news_text = news_items[0].get("title", "盤前新聞與量價") if news_items else "盤前新聞與量價"
+    if score >= 62:
+        tone = "市場氣氛偏向謹慎樂觀，多頭仍占優勢"
+    elif score <= 42:
+        tone = "盤前訊號偏防守，今日重點是確認支撐是否守住"
+    else:
+        tone = "盤前訊號中性，今日重點是開盤量能與族群輪動"
+    index_text = f"加權指數前日 {_signed_percent(twii.get('change_percent'))}，" if twii else ""
+    return f"{index_text}{tone}。早盤觀察 {news_text}，族群聚焦 {group_text}。操作上避免一次買滿，聚焦有題材、量能延續且風控位置清楚的個股。"
 
 
 def _premarket_watch_bias(item: dict, snapshot: dict) -> str:
