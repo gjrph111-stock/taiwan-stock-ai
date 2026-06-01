@@ -28,7 +28,6 @@ def build_after_hours_message(db_path: Path = DEFAULT_DB_PATH, limit: int = 6) -
     weak_groups = industry.get("weak_groups") or []
     top_return = scan.get("top_return_20d") or []
     top_volume = scan.get("top_volume_expansion") or []
-    watch_items = build_watchlist_advice(db_path, limit=limit)
     twii = _safe_yahoo_snapshot("^TWII")
     otc = _safe_yahoo_snapshot("^TWOII")
     market_tone = _after_hours_market_tone(twii, scan, top_groups)
@@ -46,7 +45,7 @@ def build_after_hours_message(db_path: Path = DEFAULT_DB_PATH, limit: int = 6) -
         "",
         "【熱門個股與族群表現細節】",
         "",
-        *_after_hours_hot_stock_lines(watch_items, top_return, top_volume, limit=limit),
+        *_after_hours_hot_stock_lines(top_groups, volume_groups, top_return, top_volume, limit=limit),
         "",
         f"強勢族群：{_format_group_list(top_groups)}",
         f"量能族群：{_format_group_list(volume_groups)}",
@@ -65,7 +64,7 @@ def build_after_hours_message(db_path: Path = DEFAULT_DB_PATH, limit: int = 6) -
         _after_hours_outlook(twii, scan, top_groups),
         "",
         "短期展望：",
-        "只要COMPUTEX能帶來正面題材且無重大利空，指數仍有向上挑戰46,000點的機會。但漲多之後需留意震盪，個股可能出現分化。建議投資人操作上保持謹慎樂觀，聚焦基本面強、訂單能見度高的AI核心供應鏈，投資人應嚴守紀律，避免在急跌過程中接刀。",
+        _after_hours_short_term_outlook(twii, scan, top_groups, weak_groups),
         "",
         "目前市場焦點仍在：",
         "1. AI供應鏈、半導體、記憶體、散熱、光通訊等主流族群是否延續量價。",
@@ -169,24 +168,69 @@ def _after_hours_breadth_text(scan: dict) -> str:
     )
 
 
-def _after_hours_hot_stock_lines(watch_items: list[dict], top_return: list[dict], top_volume: list[dict], limit: int = 6) -> list[str]:
+def _after_hours_hot_stock_lines(
+    top_groups: list[dict],
+    volume_groups: list[dict],
+    top_return: list[dict],
+    top_volume: list[dict],
+    limit: int = 6,
+) -> list[str]:
     lines = []
     used = set()
-    for item in watch_items[: min(limit, 5)]:
-        used.add(item.get("code"))
-        score = f"AI {item.get('score')}" if item.get("score") is not None else item.get("trend", "觀察")
-        lines.append(f"{item.get('name')}（{item.get('code')}）：{score}，{item.get('summary', '')}。{item.get('advice', '')}")
-    for row in top_return[:3]:
+    for group in top_groups[:3]:
+        leader = group.get("leader") or {}
+        strongest = group.get("strongest") or {}
+        leader_text = _format_market_stock(leader)
+        strongest_text = _format_market_stock(strongest)
+        breadth = float(group.get("breadth") or 0)
+        avg_change = float(group.get("avg_change_percent") or 0)
+        lines.append(
+            f"{group.get('name')}：類股平均 {avg_change:+.2f}%，上漲家數占比 {breadth:.0f}%；"
+            f"成交龍頭 {leader_text}，族群最強 {strongest_text}。"
+        )
+        for item in (leader, strongest):
+            if item.get("code"):
+                used.add(item.get("code"))
+    for group in volume_groups[:2]:
+        leader = group.get("leader") or {}
+        if leader.get("code") in used:
+            continue
+        used.add(leader.get("code"))
+        lines.append(
+            f"量能族群 {group.get('name')}：平均量比 {float(group.get('avg_volume_ratio') or 0):.2f}，"
+            f"代表股 {_format_market_stock(leader)}。"
+        )
+    for row in top_return[: max(3, limit // 2)]:
         if row.get("code") in used:
             continue
         used.add(row.get("code"))
         lines.append(
             f"{row.get('short_name') or row.get('name')}（{row.get('code')}）：20日漲幅 {float(row.get('return_20d') or 0):.2f}%，屬盤後強勢追蹤名單。"
         )
+        if len(lines) >= limit:
+            break
     if top_volume:
-        names = "、".join(f"{row.get('short_name') or row.get('name')} 量比 {float(row.get('volume_ratio') or 0):.2f}" for row in top_volume[:4])
+        names = "、".join(
+            f"{row.get('short_name') or row.get('name')} 量比 {float(row.get('volume_ratio') or 0):.2f}"
+            for row in top_volume[:4]
+            if row.get("code") not in used
+        )
+        if not names:
+            names = "、".join(f"{row.get('short_name') or row.get('name')} 量比 {float(row.get('volume_ratio') or 0):.2f}" for row in top_volume[:4])
         lines.append(f"量能焦點：{names}，隔日需觀察是否延續成交量。")
     return lines or ["今日沒有足夠個股資料可列入熱門名單，先觀察大盤與類股輪動。"]
+
+
+def _format_market_stock(item: dict) -> str:
+    if not item:
+        return "暫無明確個股"
+    name = item.get("name") or item.get("short_name") or "-"
+    code = item.get("code") or "-"
+    change = _num(item.get("change_percent"))
+    close = _num(item.get("close"))
+    change_text = f"{change:+.2f}%" if change is not None else "漲跌待補"
+    close_text = f"收 {close:g}" if close is not None else "收盤待補"
+    return f"{name}（{code}，{close_text}，{change_text}）"
 
 
 def _format_group_list(groups: list[dict]) -> str:
@@ -226,6 +270,51 @@ def _after_hours_outlook(twii: dict | None, scan: dict, groups: list[dict]) -> s
     else:
         headline = "今天台股可用「指數震盪、族群輪動、資金挑股」來形容。"
     return f"{headline} 後市仍以 {group_text} 為主軸，若隔日量能延續，多頭結構可維持；若開盤無量或急拉不過高，需留意短線獲利了結。"
+
+
+def _after_hours_short_term_outlook(twii: dict | None, scan: dict, groups: list[dict], weak_groups: list[dict]) -> str:
+    pct = _num((twii or {}).get("change_percent"))
+    price = _num((twii or {}).get("price"))
+    summary = scan.get("summary") or {}
+    count = max(1, int(scan.get("count") or 1))
+    above20_pct = (summary.get("above_sma20") or 0) / count * 100
+    new_high = int(summary.get("new_high_60") or 0)
+    strong_group = groups[0].get("name") if groups else "主流族群"
+    weak_group = weak_groups[0].get("name") if weak_groups else "弱勢族群"
+    next_level = _next_index_level(price)
+    if pct is not None and pct >= 1 and above20_pct >= 50:
+        return (
+            f"目前指數收紅且站上20日線家數約 {above20_pct:.0f}%，多頭結構仍偏健康；"
+            f"若 {strong_group} 隔日量能延續且沒有重大利空，指數仍有機會挑戰 {next_level} 點附近壓力。"
+            f"但60日新高已達 {new_high} 檔，漲多後個股分化機率升高，操作上宜聚焦基本面強、訂單能見度高且量價同步的核心族群，避免在盤中急跌時貿然接刀。"
+        )
+    if pct is not None and pct <= -1:
+        return (
+            f"指數今日轉弱且 {weak_group} 壓力較明顯，短線先以防守為主；"
+            f"若隔日無法快速收復關鍵均線，應降低追價與槓桿，等待量縮止穩或主流族群重新轉強。"
+            "急跌過程不宜攤平，先確認支撐、成交量與法人資金是否回流。"
+        )
+    if above20_pct >= 55:
+        return (
+            f"盤面雖非單邊急漲，但站上20日線家數約 {above20_pct:.0f}%，資金仍在輪動；"
+            f"短線可維持謹慎偏多，優先觀察 {strong_group} 是否延續領漲。"
+            "若指數上攻量能不足，應把追價改為拉回找支撐，並嚴守停損。"
+        )
+    return (
+        f"目前站上20日線家數約 {above20_pct:.0f}%，盤面偏向整理與挑股；"
+        f"短線不宜預設全面多頭，需觀察 {strong_group} 能否擴散，以及 {weak_group} 是否止跌。"
+        "操作上降低持股集中度，等量價結構轉強後再提高部位。"
+    )
+
+
+def _next_index_level(price: float | None) -> str:
+    if not price or price <= 0:
+        return "下一道整數關卡"
+    step = 1000 if price >= 10000 else 100
+    level = int((price + step - 1) // step * step)
+    if level <= price:
+        level += step
+    return f"{level:,}"
 
 
 def _num(value) -> float | None:
