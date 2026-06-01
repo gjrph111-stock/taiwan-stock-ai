@@ -3145,29 +3145,45 @@ def _format_telegram_stock_answer(db_path: Path, code: str) -> str:
     stock = api_stock(db_path, code)
     if stock.get("error"):
         return stock["error"]
+    ind = api_indicators(db_path, code)
     signal = api_stock_signal(db_path, code)
     watch = _watch_snapshot(db_path, code) or {}
     latest = stock.get("latest") or {}
+    analysis = _telegram_stock_research(stock, ind if not ind.get("error") else {}, signal if not signal.get("error") else {}, watch)
     lines = [
         f"{stock['code']} {stock.get('short_name') or stock['name']}",
         f"產業：{stock.get('industry', '無資料')}",
         f"日期：{latest.get('date', '無資料')}",
-        f"收盤：{fmt_value(latest.get('close'))}",
+        f"收盤：{fmt_value(latest.get('close'))}｜狀態：{analysis['status']}",
     ]
     if not signal.get("error"):
         lines.extend(
             [
                 f"AI 分數：{fmt_value(signal.get('risk_adjusted_score'), 1)}｜{signal.get('signal', '資料不足')}",
-                f"20D：{fmt_value(signal.get('return_20d'))}%｜60D：{fmt_value(signal.get('return_60d'))}%",
-                f"回撤：{fmt_value(signal.get('drawdown_pct'))}%",
+                f"動能：5D {fmt_value(ind.get('return_5d'))}%｜20D {fmt_value(signal.get('return_20d'))}%｜60D {fmt_value(signal.get('return_60d'))}%",
+                f"回撤：{fmt_value(signal.get('drawdown_pct'))}%｜新高：{'是' if signal.get('new_high_60') else '否'}",
             ]
         )
     lines.extend(
         [
+            "",
+            "分析依據",
+            *[f"- {item}" for item in analysis["basis"]],
+            "",
+            "操作建議",
+            f"短線：{analysis['short']}",
+            f"中線：{analysis['medium']}",
+            f"長線：{analysis['long']}",
+            "",
+            "條件與價位",
             f"買點：{watch.get('buy_zone', '無資料')}",
             f"賣點：{watch.get('sell_zone', '無資料')}",
             f"停損：{watch.get('stop', '無資料')}",
-            f"建議：{_simple_watch_advice(watch) if watch else '資料不足'}",
+            f"突破條件：{analysis['breakout']}",
+            f"轉弱條件：{analysis['invalid']}",
+            "",
+            "風險提醒",
+            *[f"- {item}" for item in analysis["risks"]],
             "",
             "提醒：這是研究輔助，不是保證獲利或直接下單指令。",
         ]
@@ -3181,12 +3197,16 @@ def _format_telegram_watchlist(db_path: Path, user_key: str) -> str:
         return "你的觀察名單目前是空的。可以輸入：加入 2330"
     lines = ["你的觀察名單"]
     for item in rows[:8]:
+        strategy = _telegram_compact_strategy(db_path, item["code"], item)
         lines.extend(
             [
                 "",
                 f"{item['code']} {item['name']}｜AI {fmt_value(item.get('score'), 1)}｜{item.get('signal', '資料不足')}",
                 f"收盤 {fmt_value(item.get('close'))}｜20D {fmt_value(item.get('return_20d'))}%｜RSI {fmt_value(item.get('rsi_14'))}",
                 f"買點 {item.get('buy_zone', '無資料')}｜停損 {item.get('stop', '無資料')}",
+                f"依據：{strategy['basis']}",
+                f"短線：{strategy['short']}",
+                f"長線：{strategy['long']}",
             ]
         )
     return "\n".join(lines)
@@ -3224,6 +3244,7 @@ def _build_user_daily_message(db_path: Path, user_key: str, display_name: str, l
     if not rows:
         lines.append("目前尚未加入觀察股票，請先回網站加入觀察名單。")
     for item in rows:
+        strategy = _telegram_compact_strategy(db_path, item["code"], item)
         lines.extend([
             "",
             f"{item['code']} {item['name']}｜AI {item.get('score', '無資料')}｜{item.get('signal', '資料不足')}",
@@ -3231,7 +3252,9 @@ def _build_user_daily_message(db_path: Path, user_key: str, display_name: str, l
             f"買點：{item.get('buy_zone', '無資料')}",
             f"賣點：{item.get('sell_zone', '無資料')}",
             f"停損：{item.get('stop', '無資料')}",
-            f"建議：{_simple_watch_advice(item)}",
+            f"依據：{strategy['basis']}",
+            f"短線：{strategy['short']}",
+            f"長線：{strategy['long']}",
         ])
     lines.extend([
         "",
@@ -3253,6 +3276,7 @@ def _build_user_intraday_message(db_path: Path, user_key: str, display_name: str
     if not rows:
         lines.append("目前尚未加入觀察股票。")
     for item in rows:
+        strategy = _telegram_compact_strategy(db_path, item["code"], item)
         close = item.get("close")
         stop = item.get("stop")
         sell_zone = item.get("sell_zone")
@@ -3269,7 +3293,9 @@ def _build_user_intraday_message(db_path: Path, user_key: str, display_name: str
             f"{item['code']} {item['name']}｜{item.get('signal', '資料不足')}｜{risk}",
             f"現價/收盤：{fmt_value(close)}｜RSI {fmt_value(item.get('rsi_14'))}｜量比 {fmt_value(item.get('volume_ratio'))}",
             f"買點：{buy_zone or '無資料'}｜賣點：{sell_zone or '無資料'}｜停損：{stop or '無資料'}",
-            f"建議：{_simple_watch_advice(item)}",
+            f"依據：{strategy['basis']}",
+            f"短線：{strategy['short']}",
+            f"長線：{strategy['long']}",
         ])
     lines.extend([
         "",
@@ -4021,6 +4047,178 @@ def fmt_value(value, digits: int = 2) -> str:
     if isinstance(value, (int, float)):
         return f"{value:.{digits}f}"
     return str(value)
+
+
+def _to_float(value) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _distance_pct(price, base) -> float | None:
+    price_v = _to_float(price)
+    base_v = _to_float(base)
+    if price_v is None or base_v in (None, 0):
+        return None
+    return (price_v / base_v - 1) * 100
+
+
+def _fmt_signed_pct(value) -> str:
+    number = _to_float(value)
+    if number is None:
+        return "無資料"
+    sign = "+" if number > 0 else ""
+    return f"{sign}{number:.2f}%"
+
+
+def _telegram_stock_research(stock: dict, ind: dict, signal: dict, watch: dict) -> dict:
+    close = _to_float((stock.get("latest") or {}).get("close") or ind.get("close") or watch.get("close"))
+    sma5 = _to_float(ind.get("sma_5"))
+    sma20 = _to_float(ind.get("sma_20"))
+    sma60 = _to_float(ind.get("sma_60"))
+    rsi14 = _to_float(ind.get("rsi_14") or watch.get("rsi_14"))
+    macd_v = _to_float(ind.get("macd"))
+    macd_signal = _to_float(ind.get("macd_signal"))
+    macd_hist = _to_float(ind.get("macd_histogram"))
+    volume_ratio_v = _to_float(ind.get("volume_ratio") or watch.get("volume_ratio"))
+    ret5 = _to_float(ind.get("return_5d") or watch.get("return_5d"))
+    ret20 = _to_float(ind.get("return_20d") or watch.get("return_20d") or signal.get("return_20d"))
+    ret60 = _to_float(ind.get("return_60d") or watch.get("return_60d") or signal.get("return_60d"))
+    score = _to_float(signal.get("risk_adjusted_score") or watch.get("score"))
+    drawdown = _to_float(signal.get("drawdown_pct"))
+    new_high = bool(ind.get("new_high_60") or signal.get("new_high_60"))
+
+    above5 = close is not None and sma5 is not None and close >= sma5
+    above20 = close is not None and sma20 is not None and close >= sma20
+    above60 = close is not None and sma60 is not None and close >= sma60
+    ma_bull = sma20 is not None and sma60 is not None and sma20 >= sma60
+    macd_bull = macd_v is not None and macd_signal is not None and macd_v >= macd_signal
+    macd_bear = macd_v is not None and macd_signal is not None and macd_v < macd_signal
+    overheat = rsi14 is not None and rsi14 >= 75
+    weak_rsi = rsi14 is not None and rsi14 <= 40
+    volume_expanding = volume_ratio_v is not None and volume_ratio_v >= 1.5
+    volume_thin = volume_ratio_v is not None and volume_ratio_v < 0.8
+
+    if overheat and above20 and above60:
+        status = "強勢過熱，偏多但不追高"
+    elif above20 and above60 and ma_bull and macd_bull:
+        status = "多頭趨勢延續"
+    elif above20 and not above60:
+        status = "反彈中，仍需站穩季線"
+    elif not above20 and above60:
+        status = "長線尚可，短線整理"
+    elif close is not None and sma20 is not None and close < sma20:
+        status = "短線轉弱，先控風險"
+    else:
+        status = "資料中性，等待訊號確認"
+
+    basis = []
+    if close is not None:
+        basis.append(f"均線：收盤 {fmt_value(close)}；5/20/60MA={fmt_value(sma5)}/{fmt_value(sma20)}/{fmt_value(sma60)}，月線距離 {_fmt_signed_pct(_distance_pct(close, sma20))}、季線距離 {_fmt_signed_pct(_distance_pct(close, sma60))}")
+    else:
+        basis.append("均線：價格資料不足，無法判斷均線位置")
+    basis.append(f"動能：5D {_fmt_signed_pct(ret5)}、20D {_fmt_signed_pct(ret20)}、60D {_fmt_signed_pct(ret60)}，用來區分短線衝刺與中長線趨勢")
+    basis.append(f"RSI14：{fmt_value(rsi14)}（{'過熱' if overheat else '偏弱' if weak_rsi else '中性偏多' if rsi14 is not None and rsi14 >= 55 else '中性'}）")
+    basis.append(f"MACD：{('多方' if macd_bull else '空方' if macd_bear else '無法判斷')}，柱狀體 {fmt_value(macd_hist)}，用來觀察趨勢加速或鈍化")
+    basis.append(f"量能：量比 {fmt_value(volume_ratio_v)}（{'放量確認' if volume_expanding else '量縮，追價力道不足' if volume_thin else '正常'}）")
+    basis.append(f"結構：{'60 日新高' if new_high else '未創 60 日新高'}；AI 分數 {fmt_value(score, 1)}；回撤 {fmt_value(drawdown)}%")
+    if signal.get("reasons"):
+        basis.append("AI 理由：" + "、".join(str(item) for item in signal.get("reasons", [])[:4]))
+
+    buy_zone = watch.get("buy_zone") or signal.get("entry_zone") or "無資料"
+    sell_zone = watch.get("sell_zone") or signal.get("exit_zone") or "無資料"
+    stop = watch.get("stop") or signal.get("stop") or "無資料"
+
+    if close is not None and stop not in (None, "", "無資料"):
+        stop_v = _to_float(stop)
+    else:
+        stop_v = None
+
+    if stop_v is not None and close is not None and close <= stop_v:
+        short = f"已接近/跌破停損 {stop}，短線先降風險，不用凹單；等重新站回 5MA/20MA 再評估。"
+    elif overheat and volume_expanding:
+        short = f"短線強但過熱，已有部位可沿賣點 {sell_zone} 分批停利；新倉等回測買點 {buy_zone} 或盤中拉回不破 5MA。"
+    elif overheat:
+        short = f"RSI 過熱但量能未明顯放大，不建議追高；等拉回 {buy_zone}、RSI 降溫後再分批。"
+    elif above5 and above20 and macd_bull:
+        short = f"短線偏多，可採回測不破 5MA/20MA 分批；若放量突破賣壓 {sell_zone} 才考慮加碼。"
+    elif not above20 and macd_bear:
+        short = f"短線偏弱，先等站回月線 {fmt_value(sma20)} 且 MACD 翻正；未站回前以反彈減碼或觀望為主。"
+    else:
+        short = f"短線訊號未完全一致，採區間策略：靠近買點 {buy_zone} 才分批，接近賣點 {sell_zone} 不追價。"
+
+    if above20 and above60 and ma_bull:
+        medium = f"中線仍屬多頭架構，核心觀察月線 {fmt_value(sma20)} 與季線 {fmt_value(sma60)}；只要月線未有效跌破，可用回檔分批策略。"
+    elif above20 and not above60:
+        medium = f"中線是反彈修復，不是完整多頭；需站穩季線 {fmt_value(sma60)} 且量能維持，才升級為波段布局。"
+    elif not above20 and above60:
+        medium = f"中線進入整理，季線仍是最後防線；跌破季線要降低持股，站回月線才恢復積極。"
+    else:
+        medium = f"中線偏弱，先不急著攤平；等價格重回月線/季線上方並出現放量轉強。"
+
+    if above60 and (ret60 is None or ret60 >= 0) and score is not None and score >= 60:
+        long = f"長線可列入持續追蹤或核心候選，但不一次買滿；以季線 {fmt_value(sma60)}、財報與產業趨勢作為續抱條件。"
+    elif above60:
+        long = f"長線尚未破壞，但分數/動能未完全確認；可小部位觀察，跌破季線或基本面轉弱則退出。"
+    else:
+        long = f"長線尚未站回季線，不適合用長抱邏輯硬做；先等季線收復與中期趨勢轉正。"
+
+    if sell_zone != "無資料":
+        breakout = f"帶量突破並站穩賣壓區 {sell_zone}，且 RSI 不再快速背離，才視為續強。"
+    else:
+        breakout = "需放量突破近期高點且收盤站穩月線，才視為續強。"
+    invalid_parts = []
+    if stop != "無資料":
+        invalid_parts.append(f"跌破停損 {stop}")
+    if sma20 is not None:
+        invalid_parts.append(f"收盤跌破月線 {fmt_value(sma20)}")
+    if sma60 is not None:
+        invalid_parts.append(f"波段跌破季線 {fmt_value(sma60)}")
+    invalid = "；".join(invalid_parts) if invalid_parts else "跌破前低且 MACD 轉空"
+
+    risks = []
+    if overheat:
+        risks.append("RSI 已偏高，容易出現急漲後震盪或隔日開高走低。")
+    if volume_expanding and ret5 is not None and ret5 > 10:
+        risks.append("短線漲幅與量能同步放大，代表人氣強，但也可能是籌碼換手高峰。")
+    if drawdown is not None and drawdown <= -20:
+        risks.append("曾出現較大回撤，追高需嚴守停損，不宜重倉。")
+    if macd_bear:
+        risks.append("MACD 尚未轉多，反彈若無量容易失敗。")
+    if volume_thin:
+        risks.append("量能不足，突破可信度較低。")
+    if not risks:
+        risks.append("主要風險是大盤轉弱、法人賣超或跌破均線支撐。")
+
+    return {
+        "status": status,
+        "basis": basis[:7],
+        "short": short,
+        "medium": medium,
+        "long": long,
+        "breakout": breakout,
+        "invalid": invalid,
+        "risks": risks[:4],
+    }
+
+
+def _telegram_compact_strategy(db_path: Path, code: str, item: dict | None = None) -> dict:
+    stock = api_stock(db_path, code)
+    ind = api_indicators(db_path, code)
+    signal = api_stock_signal(db_path, code)
+    watch = item or _watch_snapshot(db_path, code) or {}
+    if stock.get("error") or ind.get("error"):
+        return {"basis": "資料不足", "short": "資料不足", "long": "資料不足"}
+    analysis = _telegram_stock_research(stock, ind, signal if not signal.get("error") else {}, watch)
+    basis = analysis["basis"][0] if analysis.get("basis") else "資料不足"
+    return {
+        "basis": basis.replace("均線：", ""),
+        "short": analysis["short"],
+        "long": analysis["long"],
+    }
 
 
 def _simple_watch_advice(item: dict) -> str:
