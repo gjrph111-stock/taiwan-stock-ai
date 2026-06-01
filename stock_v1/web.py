@@ -917,7 +917,7 @@ def api_news(db_path: Path, code: str) -> dict:
 def _market_session() -> dict:
     now = datetime.now(ZoneInfo("Asia/Taipei"))
     is_weekday = now.weekday() < 5
-    intraday = is_weekday and time(9, 0) <= now.time() <= time(13, 30)
+    intraday = is_weekday and time(9, 0) <= now.time() <= time(14, 0)
     return {
         "is_intraday": intraday,
         "session_label": "盤中盯盤" if intraday else "盤後整理",
@@ -1285,7 +1285,7 @@ def send_enabled_user_telegrams(db_path: Path, limit: int = 5) -> dict:
     for user in users:
         try:
             message = _build_user_daily_message(db_path, user["user_key"], user["display_name"], limit=limit)
-            _send_telegram_to_chat(user["telegram_chat_id"], message)
+            _send_telegram_parts_to_chat(user["telegram_chat_id"], message)
             sent += 1
         except Exception as exc:
             failures.append({"user_key": user["user_key"], "name": user["display_name"], "error": str(exc)})
@@ -1308,7 +1308,7 @@ def send_enabled_user_intraday_telegrams(db_path: Path, limit: int = 5) -> dict:
     for user in users:
         try:
             message = _build_user_intraday_message(db_path, user["user_key"], user["display_name"], limit=limit)
-            _send_telegram_to_chat(user["telegram_chat_id"], message)
+            _send_telegram_parts_to_chat(user["telegram_chat_id"], message)
             sent += 1
         except Exception as exc:
             failures.append({"user_key": user["user_key"], "name": user["display_name"], "error": str(exc)})
@@ -1331,8 +1331,7 @@ def send_enabled_user_premarket_telegrams(db_path: Path, limit: int = 5) -> dict
     for user in users:
         try:
             message = _build_user_premarket_message(db_path, user["user_key"], user["display_name"], limit=limit)
-            for part in split_premarket_message(message):
-                _send_telegram_to_chat(user["telegram_chat_id"], part)
+            _send_telegram_parts_to_chat(user["telegram_chat_id"], message)
             sent += 1
         except Exception as exc:
             failures.append({"user_key": user["user_key"], "name": user["display_name"], "error": str(exc)})
@@ -2456,7 +2455,7 @@ def _local_quote(conn: sqlite3.Connection, stock: sqlite3.Row) -> dict | None:
 def _detect_and_push_large_order_alerts(db_path: Path, quotes: list[dict]) -> list[dict]:
     session = _market_session()
     now = datetime.now(ZoneInfo("Asia/Taipei"))
-    if not (session["is_intraday"] or (now.weekday() < 5 and time(9, 0) <= now.time() <= time(13, 35))):
+    if not (session["is_intraday"] or (now.weekday() < 5 and time(9, 0) <= now.time() <= time(14, 0))):
         return []
     try:
         alerts = _detect_large_order_alerts(db_path, quotes)
@@ -2655,7 +2654,7 @@ def _push_owner_large_order_alerts(alerts: list[dict]) -> None:
     lines.append("\n提醒：大單可能撤單，不是直接下單指令；需搭配實際成交、量能與支撐壓力確認。")
     message = "\n".join(lines)
     for chat_id in chat_ids:
-        _send_telegram_to_chat(chat_id, message)
+        _send_telegram_parts_to_chat(chat_id, message)
 
 
 def _owner_telegram_chat_ids() -> list[str]:
@@ -3195,8 +3194,53 @@ def split_premarket_message(message: str) -> list[str]:
         parts.extend("\n".join(_trim_blank_lines(block)).strip() for block in body_blocks[1:])
     else:
         parts.append("\n".join(header).strip())
-    total = len(parts)
-    return [f"台股早訊（{index}/{total}）\n{part}" for index, part in enumerate(parts, start=1)]
+    return parts
+
+
+def split_telegram_message(message: str) -> list[str]:
+    first_line = message.splitlines()[0] if message.splitlines() else ""
+    if "台股早訊" in first_line:
+        return split_premarket_message(message)
+    blocks = [block.strip() for block in message.split("\n\n") if block.strip()]
+    if len(blocks) <= 1:
+        return _chunk_message(message)
+    parts: list[str] = []
+    header = blocks[0]
+    if len(blocks) >= 2 and _is_section_heading(blocks[1]):
+        parts.append(f"{header}\n\n{blocks[1]}")
+        parts.extend(blocks[2:])
+    else:
+        parts.append(header)
+        parts.extend(blocks[1:])
+    final_parts: list[str] = []
+    for part in parts:
+        final_parts.extend(_chunk_message(part))
+    return final_parts
+
+
+def _is_section_heading(block: str) -> bool:
+    lines = [line.strip() for line in block.splitlines() if line.strip()]
+    return len(lines) == 1 and not lines[0][:1].isdigit()
+
+
+def _chunk_message(message: str, limit: int = 3600) -> list[str]:
+    if len(message) <= limit:
+        return [message]
+    chunks = []
+    current = []
+    length = 0
+    for line in message.splitlines():
+        extra = len(line) + 1
+        if current and length + extra > limit:
+            chunks.append("\n".join(current).strip())
+            current = [line]
+            length = extra
+        else:
+            current.append(line)
+            length += extra
+    if current:
+        chunks.append("\n".join(current).strip())
+    return chunks
 
 
 def _trim_blank_lines(lines: list[str]) -> list[str]:
@@ -3697,6 +3741,13 @@ def _send_telegram_to_chat(chat_id: str, message: str) -> dict:
         "sendMessage",
         {"chat_id": chat_id, "text": message[:3900], "disable_web_page_preview": True},
     )
+
+
+def _send_telegram_parts_to_chat(chat_id: str, message: str) -> dict:
+    results = []
+    for part in split_telegram_message(message):
+        results.append(_send_telegram_to_chat(chat_id, part))
+    return {"sent": len(results), "results": results}
 
 
 def _telegram_api(method: str, payload: dict) -> dict:
@@ -9940,7 +9991,7 @@ INDEX_HTML = r"""<!doctype html>
         document.getElementById("aiMonitorSummary").innerHTML = `
           <div class="trade-callout">
             <strong>AI 盤中盯盤未啟動</strong>
-            <p>${m.message || "AI 盯盤只在台股盤中 09:00-13:30 顯示。"}</p>
+            <p>${m.message || "AI 盯盤只在台股盤中 09:00-14:00 顯示。"}</p>
           </div>`;
         renderAiMonitor(document.getElementById("aiMonitorTable"), []);
         return;

@@ -9,7 +9,7 @@ from .config import DEFAULT_DB_PATH
 from .indicators import macd, pct_change, rsi, sma, volume_ratio
 from .names import short_name
 from .signals import rank_signals, risk_adjusted_score, score_stock
-from .web import api_scan, api_status, api_strategy
+from .web import api_scan, api_status, api_strategy, split_telegram_message
 
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "notify.json"
@@ -242,12 +242,15 @@ def send_telegram(message: str, config: dict) -> dict:
         raise ValueError("Telegram bot_token/chat_id is not configured in config/notify.json or environment variables.")
 
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "disable_web_page_preview": True,
-    }
-    return _post_json(url, payload)
+    results = []
+    for part in split_telegram_message(message):
+        payload = {
+            "chat_id": chat_id,
+            "text": part[:3900],
+            "disable_web_page_preview": True,
+        }
+        results.append(_post_json(url, payload))
+    return {"sent": len(results), "results": results}
 
 
 def send_line(message: str, config: dict) -> dict:

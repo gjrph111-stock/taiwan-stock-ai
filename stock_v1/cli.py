@@ -46,7 +46,6 @@ from .web import (
     send_enabled_user_premarket_telegrams,
     send_enabled_user_telegrams,
     set_telegram_webhook,
-    split_premarket_message,
 )
 
 
@@ -141,7 +140,7 @@ def main() -> None:
 
     large_order_parser = subparsers.add_parser("large-order-watch", help="Scan realtime watchlist quotes and push large order alerts")
     large_order_parser.add_argument("--codes", help="Comma-separated stock codes. Defaults to local watchlist")
-    large_order_parser.add_argument("--force", action="store_true", help="Run even outside weekday 09:00-13:35")
+    large_order_parser.add_argument("--force", action="store_true", help="Run even outside weekday 09:00-14:00")
 
     user_premarket_parser = subparsers.add_parser("notify-users-premarket", help="Send personal premarket night-session reports to enabled users")
     user_premarket_parser.add_argument("--limit", type=int, default=5, help="Rows per user watchlist")
@@ -352,9 +351,9 @@ def main() -> None:
     if args.command == "large-order-watch":
         conn.close()
         now = datetime.now(ZoneInfo("Asia/Taipei"))
-        allowed = now.weekday() < 5 and time(9, 0) <= now.time() <= time(13, 35)
+        allowed = now.weekday() < 5 and time(9, 0) <= now.time() <= time(14, 0)
         if not allowed and not args.force:
-            print(f"Skipped: large order watch is only allowed Mon-Fri 09:00-13:35 Asia/Taipei. Now={now:%Y-%m-%d %H:%M:%S}")
+            print(f"Skipped: large order watch is only allowed Mon-Fri 09:00-14:00 Asia/Taipei. Now={now:%Y-%m-%d %H:%M:%S}")
             return
         codes = args.codes or ",".join(api_watchlist(Path(args.db)).get("codes") or [])
         result = api_realtime(Path(args.db), codes)
@@ -381,8 +380,8 @@ def main() -> None:
             return
         message = build_owner_premarket_message(Path(args.db), args.limit)
         config = load_config(Path(args.config)) if Path(args.config).exists() else {}
-        results = [send_telegram(part, config) for part in split_premarket_message(message)]
-        print({"sent": len(results), "results": results})
+        result = send_telegram(message, config)
+        print(result)
         return
 
     if args.command == "news-watch":
