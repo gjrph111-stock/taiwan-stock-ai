@@ -24,7 +24,7 @@ from .config import DEFAULT_DB_PATH
 from .daily import run_daily
 from .export import export_strategy_report
 from .ai_monitor import build_ai_monitor, format_monitor_message
-from .notify import DEFAULT_CONFIG_PATH, build_daily_message, load_config, send_line, send_telegram
+from .notify import DEFAULT_CONFIG_PATH, build_after_hours_message, build_daily_message, load_config, send_line, send_telegram
 from .reports import (
     print_indicator_report,
     print_market_scan,
@@ -136,11 +136,11 @@ def main() -> None:
 
     user_intraday_parser = subparsers.add_parser("notify-users-intraday", help="Send personal intraday Telegram reports to enabled users")
     user_intraday_parser.add_argument("--limit", type=int, default=5, help="Rows per user watchlist")
-    user_intraday_parser.add_argument("--force", action="store_true", help="Send even outside weekday 09:00-14:00")
+    user_intraday_parser.add_argument("--force", action="store_true", help="Send even outside weekday 09:00-13:40")
 
     large_order_parser = subparsers.add_parser("large-order-watch", help="Scan realtime watchlist quotes and push large order alerts")
     large_order_parser.add_argument("--codes", help="Comma-separated stock codes. Defaults to local watchlist")
-    large_order_parser.add_argument("--force", action="store_true", help="Run even outside weekday 09:00-14:00")
+    large_order_parser.add_argument("--force", action="store_true", help="Run even outside weekday 09:00-13:40")
 
     user_premarket_parser = subparsers.add_parser("notify-users-premarket", help="Send personal premarket night-session reports to enabled users")
     user_premarket_parser.add_argument("--limit", type=int, default=5, help="Rows per user watchlist")
@@ -160,11 +160,12 @@ def main() -> None:
     intraday_parser = subparsers.add_parser("notify-intraday", help="Send owner AI monitor only during market hours")
     intraday_parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Notification config path")
     intraday_parser.add_argument("--limit", type=int, default=5, help="Rows per AI monitor")
-    intraday_parser.add_argument("--force", action="store_true", help="Send even outside weekday 09:00-14:00")
+    intraday_parser.add_argument("--force", action="store_true", help="Send even outside weekday 09:00-13:40")
 
     after_hours_parser = subparsers.add_parser("notify-after-hours", help="Send owner after-hours report and Top 5")
     after_hours_parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Notification config path")
     after_hours_parser.add_argument("--limit", type=int, default=5, help="Rows per ranking")
+    after_hours_parser.add_argument("--force", action="store_true", help="Send even outside weekday 14:00-14:30")
 
     webhook_parser = subparsers.add_parser("telegram-webhook", help="Set Telegram webhook URL")
     webhook_parser.add_argument("--url", required=True, help="Webhook URL, e.g. https://example.onrender.com/api/telegram/webhook")
@@ -340,9 +341,9 @@ def main() -> None:
     if args.command == "notify-users-intraday":
         conn.close()
         now = datetime.now(ZoneInfo("Asia/Taipei"))
-        allowed = now.weekday() < 5 and time(9, 0) <= now.time() <= time(14, 0)
+        allowed = now.weekday() < 5 and time(9, 0) <= now.time() <= time(13, 40)
         if not allowed and not args.force:
-            print(f"Skipped: user intraday push is only allowed Mon-Fri 09:00-14:00 Asia/Taipei. Now={now:%Y-%m-%d %H:%M:%S}")
+            print(f"Skipped: user intraday push is only allowed Mon-Fri 09:00-13:40 Asia/Taipei. Now={now:%Y-%m-%d %H:%M:%S}")
             return
         result = send_enabled_user_intraday_telegrams(Path(args.db), args.limit)
         print(result)
@@ -351,9 +352,9 @@ def main() -> None:
     if args.command == "large-order-watch":
         conn.close()
         now = datetime.now(ZoneInfo("Asia/Taipei"))
-        allowed = now.weekday() < 5 and time(9, 0) <= now.time() <= time(14, 0)
+        allowed = now.weekday() < 5 and time(9, 0) <= now.time() <= time(13, 40)
         if not allowed and not args.force:
-            print(f"Skipped: large order watch is only allowed Mon-Fri 09:00-14:00 Asia/Taipei. Now={now:%Y-%m-%d %H:%M:%S}")
+            print(f"Skipped: large order watch is only allowed Mon-Fri 09:00-13:40 Asia/Taipei. Now={now:%Y-%m-%d %H:%M:%S}")
             return
         codes = args.codes or ",".join(api_watchlist(Path(args.db)).get("codes") or [])
         result = api_realtime(Path(args.db), codes)
@@ -406,9 +407,9 @@ def main() -> None:
     if args.command == "notify-intraday":
         conn.close()
         now = datetime.now(ZoneInfo("Asia/Taipei"))
-        allowed = now.weekday() < 5 and time(9, 0) <= now.time() <= time(14, 0)
+        allowed = now.weekday() < 5 and time(9, 0) <= now.time() <= time(13, 40)
         if not allowed and not args.force:
-            print(f"Skipped: AI intraday push is only allowed Mon-Fri 09:00-14:00 Asia/Taipei. Now={now:%Y-%m-%d %H:%M:%S}")
+            print(f"Skipped: AI intraday push is only allowed Mon-Fri 09:00-13:40 Asia/Taipei. Now={now:%Y-%m-%d %H:%M:%S}")
             return
         monitor = build_ai_monitor(Path(args.db), limit=args.limit)
         message = "\n".join([
@@ -421,7 +422,12 @@ def main() -> None:
 
     if args.command == "notify-after-hours":
         conn.close()
-        result = send_telegram(build_daily_message(Path(args.db), args.limit), load_config(Path(args.config)) if Path(args.config).exists() else {})
+        now = datetime.now(ZoneInfo("Asia/Taipei"))
+        allowed = now.weekday() < 5 and time(14, 0) <= now.time() <= time(14, 30)
+        if not allowed and not args.force:
+            print(f"Skipped: after-hours push is only allowed Mon-Fri 14:00-14:30 Asia/Taipei. Now={now:%Y-%m-%d %H:%M:%S}")
+            return
+        result = send_telegram(build_after_hours_message(Path(args.db), args.limit), load_config(Path(args.config)) if Path(args.config).exists() else {})
         print(result)
         return
 

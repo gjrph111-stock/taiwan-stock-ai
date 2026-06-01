@@ -917,7 +917,7 @@ def api_news(db_path: Path, code: str) -> dict:
 def _market_session() -> dict:
     now = datetime.now(ZoneInfo("Asia/Taipei"))
     is_weekday = now.weekday() < 5
-    intraday = is_weekday and time(9, 0) <= now.time() <= time(14, 0)
+    intraday = is_weekday and time(9, 0) <= now.time() <= time(13, 40)
     return {
         "is_intraday": intraday,
         "session_label": "盤中盯盤" if intraday else "盤後整理",
@@ -1169,7 +1169,7 @@ def api_job_notify_users_intraday(db_path: Path, token: str, limit: int = 5) -> 
     if not ok:
         return {"error": error}
     now = datetime.now(ZoneInfo("Asia/Taipei"))
-    allowed = now.weekday() < 5 and time(9, 0) <= now.time() <= time(14, 0)
+    allowed = now.weekday() < 5 and time(9, 0) <= now.time() <= time(13, 40)
     if not allowed:
         return {"skipped": True, "message": f"Not market time. Now={now:%Y-%m-%d %H:%M:%S} Asia/Taipei"}
     return send_enabled_user_intraday_telegrams(db_path, limit=limit)
@@ -2462,7 +2462,7 @@ def _local_quote(conn: sqlite3.Connection, stock: sqlite3.Row) -> dict | None:
 def _detect_and_push_realtime_alerts(db_path: Path, quotes: list[dict]) -> dict:
     session = _market_session()
     now = datetime.now(ZoneInfo("Asia/Taipei"))
-    if not (session["is_intraday"] or (now.weekday() < 5 and time(9, 0) <= now.time() <= time(14, 0))):
+    if not (session["is_intraday"] or (now.weekday() < 5 and time(9, 0) <= now.time() <= time(13, 40))):
         return {"large_order_alerts": [], "price_move_alerts": []}
     try:
         large_order_alerts = _detect_large_order_alerts(db_path, quotes)
@@ -3382,13 +3382,19 @@ def split_telegram_message(message: str) -> list[str]:
     if len(blocks) <= 1:
         return _chunk_message(message)
     parts: list[str] = []
-    header = blocks[0]
-    if len(blocks) >= 2 and _is_section_heading(blocks[1]):
-        parts.append(f"{header}\n\n{blocks[1]}")
-        parts.extend(blocks[2:])
-    else:
-        parts.append(header)
-        parts.extend(blocks[1:])
+    index = 0
+    while index < len(blocks):
+        block = blocks[index]
+        if index == 0 and index + 2 < len(blocks) and _is_section_heading(blocks[index + 1]):
+            parts.append(f"{block}\n\n{blocks[index + 1]}\n\n{blocks[index + 2]}")
+            index += 3
+            continue
+        if _is_section_heading(block) and index + 1 < len(blocks):
+            parts.append(f"{block}\n\n{blocks[index + 1]}")
+            index += 2
+            continue
+        parts.append(block)
+        index += 1
     final_parts: list[str] = []
     for part in parts:
         final_parts.extend(_chunk_message(part))
@@ -7250,7 +7256,7 @@ INDEX_HTML = r"""<!doctype html>
             <dt>推播狀態</dt><dd id="notifyTelegramStatus">尚未設定</dd>
             <dt>Telegram 綁定</dt><dd>朋友可先建立個人設定，再到 Telegram 對 bot 輸入「綁定 個人代碼」。若直接對 bot 輸入 /start，系統也會自動建立個人帳號。</dd>
             <dt>推播內容</dt><dd>個人觀察名單、AI 分數、買點、賣點、停損與操作提醒</dd>
-            <dt>自動排程</dt><dd>盤中 09:00-14:00 發送個人 AI 盯盤；盤後發送個人觀察名單報告。</dd>
+            <dt>自動排程</dt><dd>盤中 09:00-13:40 發送個人 AI 盯盤；14:00 發送盤後收盤訊息。</dd>
           </dl></div>
         </section>
         <section class="wide">
@@ -10172,7 +10178,7 @@ INDEX_HTML = r"""<!doctype html>
         document.getElementById("aiMonitorSummary").innerHTML = `
           <div class="trade-callout">
             <strong>AI 盤中盯盤未啟動</strong>
-            <p>${m.message || "AI 盯盤只在台股盤中 09:00-14:00 顯示。"}</p>
+            <p>${m.message || "AI 盯盤只在台股盤中 09:00-13:40 顯示。"}</p>
           </div>`;
         renderAiMonitor(document.getElementById("aiMonitorTable"), []);
         return;

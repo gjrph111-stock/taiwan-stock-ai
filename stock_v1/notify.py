@@ -1,18 +1,77 @@
 import json
 import os
 import sqlite3
+from datetime import date, datetime
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 from .config import DEFAULT_DB_PATH
 from .indicators import macd, pct_change, rsi, sma, volume_ratio
 from .names import short_name
 from .signals import rank_signals, risk_adjusted_score, score_stock
-from .web import api_scan, api_status, api_strategy, split_telegram_message
+from .web import _fetch_yahoo_snapshot, api_scan, api_status, api_strategy, api_watch, split_telegram_message
 
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "notify.json"
+
+
+def build_after_hours_message(db_path: Path = DEFAULT_DB_PATH, limit: int = 6) -> str:
+    now = datetime.now(ZoneInfo("Asia/Taipei"))
+    status = api_status(db_path)
+    scan = api_scan(db_path, limit=max(limit, 8))
+    watch = api_watch(db_path)
+    industry = watch.get("industry_after_report") or {}
+    top_groups = industry.get("top_groups") or []
+    volume_groups = industry.get("volume_focus") or []
+    weak_groups = industry.get("weak_groups") or []
+    top_return = scan.get("top_return_20d") or []
+    top_volume = scan.get("top_volume_expansion") or []
+    watch_items = build_watchlist_advice(db_path, limit=limit)
+    twii = _safe_yahoo_snapshot("^TWII")
+    otc = _safe_yahoo_snapshot("^TWOII")
+    market_tone = _after_hours_market_tone(twii, scan, top_groups)
+    lines = [
+        f"{now.year}年{now.month}月{now.day}日（{_weekday_short(now)}）台股收盤訊息",
+        "",
+        "【主要指數表現】",
+        "",
+        market_tone,
+        "",
+        _format_index_line("加權指數", twii, fallback_date=status.get("last_date")),
+        _format_index_line("櫃買指數", otc),
+        "",
+        _after_hours_breadth_text(scan),
+        "",
+        "【熱門個股與族群表現細節】",
+        "",
+        *_after_hours_hot_stock_lines(watch_items, top_return, top_volume, limit=limit),
+        "",
+        f"強勢族群：{_format_group_list(top_groups)}",
+        f"量能族群：{_format_group_list(volume_groups)}",
+        f"弱勢警戒：{_format_group_list(weak_groups)}",
+        "",
+        "【市場主要驅動因素】",
+        "",
+        f"1. {_after_hours_driver_ai(top_groups, top_return)}",
+        "",
+        f"2. {_after_hours_driver_flow(scan, top_volume)}",
+        "",
+        f"3. {_after_hours_driver_structure(scan, weak_groups)}",
+        "",
+        "【總結與後市展望】",
+        "",
+        _after_hours_outlook(twii, scan, top_groups),
+        "",
+        "目前市場焦點仍在：",
+        "1. AI供應鏈、半導體、記憶體、散熱、光通訊等主流族群是否延續量價。",
+        "2. 外資與法人資金是否續抱權值股與高成交族群。",
+        "3. 指數高檔震盪時，獲利了結賣壓與關鍵均線支撐是否守住。",
+        "",
+        "提醒：盤後訊息是收盤後研究摘要，不是直接下單指令；隔日仍需搭配盤前早訊、開盤量價與停損紀律。",
+    ]
+    return "\n".join(lines)
 
 
 def build_daily_message(db_path: Path = DEFAULT_DB_PATH, limit: int = 5) -> str:
@@ -59,6 +118,119 @@ def build_daily_message(db_path: Path = DEFAULT_DB_PATH, limit: int = 5) -> str:
         "提醒：以上是依日線資料、技術指標與風控條件產生的研究建議，不是保證獲利或直接下單指令。進出場請自行搭配即時價格、成交量與停損紀律。",
     ])
     return "\n".join(lines)
+
+
+def _weekday_short(value: datetime) -> str:
+    return ["週一", "週二", "週三", "週四", "週五", "週六", "週日"][value.weekday()]
+
+
+def _safe_yahoo_snapshot(symbol: str) -> dict | None:
+    try:
+        return _fetch_yahoo_snapshot(symbol)
+    except Exception:
+        return None
+
+
+def _format_index_line(name: str, snapshot: dict | None, fallback_date: str | None = None) -> str:
+    if not snapshot:
+        suffix = f"資料日期 {fallback_date}，" if fallback_date else ""
+        return f"{name}：{suffix}免費指數資料暫缺，請以交易所收盤資料補驗。"
+    change = _num(snapshot.get("change"))
+    pct = _num(snapshot.get("change_percent"))
+    price = _num(snapshot.get("price"))
+    direction = "上漲" if change and change > 0 else "下跌" if change and change < 0 else "持平"
+    return f"{name}：{direction}{abs(change or 0):,.2f} 點（{pct:+.2f}%），收在 {price:,.2f} 點。"
+
+
+def _after_hours_market_tone(twii: dict | None, scan: dict, groups: list[dict]) -> str:
+    pct = _num((twii or {}).get("change_percent"))
+    summary = scan.get("summary") or {}
+    count = max(1, int(scan.get("count") or 1))
+    above20_pct = (summary.get("above_sma20") or 0) / count * 100
+    leader = groups[0].get("name") if groups else "主流族群"
+    if pct is not None and pct >= 1:
+        return f"台股今日收盤展現強勢多頭氣勢，指數收紅並由 {leader} 領軍，市場風險偏好維持高檔。"
+    if pct is not None and pct <= -1:
+        return f"台股今日收盤承壓，指數明顯回落，盤面轉為風控優先，需觀察 {leader} 是否仍有承接。"
+    if above20_pct >= 55:
+        return f"台股今日呈現類股輪動格局，雖指數震盪，站上20日線家數仍維持相對健康，{leader} 是盤面焦點。"
+    return f"台股今日收盤偏整理，市場資金集中在少數題材與量能族群，{leader} 仍是隔日觀察重點。"
+
+
+def _after_hours_breadth_text(scan: dict) -> str:
+    summary = scan.get("summary") or {}
+    count = scan.get("count") or 0
+    return (
+        f"整體市場廣度：{summary.get('above_sma20', 0)} / {count} 檔站上20日線，"
+        f"{summary.get('above_sma60', 0)} 檔站上60日線，{summary.get('new_high_60', 0)} 檔創60日新高。"
+    )
+
+
+def _after_hours_hot_stock_lines(watch_items: list[dict], top_return: list[dict], top_volume: list[dict], limit: int = 6) -> list[str]:
+    lines = []
+    used = set()
+    for item in watch_items[: min(limit, 5)]:
+        used.add(item.get("code"))
+        score = f"AI {item.get('score')}" if item.get("score") is not None else item.get("trend", "觀察")
+        lines.append(f"{item.get('name')}（{item.get('code')}）：{score}，{item.get('summary', '')}。{item.get('advice', '')}")
+    for row in top_return[:3]:
+        if row.get("code") in used:
+            continue
+        used.add(row.get("code"))
+        lines.append(
+            f"{row.get('short_name') or row.get('name')}（{row.get('code')}）：20日漲幅 {float(row.get('return_20d') or 0):.2f}%，屬盤後強勢追蹤名單。"
+        )
+    if top_volume:
+        names = "、".join(f"{row.get('short_name') or row.get('name')} 量比 {float(row.get('volume_ratio') or 0):.2f}" for row in top_volume[:4])
+        lines.append(f"量能焦點：{names}，隔日需觀察是否延續成交量。")
+    return lines or ["今日沒有足夠個股資料可列入熱門名單，先觀察大盤與類股輪動。"]
+
+
+def _format_group_list(groups: list[dict]) -> str:
+    if not groups:
+        return "暫無明確族群。"
+    return "、".join(
+        f"{row.get('name')}（均漲跌 {float(row.get('avg_change_percent') or 0):.2f}%）"
+        for row in groups[:5]
+    )
+
+
+def _after_hours_driver_ai(groups: list[dict], top_return: list[dict]) -> str:
+    group = groups[0].get("name") if groups else "AI與半導體相關族群"
+    stock = (top_return[0].get("short_name") or top_return[0].get("name")) if top_return else "強勢股"
+    return f"AI與主流題材延續：{group} 表現較強，{stock} 等強勢股帶動市場人氣。"
+
+
+def _after_hours_driver_flow(scan: dict, top_volume: list[dict]) -> str:
+    summary = scan.get("summary") or {}
+    volume_text = "、".join(f"{row.get('short_name') or row.get('name')}" for row in top_volume[:3]) or "高量能股"
+    return f"資金集中度提高：60日新高 {summary.get('new_high_60', 0)} 檔，量能集中在 {volume_text}，顯示資金仍在尋找主流。"
+
+
+def _after_hours_driver_structure(scan: dict, weak_groups: list[dict]) -> str:
+    summary = scan.get("summary") or {}
+    weak_text = _format_group_list(weak_groups[:2])
+    return f"多頭結構與風險並存：站上月線 {summary.get('above_sma20', 0)} 檔，但弱勢族群仍有 {weak_text}，高檔需防獲利了結。"
+
+
+def _after_hours_outlook(twii: dict | None, scan: dict, groups: list[dict]) -> str:
+    pct = _num((twii or {}).get("change_percent"))
+    group_text = _format_group_list(groups[:2])
+    if pct is not None and pct >= 1:
+        headline = "今天台股可用「主流族群領漲、量價偏強、風險偏好升溫」來形容。"
+    elif pct is not None and pct <= -1:
+        headline = "今天台股可用「賣壓升溫、資金防守、等待止穩」來形容。"
+    else:
+        headline = "今天台股可用「指數震盪、族群輪動、資金挑股」來形容。"
+    return f"{headline} 後市仍以 {group_text} 為主軸，若隔日量能延續，多頭結構可維持；若開盤無量或急拉不過高，需留意短線獲利了結。"
+
+
+def _num(value) -> float | None:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    return num if num == num else None
 
 
 def build_watchlist_advice(db_path: Path = DEFAULT_DB_PATH, limit: int | None = None) -> list[dict]:
