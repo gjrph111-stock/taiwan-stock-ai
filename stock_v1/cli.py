@@ -357,7 +357,11 @@ def main() -> None:
             return
         codes = args.codes or ",".join(api_watchlist(Path(args.db)).get("codes") or [])
         result = api_realtime(Path(args.db), codes)
-        print({"quotes": len(result.get("quotes") or []), "large_order_alerts": result.get("large_order_alerts") or []})
+        print({
+            "quotes": len(result.get("quotes") or []),
+            "large_order_alerts": result.get("large_order_alerts") or [],
+            "price_move_alerts": result.get("price_move_alerts") or [],
+        })
         return
 
     if args.command == "notify-users-premarket":

@@ -1432,12 +1432,13 @@ def api_realtime(db_path: Path, raw_codes: str) -> dict:
         with _connect(db_path) as conn:
             quotes = [twse_by_code[stock["code"]] for stock in stocks if stock["code"] in twse_by_code]
             _attach_sparklines(conn, quotes, append_live=True)
-        large_order_alerts = _detect_and_push_large_order_alerts(db_path, quotes)
+        realtime_alerts = _detect_and_push_realtime_alerts(db_path, quotes)
         return {
             "quotes": quotes,
             "message": twse_result["message"],
             "source": "TWSE MIS",
-            "large_order_alerts": large_order_alerts,
+            "large_order_alerts": realtime_alerts["large_order_alerts"],
+            "price_move_alerts": realtime_alerts["price_move_alerts"],
         }
 
     quotes = []
@@ -1483,11 +1484,17 @@ def api_realtime(db_path: Path, raw_codes: str) -> dict:
                 quotes.append(local)
         _attach_sparklines(conn, quotes, append_live=True)
 
-    large_order_alerts = _detect_and_push_large_order_alerts(db_path, quotes)
+    realtime_alerts = _detect_and_push_realtime_alerts(db_path, quotes)
     message = twse_result["message"] if twse_quotes else "證交所 MIS 即時報價暫不可用，已改用 FinMind TaiwanStockPrice。"
     if failures:
         message += " 部分股票已切回本機資料：" + "；".join(failures[:3])
-    return {"quotes": quotes, "message": message, "source": "TWSE MIS + FinMind", "large_order_alerts": large_order_alerts}
+    return {
+        "quotes": quotes,
+        "message": message,
+        "source": "TWSE MIS + FinMind",
+        "large_order_alerts": realtime_alerts["large_order_alerts"],
+        "price_move_alerts": realtime_alerts["price_move_alerts"],
+    }
 
 
 def api_realtime_trend(db_path: Path, code: str, interval: str = "1d") -> dict:
@@ -2452,27 +2459,34 @@ def _local_quote(conn: sqlite3.Connection, stock: sqlite3.Row) -> dict | None:
     }
 
 
-def _detect_and_push_large_order_alerts(db_path: Path, quotes: list[dict]) -> list[dict]:
+def _detect_and_push_realtime_alerts(db_path: Path, quotes: list[dict]) -> dict:
     session = _market_session()
     now = datetime.now(ZoneInfo("Asia/Taipei"))
     if not (session["is_intraday"] or (now.weekday() < 5 and time(9, 0) <= now.time() <= time(14, 0))):
-        return []
+        return {"large_order_alerts": [], "price_move_alerts": []}
     try:
-        alerts = _detect_large_order_alerts(db_path, quotes)
+        large_order_alerts = _detect_large_order_alerts(db_path, quotes)
+        price_move_alerts = _detect_price_move_alerts(db_path, quotes)
     except Exception:
-        return []
-    if not alerts:
-        return []
-    try:
-        _push_owner_large_order_alerts(alerts)
-    except Exception as exc:
-        for alert in alerts:
-            alert["push_error"] = str(exc)
-    return alerts
+        return {"large_order_alerts": [], "price_move_alerts": []}
+    if large_order_alerts:
+        try:
+            _push_owner_large_order_alerts(large_order_alerts)
+        except Exception as exc:
+            for alert in large_order_alerts:
+                alert["push_error"] = str(exc)
+    if price_move_alerts:
+        try:
+            _push_owner_price_move_alerts(price_move_alerts)
+        except Exception as exc:
+            for alert in price_move_alerts:
+                alert["push_error"] = str(exc)
+    return {"large_order_alerts": large_order_alerts, "price_move_alerts": price_move_alerts}
 
 
 def _detect_large_order_alerts(db_path: Path, quotes: list[dict]) -> list[dict]:
     now = datetime.now(ZoneInfo("Asia/Taipei"))
+    now_text = now.strftime("%Y-%m-%d %H:%M:%S")
     observed_cache = _large_order_observed_cache()
     alerts = []
     with _connect(db_path) as conn:
@@ -2509,12 +2523,12 @@ def _detect_large_order_alerts(db_path: Path, quotes: list[dict]) -> list[dict]:
                 conn.execute(
                     """
                     INSERT INTO large_order_observations (code, side, price, qty, observed_at)
-                    VALUES (?, ?, ?, ?, datetime('now'))
+                    VALUES (?, ?, ?, ?, ?)
                     ON CONFLICT(code, side, price) DO UPDATE SET
                         qty = excluded.qty,
                         observed_at = excluded.observed_at
                     """,
-                    (code, side, float(price), qty),
+                    (code, side, float(price), qty, now_text),
                 )
                 is_large = qty >= threshold
                 is_sudden = previous_qty <= 0 and qty >= threshold * 1.5
@@ -2555,7 +2569,7 @@ def _detect_large_order_alerts(db_path: Path, quotes: list[dict]) -> list[dict]:
                         code, name, side, price, qty, previous_qty, threshold_lots, last_price,
                         change_percent, source, alerted_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         alert["code"],
@@ -2568,11 +2582,119 @@ def _detect_large_order_alerts(db_path: Path, quotes: list[dict]) -> list[dict]:
                         alert["last_price"],
                         alert["change_percent"],
                         alert["source"],
+                        now_text,
                     ),
                 )
                 alerts.append(alert)
         conn.commit()
     return alerts
+
+
+def _detect_price_move_alerts(db_path: Path, quotes: list[dict]) -> list[dict]:
+    now = datetime.now(ZoneInfo("Asia/Taipei"))
+    now_text = now.strftime("%Y-%m-%d %H:%M:%S")
+    delta_threshold = _float_env("STOCK_V1_PRICE_MOVE_DELTA", 1.0)
+    min_abs_change = _float_env("STOCK_V1_PRICE_MOVE_MIN_ABS", 1.5)
+    alerts = []
+    with _connect(db_path) as conn:
+        _ensure_large_order_tables(conn)
+        for quote in quotes:
+            code = str(quote.get("code") or "")
+            price = _to_float(quote.get("price"))
+            change_percent = _to_float(quote.get("change_percent"))
+            if not code or price is None or change_percent is None:
+                continue
+            previous = conn.execute(
+                """
+                SELECT price, change_percent, observed_at
+                FROM price_move_observations
+                WHERE code = ?
+                """,
+                (code,),
+            ).fetchone()
+            conn.execute(
+                """
+                INSERT INTO price_move_observations (code, price, change_percent, observed_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(code) DO UPDATE SET
+                    price = excluded.price,
+                    change_percent = excluded.change_percent,
+                    observed_at = excluded.observed_at
+                """,
+                (code, price, change_percent, now_text),
+            )
+            if not previous:
+                continue
+            previous_change = _to_float(previous["change_percent"])
+            previous_price = _to_float(previous["price"])
+            if previous_change is None:
+                continue
+            minutes = _minutes_since(previous["observed_at"], now)
+            if minutes <= 0 or minutes > 15:
+                continue
+            delta = change_percent - previous_change
+            direction = "急漲" if delta >= delta_threshold else "急跌" if delta <= -delta_threshold else ""
+            if not direction or abs(change_percent) < min_abs_change:
+                continue
+            last_alert = conn.execute(
+                """
+                SELECT alerted_at
+                FROM price_move_alerts
+                WHERE code = ? AND direction = ?
+                ORDER BY alerted_at DESC
+                LIMIT 1
+                """,
+                (code, direction),
+            ).fetchone()
+            if last_alert and _minutes_since(last_alert["alerted_at"], now) < 10:
+                continue
+            alert = {
+                "code": code,
+                "name": quote.get("name") or code,
+                "direction": direction,
+                "price": price,
+                "previous_price": previous_price,
+                "change_percent": change_percent,
+                "previous_change_percent": previous_change,
+                "delta_percent": delta,
+                "time": quote.get("time") or now.strftime("%H:%M:%S"),
+                "source": quote.get("source") or "",
+                "detected_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            conn.execute(
+                """
+                INSERT INTO price_move_alerts (
+                    code, name, direction, price, previous_price, change_percent,
+                    previous_change_percent, delta_percent, source, alerted_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    alert["code"],
+                    alert["name"],
+                    alert["direction"],
+                    alert["price"],
+                    alert["previous_price"],
+                    alert["change_percent"],
+                    alert["previous_change_percent"],
+                    alert["delta_percent"],
+                    alert["source"],
+                    now_text,
+                ),
+            )
+            alerts.append(alert)
+        conn.commit()
+    return alerts
+
+
+def _float_env(name: str, default: float) -> float:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
 
 
 def _large_order_observed_cache() -> dict:
@@ -2657,6 +2779,33 @@ def _push_owner_large_order_alerts(alerts: list[dict]) -> None:
         _send_telegram_parts_to_chat(chat_id, message)
 
 
+def _push_owner_price_move_alerts(alerts: list[dict]) -> None:
+    chat_ids = _owner_telegram_chat_ids()
+    if not chat_ids:
+        return
+    now = datetime.now(ZoneInfo("Asia/Taipei"))
+    lines = [
+        f"台股智研｜盤中急漲急跌警報 {now:%H:%M:%S}",
+        f"偵測到 {len(alerts)} 檔觀察名單股票短時間漲跌幅快速變化，請回即時看盤確認成交量與支撐壓力。",
+    ]
+    for alert in alerts[:10]:
+        direction_note = "買盤快速推升，注意是否帶量突破" if alert.get("direction") == "急漲" else "賣壓快速放大，先檢查停損與支撐"
+        lines.extend(
+            [
+                "",
+                f"{alert.get('code')} {alert.get('name')}｜{alert.get('direction')}｜{direction_note}",
+                f"現價 {fmt_value(alert.get('price'))}｜漲跌幅 {fmt_value(alert.get('change_percent'))}%｜前次 {fmt_value(alert.get('previous_change_percent'))}%｜變化 {fmt_value(alert.get('delta_percent'))} 個百分點",
+                f"資料時間 {alert.get('time', '-')}｜來源 {alert.get('source') or '-'}",
+            ]
+        )
+    if len(alerts) > 10:
+        lines.append(f"\n另有 {len(alerts) - 10} 檔急漲急跌先省略，請回即時看盤查看。")
+    lines.append("\n提醒：急漲急跌是風控雷達，不是直接追價或殺低指令；需搭配成交量、五檔與關鍵價位確認。")
+    message = "\n".join(lines)
+    for chat_id in chat_ids:
+        _send_telegram_parts_to_chat(chat_id, message)
+
+
 def _owner_telegram_chat_ids() -> list[str]:
     chat_id = os.environ.get("STOCK_V1_TELEGRAM_CHAT_ID", "").strip()
     if not chat_id:
@@ -2704,6 +2853,34 @@ def _ensure_large_order_tables(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS price_move_observations (
+            code TEXT PRIMARY KEY,
+            price REAL,
+            change_percent REAL,
+            observed_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS price_move_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL,
+            name TEXT,
+            direction TEXT NOT NULL,
+            price REAL,
+            previous_price REAL,
+            change_percent REAL,
+            previous_change_percent REAL,
+            delta_percent REAL,
+            source TEXT,
+            alerted_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_price_move_alerts_key ON price_move_alerts(code, direction, alerted_at)")
 
 
 def _sparkline_values(values: list[float], points: int = 22) -> list[float]:
@@ -9973,7 +10150,11 @@ INDEX_HTML = r"""<!doctype html>
       renderRealtime(document.getElementById("realtimeTable"), quotes);
       renderRealtimeMonitor(monitor);
       const alerts = data.large_order_alerts || [];
-      const alertText = alerts.length ? ` 偵測到 ${alerts.length} 筆即時大單。` : "";
+      const moveAlerts = data.price_move_alerts || [];
+      const alertParts = [];
+      if (alerts.length) alertParts.push(`${alerts.length} 筆即時大單`);
+      if (moveAlerts.length) alertParts.push(`${moveAlerts.length} 檔急漲急跌`);
+      const alertText = alertParts.length ? ` 偵測到 ${alertParts.join("、")}。` : "";
       document.getElementById("realtimeNotice").textContent = `${data.message || "即時看盤資料已更新。"} 顯示 ${quotes.length} 檔。${alertText}`;
       if (quotes.length) {
         const nextCode = quotes.some(row => row.code === selectedRealtimeCode) ? selectedRealtimeCode : quotes[0].code;
