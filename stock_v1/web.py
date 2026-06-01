@@ -1331,7 +1331,8 @@ def send_enabled_user_premarket_telegrams(db_path: Path, limit: int = 5) -> dict
     for user in users:
         try:
             message = _build_user_premarket_message(db_path, user["user_key"], user["display_name"], limit=limit)
-            _send_telegram_to_chat(user["telegram_chat_id"], message)
+            for part in split_premarket_message(message):
+                _send_telegram_to_chat(user["telegram_chat_id"], part)
             sent += 1
         except Exception as exc:
             failures.append({"user_key": user["user_key"], "name": user["display_name"], "error": str(exc)})
@@ -3168,6 +3169,43 @@ def _format_premarket_message(db_path: Path, display_name: str, rows: list[dict]
             lines.append(f"• {item['code']} {item['name']}：{_premarket_watch_bias(item, snapshot)}；{_premarket_watch_action(item, snapshot)}")
     lines.extend(["", "提醒：盤前早訊是開盤前情境推演，真正進出場仍以 09:00 後即時價格、成交量、支撐壓力與停損紀律為準。"])
     return "\n".join(lines)
+
+
+def split_premarket_message(message: str) -> list[str]:
+    """Split the morning brief into readable Telegram-sized sections."""
+    major_headings = ("1. ", "2. ", "3. ", "4. ", "5. ", "總結：", "關注名單早盤提醒：")
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for line in message.splitlines():
+        if line.startswith(major_headings):
+            if current:
+                blocks.append(current)
+            current = [line]
+        else:
+            current.append(line)
+    if current:
+        blocks.append(current)
+    if len(blocks) <= 1:
+        return [message]
+    parts: list[str] = []
+    header = _trim_blank_lines(blocks[0])
+    body_blocks = blocks[1:]
+    if body_blocks:
+        parts.append("\n".join([*header, "", *_trim_blank_lines(body_blocks[0])]).strip())
+        parts.extend("\n".join(_trim_blank_lines(block)).strip() for block in body_blocks[1:])
+    else:
+        parts.append("\n".join(header).strip())
+    total = len(parts)
+    return [f"台股早訊（{index}/{total}）\n{part}" for index, part in enumerate(parts, start=1)]
+
+
+def _trim_blank_lines(lines: list[str]) -> list[str]:
+    clean = list(lines)
+    while clean and not clean[0].strip():
+        clean.pop(0)
+    while clean and not clean[-1].strip():
+        clean.pop()
+    return clean
 
 
 def _weekday_zh(value: datetime) -> str:

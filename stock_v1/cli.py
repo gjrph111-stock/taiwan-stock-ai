@@ -46,6 +46,7 @@ from .web import (
     send_enabled_user_premarket_telegrams,
     send_enabled_user_telegrams,
     set_telegram_webhook,
+    split_premarket_message,
 )
 
 
@@ -379,8 +380,9 @@ def main() -> None:
             print(f"Skipped: owner premarket push is only allowed Mon-Fri 08:20-08:50 Asia/Taipei. Now={now:%Y-%m-%d %H:%M:%S}")
             return
         message = build_owner_premarket_message(Path(args.db), args.limit)
-        result = send_telegram(message, load_config(Path(args.config)) if Path(args.config).exists() else {})
-        print(result)
+        config = load_config(Path(args.config)) if Path(args.config).exists() else {}
+        results = [send_telegram(part, config) for part in split_premarket_message(message)]
+        print({"sent": len(results), "results": results})
         return
 
     if args.command == "news-watch":
